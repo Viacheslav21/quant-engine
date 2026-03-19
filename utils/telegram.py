@@ -13,11 +13,13 @@ class TelegramBot:
         if not self.token or not self.chat_id:
             return
         try:
-            await self.client.post(
+            r = await self.client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
             )
-        except Exception:
+            log.debug(f"[TG] Sent OK ({r.status_code})")
+        except Exception as e:
+            log.warning(f"[TG] HTML send failed: {e}, trying plain text")
             try:
                 plain = text.replace("<b>","").replace("</b>","").replace("<a href='","").replace("'>","").replace("</a>","")
                 await self.client.post(

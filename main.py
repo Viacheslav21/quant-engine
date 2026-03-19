@@ -49,6 +49,9 @@ CONFIG = {
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "5")),
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.15")),
+    "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
+    "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.50")),
+    "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
 }
 
 async def claude_confirm(signal: dict, config: dict) -> dict:
@@ -136,35 +139,66 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     )
     return True
 
-async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner):
+async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner, config: dict):
     open_pos = await db.get_open_positions()
     if not open_pos: return
     markets  = await scanner.fetch()
     mmap     = {m["id"]: m for m in markets}
+
+    tp_pct = config["TAKE_PROFIT_PCT"]
+    sl_pct = config["STOP_LOSS_PCT"]
+
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
         if not m: continue
         price = m["yes_price"] if pos["side"] == "YES" else m.get("no_price", 1-m["yes_price"])
         upnl  = (price / pos["side_price"] - 1) * pos["stake_amt"]
         await db.update_position_price(pos["id"], price, upnl)
-        is_closed = m.get("yes_price", 0.5) >= 0.98 or m.get("yes_price", 0.5) <= 0.02
-        if is_closed:
+
+        pnl_pct  = (price - pos["side_price"]) / pos["side_price"]
+        close_reason = None
+
+        # 1. Market fully resolved
+        is_resolved = m.get("yes_price", 0.5) >= 0.98 or m.get("yes_price", 0.5) <= 0.02
+        if is_resolved:
             outcome = "YES" if m["yes_price"] >= 0.98 else "NO"
             won     = outcome == pos["side"]
             payout  = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
             pnl     = round(payout - pos["stake_amt"], 2)
-            await db.close_position(pos["id"], outcome, payout, pnl)
-            stats = await db.get_stats()
-            total = stats["wins"] + stats["losses"]
-            wr    = round(stats["wins"]/total*100) if total > 0 else 0
-            log.info(f"[MONITOR] {'WIN ✅' if won else 'LOSS ❌'} P&L:{pnl:+.2f}")
-            await telegram.send(
-                f"{'✅ WIN' if won else '❌ LOSS'}\n\n"
-                f"❓ {pos['question'][:120]}\n\n"
-                f"{pos['side']} @ {pos['side_price']*100:.1f}¢ → <b>{outcome}</b>\n"
-                f"💰 P&L:<b>{pnl:+.2f}$</b>\n"
-                f"📊 WR:{wr}% | Банкролл:${stats['bankroll']:.2f}"
-            )
+            close_reason = "RESOLVED"
+
+        # 2. Take profit — price moved in our favor
+        elif pnl_pct >= tp_pct:
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+            pnl    = round(payout - pos["stake_amt"], 2)
+            close_reason = "TAKE_PROFIT"
+
+        # 3. Stop loss — price moved against us
+        elif pnl_pct <= -sl_pct:
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+            pnl    = round(payout - pos["stake_amt"], 2)
+            close_reason = "STOP_LOSS"
+
+        if not close_reason:
+            continue
+
+        outcome = outcome if close_reason == "RESOLVED" else f"{pos['side']}@{price*100:.0f}¢"
+        await db.close_position(pos["id"], outcome, payout, pnl)
+        stats = await db.get_stats()
+        total = stats["wins"] + stats["losses"]
+        wr    = round(stats["wins"]/total*100) if total > 0 else 0
+
+        reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑"}[close_reason]
+        won = pnl > 0
+        log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
+        await telegram.send(
+            f"{reason_emoji} <b>{close_reason}</b> {'✅' if won else '❌'}\n\n"
+            f"❓ {pos['question'][:120]}\n\n"
+            f"{pos['side']} @ {pos['side_price']*100:.1f}¢ → <b>{price*100:.1f}¢</b>\n"
+            f"📈 Движение:<b>{pnl_pct*100:+.1f}%</b>\n"
+            f"💰 P&L:<b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
+            f"📊 WR:{wr}% | Банкролл:${stats['bankroll']:.2f}"
+        )
 
 async def main():
     log.info("🚀 QUANT ENGINE v3")
@@ -280,7 +314,7 @@ async def main():
                 })
                 await execute_signal(sig, db, telegram, CONFIG)
 
-            await monitor_positions(db, telegram, scanner)
+            await monitor_positions(db, telegram, scanner, CONFIG)
 
             if now - last_history >= CONFIG["HISTORY_INTERVAL"]:
                 last_history = now

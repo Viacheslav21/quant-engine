@@ -135,11 +135,14 @@ class NewsMonitor:
             if not (theme_match or kw_match): continue
             price_unchanged = await self._price_unchanged(market["id"])
             if price_unchanged:
+                log.info(f"[NEWS] Match: '{news_item['title'][:60]}' → '{market['question'][:60]}'")
                 relevant.append({
                     **market,
                     "news_sentiment": news_item["sentiment"],
                     "news_title":     news_item["title"],
                 })
+        if relevant:
+            log.info(f"[NEWS] Found {len(relevant)} relevant markets for theme={theme}")
         return relevant
 
     async def _price_unchanged(self, market_id: str) -> bool:

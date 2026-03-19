@@ -48,6 +48,7 @@ class PolymarketScanner:
     async def fetch(self) -> list:
         try:
             markets = []
+            filtered = 0
             offset  = 0
             while len(markets) < 200:
                 r = await self.client.get(f"{GAMMA_API}/markets", params={
@@ -61,6 +62,7 @@ class PolymarketScanner:
                     vol = float(m.get("volume") or 0)
                     liq = float(m.get("liquidity") or 0)
                     if vol < self.config["MIN_VOLUME"] or liq < 5000:
+                        filtered += 1
                         continue
                     raw_prices = m.get("outcomePrices") or ["0.5","0.5"]
                     if isinstance(raw_prices, str):
@@ -69,6 +71,7 @@ class PolymarketScanner:
                     yes_price = float(raw_prices[0])
                     no_price  = float(raw_prices[1]) if len(raw_prices) > 1 else 1 - yes_price
                     if yes_price > 0.97 or yes_price < 0.03:
+                        filtered += 1
                         continue
                     end_date = _parse_end_date(m.get("endDate"))
                     markets.append({
@@ -86,7 +89,7 @@ class PolymarketScanner:
                     })
                 offset += 100
                 if len(batch) < 100: break
-            log.info(f"[SCANNER] {len(markets)} рынков")
+            log.info(f"[SCANNER] {len(markets)} рынков (filtered out: {filtered})")
             return markets
         except Exception as e:
             log.error(f"[SCANNER] {e}")

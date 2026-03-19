@@ -18,8 +18,9 @@ class Database:
         log.info("[DB] PostgreSQL подключён")
 
     async def _create_schema(self):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
                 CREATE TABLE IF NOT EXISTS markets (
                     id TEXT PRIMARY KEY, slug TEXT, question TEXT NOT NULL,
                     theme TEXT DEFAULT 'other', yes_price REAL, no_price REAL,
@@ -85,6 +86,10 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_news_processed ON news(processed, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(is_active, volume DESC);
             """)
+            log.info("[DB] Schema created")
+        except Exception as e:
+            log.error(f"[DB] Schema creation failed: {e}")
+            raise
 
     async def _init_stats(self):
         bankroll = float(os.getenv("BANKROLL", "1000"))
@@ -164,24 +169,29 @@ class Database:
             return [dict(r) for r in rows]
 
     async def save_position(self, pos: dict):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-                """, pos["id"], pos["market_id"], pos.get("signal_id"),
-                    pos["question"], pos.get("theme","other"), pos["side"],
-                    pos["side_price"], pos["p_final"], pos["ev"], pos["kl"],
-                    pos["kelly"], pos["stake_amt"], pos["side_price"], pos.get("url",""))
-                await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", -pos["stake_amt"])
-                await conn.execute("""
-                    UPDATE stats SET
-                        total_bets=total_bets+1,
-                        avg_ev=(avg_ev*total_bets+$1)/(total_bets+1),
-                        avg_kelly=(avg_kelly*total_bets+$2)/(total_bets+1),
-                        updated_at=NOW()
-                    WHERE id=1
-                """, pos["ev"], pos["kelly"])
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("""
+                        INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    """, pos["id"], pos["market_id"], pos.get("signal_id"),
+                        pos["question"], pos.get("theme","other"), pos["side"],
+                        pos["side_price"], pos["p_final"], pos["ev"], pos["kl"],
+                        pos["kelly"], pos["stake_amt"], pos["side_price"], pos.get("url",""))
+                    await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", -pos["stake_amt"])
+                    await conn.execute("""
+                        UPDATE stats SET
+                            total_bets=total_bets+1,
+                            avg_ev=(avg_ev*total_bets+$1)/(total_bets+1),
+                            avg_kelly=(avg_kelly*total_bets+$2)/(total_bets+1),
+                            updated_at=NOW()
+                        WHERE id=1
+                    """, pos["ev"], pos["kelly"])
+            log.info(f"[DB] Position opened: {pos['id']} {pos['side']} ${pos['stake_amt']:.2f} on {pos['question'][:50]}")
+        except Exception as e:
+            log.error(f"[DB] save_position failed: {e}")
+            raise
 
     async def update_position_price(self, pos_id: str, price: float, upnl: float):
         async with self.pool.acquire() as conn:
@@ -190,15 +200,20 @@ class Database:
     async def close_position(self, pos_id: str, outcome: str, payout: float, pnl: float):
         result = "WIN" if pnl > 0 else "LOSS"
         won = result == "WIN"
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    UPDATE positions SET outcome=$1,payout=$2,pnl=$3,result=$4,status='closed',closed_at=NOW() WHERE id=$5
-                """, outcome, payout, pnl, result, pos_id)
-                await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", payout)
-                await conn.execute("""
-                    UPDATE stats SET total_pnl=total_pnl+$1, wins=wins+$2, losses=losses+$3, updated_at=NOW() WHERE id=1
-                """, pnl, 1 if won else 0, 0 if won else 1)
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("""
+                        UPDATE positions SET outcome=$1,payout=$2,pnl=$3,result=$4,status='closed',closed_at=NOW() WHERE id=$5
+                    """, outcome, payout, pnl, result, pos_id)
+                    await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", payout)
+                    await conn.execute("""
+                        UPDATE stats SET total_pnl=total_pnl+$1, wins=wins+$2, losses=losses+$3, updated_at=NOW() WHERE id=1
+                    """, pnl, 1 if won else 0, 0 if won else 1)
+            log.info(f"[DB] Position closed: {pos_id} {result} pnl={pnl:+.2f} payout={payout:.2f}")
+        except Exception as e:
+            log.error(f"[DB] close_position failed: {e}")
+            raise
 
     async def get_open_positions(self) -> list:
         async with self.pool.acquire() as conn:
@@ -224,6 +239,7 @@ class Database:
                 data.get("avg_volume",0), data.get("volume_signal",1.0),
                 data.get("time_decay_coef",0.05), data.get("prospect_factor",1.0),
                 data.get("win_rate",0.5), data.get("avg_ev",0))
+        log.debug(f"[DB] Pattern upserted: {category} base_rate={data['base_rate']:.4f} n={data['sample_size']}")
 
     async def get_patterns(self) -> dict:
         async with self.pool.acquire() as conn:
@@ -289,3 +305,4 @@ class Database:
     async def close(self):
         if self.pool:
             await self.pool.close()
+            log.info("[DB] Connection pool closed")

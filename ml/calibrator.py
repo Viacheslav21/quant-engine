@@ -17,6 +17,7 @@ class Calibrator:
     async def update(self):
         closed = await self.db.get_closed_positions(limit=self.window)
         if len(closed) < self._min_bets:
+            log.info(f"[CALIBRATOR] Skipped: {len(closed)} positions < {self._min_bets} minimum")
             return
         preds    = np.array([float(p.get("p_final",0.5)) for p in closed])
         outcomes = np.array([1.0 if p.get("result")=="WIN" else 0.0 for p in closed])
@@ -29,6 +30,7 @@ class Calibrator:
         log.info(f"[CALIBRATOR] Brier:{self._brier:.4f} Bias:{self.bias:+.4f} Factor:{self.factor:.4f} [{self.quality()}]")
 
     def update_from_history(self, agent: str, brier: float, bias: float, factor: float):
+        log.debug(f"[CALIBRATOR] Updated from history: agent={agent} brier={brier:.4f} bias={bias:+.4f} factor={factor:.4f}")
         self._agent_factors[agent] = factor
         if agent == "final":
             self.factor = factor
@@ -42,7 +44,8 @@ class Calibrator:
             logit     = math.log(max(p_raw,0.001) / (1-min(p_raw,0.999)+1e-9))
             logit_adj = logit * self.factor - self.bias
             return max(0.02, min(0.98, 1/(1+math.exp(-logit_adj))))
-        except Exception:
+        except Exception as e:
+            log.warning(f"[CALIBRATOR] adjust() failed for p_raw={p_raw}: {e}")
             return p_raw
 
     def get_score(self) -> float:

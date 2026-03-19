@@ -88,11 +88,20 @@ class MathEngine:
         kelly = kelly_fraction(p_side, price_side)
         edge  = abs(p_final - p_market)
 
-        if ev    < self.config["MIN_EV"]:        return None
-        if kl    < self.config["MIN_KL"]:        return None
-        if kelly < self.config["MIN_KELLY_FRAC"]: return None
-        if edge  < 0.05:                          return None
+        if ev < self.config["MIN_EV"]:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {self.config['MIN_EV']}")
+            return None
+        if kl < self.config["MIN_KL"]:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: KL {kl:.4f} < {self.config['MIN_KL']}")
+            return None
+        if kelly < self.config["MIN_KELLY_FRAC"]:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: Kelly {kelly:.4f} < {self.config['MIN_KELLY_FRAC']}")
+            return None
+        if edge < 0.05:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.05")
+            return None
 
+        log.info(f"[MATH] Signal: {side} '{market['question'][:50]}' EV:+{ev*100:.1f}% Kelly:{kelly*100:.1f}% Edge:{edge*100:.1f}%")
         return {
             "market_id":  market["id"],
             "question":   market["question"],
@@ -155,4 +164,6 @@ class MathEngine:
 
     def compute_stake(self, bankroll: float, kelly: float) -> float:
         stake = bankroll * kelly
-        return round(max(1.0, min(stake, bankroll*self.config["MAX_KELLY_FRAC"])), 2)
+        stake = round(max(1.0, min(stake, bankroll*self.config["MAX_KELLY_FRAC"])), 2)
+        log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")
+        return stake
