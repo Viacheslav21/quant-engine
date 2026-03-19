@@ -173,7 +173,22 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
 
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
-        if not m: continue
+        is_closed = False
+        if not m:
+            # Market not in active scan — likely resolved/closed, fetch directly
+            raw = await scanner.get_market(pos["market_id"])
+            if not raw:
+                continue
+            raw_prices = raw.get("outcomePrices") or ["0.5", "0.5"]
+            if isinstance(raw_prices, str):
+                import json as _json
+                raw_prices = _json.loads(raw_prices)
+            m = {
+                "id": raw["id"],
+                "yes_price": float(raw_prices[0]),
+                "no_price": float(raw_prices[1]) if len(raw_prices) > 1 else 1 - float(raw_prices[0]),
+            }
+            is_closed = bool(raw.get("closed"))
         price = m["yes_price"] if pos["side"] == "YES" else m.get("no_price", 1-m["yes_price"])
         upnl  = (price / pos["side_price"] - 1) * pos["stake_amt"]
         await db.update_position_price(pos["id"], price, upnl)
@@ -185,10 +200,10 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
         sl_pct = pos.get("sl_pct") or config["STOP_LOSS_PCT"]
 
-        # 1. Market fully resolved
-        is_resolved = m.get("yes_price", 0.5) >= 0.98 or m.get("yes_price", 0.5) <= 0.02
+        # 1. Market resolved — API says closed, or price hit 0/1
+        is_resolved = is_closed or m.get("yes_price", 0.5) >= 0.95 or m.get("yes_price", 0.5) <= 0.05
         if is_resolved:
-            outcome = "YES" if m["yes_price"] >= 0.98 else "NO"
+            outcome = "YES" if m["yes_price"] >= 0.50 else "NO"
             won     = outcome == pos["side"]
             payout  = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
             pnl     = round(payout - pos["stake_amt"], 2)
