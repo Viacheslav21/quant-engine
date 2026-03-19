@@ -295,6 +295,9 @@ async def main():
                 await db.upsert_market(m)
                 await db.save_snapshot(m["id"], m["yes_price"], m["volume"], m.get("volume_24h", 0))
 
+            # Build neg-risk groups for arbitrage detection
+            math_eng.build_neg_risk_groups(markets)
+
             news_signals = []
             if now - last_news >= CONFIG["NEWS_INTERVAL"]:
                 last_news = now

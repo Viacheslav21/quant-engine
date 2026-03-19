@@ -77,6 +77,7 @@ class MathEngine:
         self._vol_history: dict = {}
         self._price_cache: dict = {}  # market_id -> list of recent prices (30 points, ~5 min)
         self._long_price_cache: dict = {}  # market_id -> list of recent prices (180 points, ~30 min)
+        self._neg_risk_groups: dict = {}  # neg_risk_market_id -> [market dicts] for arbitrage
 
     async def load_patterns(self):
         self._patterns = await self.db.get_patterns()
@@ -111,10 +112,20 @@ class MathEngine:
 
         p_contrarian, contrarian_conf = self._mean_reversion(market["id"], p_market)
 
+        # 7. Long-term momentum from API (week/month price changes)
+        p_long_mom = self._long_momentum(market)
+
+        # 8. Volume trend (24h vs weekly average)
+        p_vol_trend = self._volume_trend(market)
+
+        # 9. NegRisk arbitrage (multi-outcome events)
+        p_arb = self._neg_risk_arb(market)
+
         # --- Bayesian fusion in log-odds space ---
         # Prior: prospect-adjusted market price
-        # Evidence: history, volume, time, momentum, contrarian
-        evidence = [e for e in [p_history, p_volume, p_time, p_momentum, p_contrarian] if e is not None]
+        # Evidence: history, volume, time, momentum, contrarian, long momentum, vol trend, arb
+        evidence = [e for e in [p_history, p_volume, p_time, p_momentum, p_contrarian,
+                                p_long_mom, p_vol_trend, p_arb] if e is not None]
         if evidence:
             p_final = bayesian_update(p_prospect, *evidence)
         else:
@@ -131,10 +142,22 @@ class MathEngine:
         else:
             side, p_side, price_side = "NO", 1-p_final, 1-p_market
 
-        ev    = expected_value(p_side, price_side)
+        # Use bestAsk as real entry price when available (more accurate than mid-price)
+        best_ask = market.get("best_ask")
+        if best_ask and 0.01 < best_ask < 0.99:
+            real_price = best_ask if p_final > p_market else (1 - best_ask)
+        else:
+            real_price = price_side
+
+        ev    = expected_value(p_side, real_price)
         kl    = kl_divergence(p_final, p_market)
-        kelly = kelly_fraction(p_side, price_side)
+        kelly = kelly_fraction(p_side, real_price)
         edge  = abs(p_final - p_market)
+
+        # Spread penalty: wide spread = less confident sizing
+        spread_mult = self._spread_penalty(market)
+        if spread_mult < 1.0:
+            kelly = round(kelly * spread_mult, 4)
 
         if ev < self.config["MIN_EV"]:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {self.config['MIN_EV']}")
@@ -159,7 +182,8 @@ class MathEngine:
             if contrarian_shift > max_other:
                 is_contrarian = True
 
-        log.info(f"[MATH] Signal: {side} '{market['question'][:50]}' EV:+{ev*100:.1f}% Kelly:{kelly*100:.1f}% Edge:{edge*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
+        arb_tag = " [ARB]" if p_arb is not None else ""
+        log.info(f"[MATH] Signal: {side} '{market['question'][:50]}' EV:+{ev*100:.1f}% Kelly:{kelly*100:.1f}% Edge:{edge*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}{arb_tag}")
         return {
             "market_id":  market["id"],
             "question":   market["question"],
@@ -171,7 +195,10 @@ class MathEngine:
             "p_prospect": p_prospect,
             "p_history":  p_history,
             "p_momentum": p_momentum,
+            "p_long_mom": p_long_mom,
             "p_contrarian": p_contrarian,
+            "p_vol_trend": p_vol_trend,
+            "p_arb":      p_arb,
             "p_final":    p_final,
             "p_side":     round(p_side, 4),
             "ev":         ev,
@@ -179,6 +206,8 @@ class MathEngine:
             "kelly":      kelly,
             "entropy":    entropy(p_market),
             "edge":       round(edge, 4),
+            "spread":     market.get("spread", 0),
+            "spread_mult": spread_mult,
             "vol_signal": round(vol_signal, 2),
             "vol_dir":    vol_dir,
             "contrarian": is_contrarian,
@@ -304,6 +333,88 @@ class MathEngine:
         p_contrarian = round(max(0.02, min(0.98, p_contrarian)), 4)
 
         return p_contrarian, confidence
+
+    def _spread_penalty(self, market: dict) -> float:
+        """Spread > 3¢ reduces confidence. Returns multiplier 0.0–1.0."""
+        spread = market.get("spread", 0)
+        if spread <= 0.03:
+            return 1.0
+        if spread >= 0.10:
+            return 0.3
+        # Linear scale: 3¢→1.0, 10¢→0.3
+        return round(1.0 - (spread - 0.03) / 0.07 * 0.7, 3)
+
+    def _long_momentum(self, market: dict) -> Optional[float]:
+        """Use API-provided week/month price changes as long-term momentum signal."""
+        chg_1wk = market.get("price_change_1wk", 0)
+        chg_1mo = market.get("price_change_1mo", 0)
+        if chg_1wk == 0 and chg_1mo == 0:
+            return None
+        # Weighted: week is more recent, weight 0.7; month gives context, weight 0.3
+        blended = chg_1wk * 0.7 + chg_1mo * 0.3
+        # Cap at ±8% shift
+        shift = max(-0.08, min(0.08, blended * 0.5))
+        p_long = market["yes_price"] + shift
+        return round(max(0.02, min(0.98, p_long)), 4)
+
+    def _volume_trend(self, market: dict) -> Optional[float]:
+        """Compare 24h volume to weekly average. Rising interest = trust market price more."""
+        vol_24h = market.get("volume_24h", 0)
+        vol_1wk = market.get("volume_1wk", 0)
+        if vol_1wk <= 0 or vol_24h <= 0:
+            return None
+        daily_avg = vol_1wk / 7
+        if daily_avg <= 0:
+            return None
+        ratio = vol_24h / daily_avg
+        if 0.5 < ratio < 2.0:
+            # Normal volume range — no signal
+            return None
+        p_market = market["yes_price"]
+        if ratio >= 2.0:
+            # Rising interest: market moving toward truth, trust market direction
+            # Amplify current deviation from 0.5
+            strength = min(0.05, (ratio - 2.0) * 0.02)
+            direction = 1 if p_market > 0.5 else -1
+            p_vol_trend = p_market + direction * strength
+        else:
+            # Dying interest (ratio < 0.5): market may be stale, pull toward 0.5
+            strength = min(0.03, (0.5 - ratio) * 0.03)
+            p_vol_trend = p_market + (0.5 - p_market) * strength
+        return round(max(0.02, min(0.98, p_vol_trend)), 4)
+
+    def build_neg_risk_groups(self, markets: list):
+        """Group neg-risk markets by their shared event ID for arbitrage detection."""
+        self._neg_risk_groups.clear()
+        for m in markets:
+            nrm_id = m.get("neg_risk_market_id", "")
+            if nrm_id and m.get("neg_risk"):
+                self._neg_risk_groups.setdefault(nrm_id, []).append(m)
+        grouped = sum(1 for g in self._neg_risk_groups.values() if len(g) > 1)
+        if grouped:
+            log.info(f"[MATH] NegRisk: {grouped} multi-outcome events ({sum(len(g) for g in self._neg_risk_groups.values())} markets)")
+
+    def _neg_risk_arb(self, market: dict) -> Optional[float]:
+        """Detect mispricing in multi-outcome events where probabilities should sum to 1."""
+        nrm_id = market.get("neg_risk_market_id", "")
+        if not nrm_id:
+            return None
+        group = self._neg_risk_groups.get(nrm_id)
+        if not group or len(group) < 2:
+            return None
+        # Sum of all YES prices in this event
+        total = sum(m["yes_price"] for m in group)
+        if total <= 0:
+            return None
+        # Fair sum = 1.0; overpriced if > 1, underpriced if < 1
+        # Adjust this market's probability proportionally
+        # E.g. total=1.10 means 10% overpriced, each outcome should be ~9% lower
+        fair_price = market["yes_price"] / total
+        # Don't return if adjustment is tiny (< 1%)
+        if abs(fair_price - market["yes_price"]) < 0.01:
+            return None
+        log.debug(f"[MATH] NegRisk arb {market['id'][:8]}: sum={total:.3f} price={market['yes_price']:.3f}→{fair_price:.3f}")
+        return round(max(0.02, min(0.98, fair_price)), 4)
 
     def compute_stake(self, bankroll: float, kelly: float) -> float:
         stake = bankroll * kelly
