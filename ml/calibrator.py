@@ -19,8 +19,26 @@ class Calibrator:
         if len(closed) < self._min_bets:
             log.info(f"[CALIBRATOR] Skipped: {len(closed)} positions < {self._min_bets} minimum")
             return
-        preds    = np.array([float(p.get("p_final",0.5)) for p in closed])
-        outcomes = np.array([1.0 if p.get("result")=="WIN" else 0.0 for p in closed])
+        # Use actual market outcome, not bet result
+        preds_list, actuals_list = [], []
+        for p in closed:
+            outcome = p.get("outcome", "")
+            if outcome == "YES":
+                actuals_list.append(1.0)
+            elif outcome == "NO":
+                actuals_list.append(0.0)
+            elif outcome.startswith("YES"):
+                actuals_list.append(1.0)
+            elif outcome.startswith("NO"):
+                actuals_list.append(0.0)
+            else:
+                continue
+            preds_list.append(float(p.get("p_final", 0.5)))
+        if len(preds_list) < self._min_bets:
+            log.info(f"[CALIBRATOR] Skipped: only {len(preds_list)} resolved outcomes")
+            return
+        preds    = np.array(preds_list)
+        outcomes = np.array(actuals_list)
         self._brier = float(np.mean((preds-outcomes)**2))
         self.bias   = float(np.mean(preds-outcomes))
         if abs(self.bias) > 0.05:

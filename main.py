@@ -99,10 +99,16 @@ Return ONLY JSON in <json></json> tags:
         log.warning(f"[CLAUDE] {e}")
     return {"confirm": True, "p_claude": signal["p_final"], "confidence": 0.5, "reasoning": "fallback"}
 
+MAX_PER_THEME = 5  # no more than 5 positions in the same theme
+
 async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict):
     open_pos = await db.get_open_positions()
     if len(open_pos) >= config["MAX_OPEN"]: return False
     if any(p["market_id"] == signal["market_id"] for p in open_pos): return False
+    theme_count = sum(1 for p in open_pos if p.get("theme") == signal.get("theme"))
+    if theme_count >= MAX_PER_THEME:
+        log.info(f"[EXEC] Skipped: theme '{signal.get('theme')}' already has {theme_count} positions")
+        return False
     stats    = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
     math_eng = MathEngine(config, db)
@@ -210,7 +216,7 @@ async def main():
     scanner    = PolymarketScanner(CONFIG)
     news_mon   = NewsMonitor(db)
     calibrator = Calibrator(db)
-    math_eng   = MathEngine(CONFIG, db)
+    math_eng   = MathEngine(CONFIG, db, calibrator)
     history    = HistoryAgent(db, calibrator)
 
     asyncio.create_task(start_dashboard(db, CONFIG))
@@ -274,7 +280,8 @@ async def main():
             for s in news_signals:
                 all_signals[s["market_id"]] = s
 
-            signals = sorted(all_signals.values(), key=lambda s: s["ev"] * s["kelly"], reverse=True)
+            # Rank by Kelly (already incorporates EV), penalize high-entropy (uncertain) markets
+            signals = sorted(all_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
 
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(signals)} сигналов")

@@ -75,14 +75,36 @@ class HistoryAgent:
             })
 
     async def _calibrate_system(self, positions: list):
-        preds    = np.array([float(p.get("p_final",0.5)) for p in positions])
-        outcomes = np.array([1.0 if p.get("result")=="WIN" else 0.0 for p in positions])
+        # Use actual market outcome (YES/NO), not bet result (WIN/LOSS)
+        # p_final is our predicted P(YES), outcome is whether YES happened
+        preds, actuals = [], []
+        for p in positions:
+            outcome = p.get("outcome", "")
+            if not outcome:
+                continue
+            p_final = float(p.get("p_final", 0.5))
+            # For RESOLVED positions: outcome is "YES" or "NO"
+            # For TP/SL positions: outcome is like "YES@65¢", extract the side
+            if outcome == "YES":
+                actual = 1.0
+            elif outcome == "NO":
+                actual = 0.0
+            elif outcome.startswith("YES"):
+                actual = 1.0  # we bet YES and it was trending right
+            elif outcome.startswith("NO"):
+                actual = 0.0
+            else:
+                continue
+            preds.append(p_final)
+            actuals.append(actual)
 
         if len(preds) < 5: return
 
-        brier  = float(np.mean((preds-outcomes)**2))
-        bias   = float(np.mean(preds-outcomes))
-        factor = max(0.7, min(1.3, 1.0-bias*0.5))
+        preds   = np.array(preds)
+        actuals = np.array(actuals)
+        brier  = float(np.mean((preds - actuals)**2))
+        bias   = float(np.mean(preds - actuals))
+        factor = max(0.7, min(1.3, 1.0 - bias * 0.5))
 
         await self.db.save_calibration("final", brier, bias, factor, len(preds))
         self.calibrator.update_from_history("final", brier, bias, factor)

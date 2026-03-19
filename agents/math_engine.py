@@ -9,6 +9,8 @@ PROSPECT_GAMMA   = 0.65
 MIN_BETS_HISTORY = 10
 VOLUME_SPIKE_THR = 2.5
 
+# --- Core math functions ---
+
 def prospect_weight(p: float, gamma: float = PROSPECT_GAMMA) -> float:
     if p <= 0.001: return 0.001
     if p >= 0.999: return 0.999
@@ -43,12 +45,37 @@ def entropy(p: float) -> float:
     if p <= 0 or p >= 1: return 0.0
     return round(-p*math.log2(p)-(1-p)*math.log2(1-p), 4)
 
+def prob_to_logodds(p: float) -> float:
+    p = max(0.001, min(0.999, p))
+    return math.log(p / (1 - p))
+
+def logodds_to_prob(lo: float) -> float:
+    return 1 / (1 + math.exp(-lo))
+
+# --- Bayesian fusion: combine evidence in log-odds space ---
+
+def bayesian_update(prior: float, *evidence_probs) -> float:
+    """Combine prior with independent evidence using log-odds (Bayesian fusion).
+    Each evidence_prob is an independent estimate of P(YES).
+    Prior is typically the market price."""
+    lo = prob_to_logodds(prior)
+    base_lo = prob_to_logodds(0.5)  # uninformative prior in log-odds
+    for p_ev in evidence_probs:
+        if p_ev is None:
+            continue
+        # Each evidence contributes its log-likelihood ratio vs base rate
+        lo += prob_to_logodds(p_ev) - base_lo
+    return max(0.02, min(0.98, logodds_to_prob(lo)))
+
+
 class MathEngine:
-    def __init__(self, config: dict, db):
-        self.config    = config
-        self.db        = db
+    def __init__(self, config: dict, db, calibrator=None):
+        self.config      = config
+        self.db          = db
+        self.calibrator  = calibrator
         self._patterns: dict = {}
         self._vol_history: dict = {}
+        self._price_cache: dict = {}  # market_id -> list of recent prices
 
     async def load_patterns(self):
         self._patterns = await self.db.get_patterns()
@@ -58,25 +85,36 @@ class MathEngine:
         p_market = market["yes_price"]
         theme    = market.get("theme","other")
 
+        # 1. Prospect theory — invert human probability weighting
         p_prospect = prospect_true_price(p_market)
-        p_history  = self._apply_history(p_market, theme)
-        vol_signal, vol_dir = self._volume_signal(market["id"], market.get("volume_24h",0))
-        p_time     = self._time_decay(p_market, market.get("end_date"))
 
-        w = {
-            "prospect": 0.40,
-            "history":  0.35 if p_history else 0.0,
-            "volume":   0.15 if vol_signal > 1.5 else 0.0,
-            "time":     0.10,
-        }
-        total_w = sum(w.values()) or 1.0
-        p_final = (
-            w["prospect"] * p_prospect +
-            w["history"]  * (p_history or p_prospect) +
-            w["volume"]   * self._vol_adjusted(p_market, vol_signal, vol_dir) +
-            w["time"]     * p_time
-        ) / total_w
-        p_final = max(0.02, min(0.98, p_final))
+        # 2. Historical base rate for this theme
+        p_history = self._apply_history(p_market, theme)
+
+        # 3. Volume spike detection
+        vol_signal, vol_dir = self._volume_signal(market["id"], market.get("volume_24h",0))
+        p_volume = self._vol_adjusted(p_market, vol_signal, vol_dir) if vol_signal > 1.5 else None
+
+        # 4. Time decay — markets converge to truth near expiry
+        p_time = self._time_decay(p_market, market.get("end_date"))
+
+        # 5. Price momentum — trend from recent snapshots
+        p_momentum = self._price_momentum(market["id"], p_market)
+
+        # --- Bayesian fusion in log-odds space ---
+        # Prior: prospect-adjusted market price
+        # Evidence: history, volume, time, momentum
+        evidence = [e for e in [p_history, p_volume, p_time, p_momentum] if e is not None]
+        if evidence:
+            p_final = bayesian_update(p_prospect, *evidence)
+        else:
+            p_final = p_prospect
+
+        # 6. Apply calibration correction if available
+        if self.calibrator:
+            p_final = self.calibrator.adjust(p_final)
+
+        p_final = max(0.02, min(0.98, round(p_final, 4)))
 
         if p_final > p_market:
             side, p_side, price_side = "YES", p_final, p_market
@@ -112,7 +150,8 @@ class MathEngine:
             "p_market":   p_market,
             "p_prospect": p_prospect,
             "p_history":  p_history,
-            "p_final":    round(p_final, 4),
+            "p_momentum": p_momentum,
+            "p_final":    p_final,
             "p_side":     round(p_side, 4),
             "ev":         ev,
             "kl":         kl,
@@ -139,15 +178,17 @@ class MathEngine:
         if avg <= 0: return 1.0, "neutral"
         ratio = volume_24h / avg
         if ratio > VOLUME_SPIKE_THR:
-            direction = "up" if volume_24h > history[-2] else "down"
-            log.info(f"[MATH] 📊 Volume spike {market_id[:8]}: {ratio:.1f}x → {direction}")
+            # Compare to average, not just previous point (less noisy)
+            direction = "up" if volume_24h > avg * 1.2 else "down"
+            log.info(f"[MATH] Volume spike {market_id[:8]}: {ratio:.1f}x avg → {direction}")
             return ratio, direction
         return ratio, "neutral"
 
     def _vol_adjusted(self, p_market: float, vol_ratio: float, direction: str) -> float:
         if vol_ratio < VOLUME_SPIKE_THR or direction == "neutral": return p_market
-        if direction == "up":   return min(0.98, p_market*(1+0.1*min(vol_ratio/5,1)))
-        return max(0.02, p_market*(1-0.1*min(vol_ratio/5,1)))
+        strength = min(0.10, 0.05 * (vol_ratio / VOLUME_SPIKE_THR))
+        if direction == "up":   return min(0.98, p_market * (1 + strength))
+        return max(0.02, p_market * (1 - strength))
 
     def _time_decay(self, p_market: float, end_date) -> float:
         if not end_date: return p_market
@@ -158,9 +199,34 @@ class MathEngine:
         except Exception:
             return p_market
         if days_left <= 0:  return p_market
-        if days_left <= 3:  return p_market*0.95 + prospect_true_price(p_market)*0.05
-        if days_left <= 14: return p_market*0.7  + prospect_true_price(p_market)*0.3
-        return prospect_true_price(p_market)
+        # Smooth decay: blend market → prospect as time increases
+        # Near expiry: trust market price more (it's converging to truth)
+        # Far from expiry: prospect theory has more room to add value
+        decay = min(1.0, max(0.0, (days_left - 3) / 30))
+        return p_market * (1 - decay) + prospect_true_price(p_market) * decay
+
+    def _price_momentum(self, market_id: str, current_price: float) -> Optional[float]:
+        """Track price trend from recent snapshots. Rising prices = more YES signal."""
+        history = self._price_cache.setdefault(market_id, [])
+        history.append(current_price)
+        if len(history) > 30: history.pop(0)
+        if len(history) < 5: return None
+
+        # Linear regression slope over recent prices
+        n = len(history)
+        x_mean = (n - 1) / 2
+        y_mean = sum(history) / n
+        num = sum((i - x_mean) * (history[i] - y_mean) for i in range(n))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        if den == 0: return None
+        slope = num / den
+
+        # Slope per tick → extrapolated probability shift
+        # Positive slope = price trending up = YES more likely
+        # Cap at ±5% adjustment
+        momentum_shift = max(-0.05, min(0.05, slope * n * 0.5))
+        p_mom = current_price + momentum_shift
+        return round(max(0.02, min(0.98, p_mom)), 4)
 
     def compute_stake(self, bankroll: float, kelly: float) -> float:
         stake = bankroll * kelly

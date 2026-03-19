@@ -74,6 +74,10 @@ class PolymarketScanner:
                         filtered += 1
                         continue
                     end_date = _parse_end_date(m.get("endDate"))
+                    # URL: use event slug if available, fall back to market slug
+                    events = m.get("events") or []
+                    event_slug = events[0].get("slug", "") if events else ""
+                    url_slug = event_slug or m.get("slug", "")
                     markets.append({
                         "id":        m["id"],
                         "slug":      m.get("slug",""),
@@ -85,7 +89,7 @@ class PolymarketScanner:
                         "liquidity": liq,
                         "end_date":  end_date,
                         "theme":     detect_theme(m.get("question","")),
-                        "url":       f"https://polymarket.com/event/{m.get('slug','')}",
+                        "url":       f"https://polymarket.com/event/{url_slug}",
                     })
                 offset += 100
                 if len(batch) < 100: break
