@@ -48,30 +48,40 @@ CONFIG = {
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "5")),
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
-    "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.15")),
+    "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.20")),
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.50")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
 }
 
+_claude_client = None
+
+def _get_claude_client(config: dict):
+    global _claude_client
+    if _claude_client is None:
+        from anthropic import AsyncAnthropic
+        _claude_client = AsyncAnthropic(api_key=config["ANTHROPIC_KEY"])
+    return _claude_client
+
 async def claude_confirm(signal: dict, config: dict) -> dict:
     import re, json
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(api_key=config["ANTHROPIC_KEY"])
+    client = _get_claude_client(config)
     SYSTEM = """You are a prediction market analyst.
 Given a market signal found by mathematical analysis, confirm or reject it.
+Search the web for latest news about this market topic before deciding.
 Return ONLY JSON in <json></json> tags:
 <json>{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}</json>"""
+    prompt = (
+        f"Market: {signal['question']}\n"
+        f"Side: {signal['side']} @ {signal['side_price']*100:.1f}¢\n"
+        f"Math: p_true={signal['p_final']*100:.1f}% vs market {signal['p_market']*100:.1f}%\n"
+        f"EV:+{signal['ev']*100:.1f}% KL:{signal['kl']:.3f}\nConfirm?"
+    )
     try:
         r = await client.messages.create(
             model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content":
-                f"Market: {signal['question']}\n"
-                f"Side: {signal['side']} @ {signal['side_price']*100:.1f}¢\n"
-                f"Math: p_true={signal['p_final']*100:.1f}% vs market {signal['p_market']*100:.1f}%\n"
-                f"EV:+{signal['ev']*100:.1f}% KL:{signal['kl']:.3f}\nConfirm?"
-            }],
+            messages=[{"role": "user", "content": prompt}],
         )
         final = r.content
         if r.stop_reason == "tool_use":
@@ -80,12 +90,7 @@ Return ONLY JSON in <json></json> tags:
                 model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[
-                    {"role": "user",      "content":
-                        f"Market: {signal['question']}\n"
-                        f"Side: {signal['side']} @ {signal['side_price']*100:.1f}¢\n"
-                        f"Math: p_true={signal['p_final']*100:.1f}% vs market {signal['p_market']*100:.1f}%\n"
-                        f"EV:+{signal['ev']*100:.1f}% KL:{signal['kl']:.3f}\nConfirm?"
-                    },
+                    {"role": "user",      "content": prompt},
                     {"role": "assistant", "content": r.content},
                     {"role": "user",      "content": [{"type":"tool_result","tool_use_id":tu.id,"content":"Done. Now return your answer as JSON in <json></json> tags."}]},
                 ],
@@ -97,7 +102,7 @@ Return ONLY JSON in <json></json> tags:
             return json.loads(match.group(1).strip())
     except Exception as e:
         log.warning(f"[CLAUDE] {e}")
-    return {"confirm": True, "p_claude": signal["p_final"], "confidence": 0.5, "reasoning": "fallback"}
+    return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0, "reasoning": "api_error"}
 
 MAX_PER_THEME = 5  # no more than 5 positions in the same theme
 
@@ -250,7 +255,9 @@ async def main():
     last_news = last_history = 0
     scan_count = 0
     claude_cache = {}  # market_id -> (timestamp, result) — avoid re-calling for same market
-    CLAUDE_CACHE_TTL = 600  # 10 minutes
+    CLAUDE_CACHE_TTL = 1800  # 30 minutes
+    last_claude_call = 0  # timestamp of last actual API call
+    CLAUDE_MIN_INTERVAL = 60  # max 1 API call per minute
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -306,15 +313,22 @@ async def main():
             claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
 
             confirmed = []
-            for sig in signals[:5]:
+            can_call_claude = (now - last_claude_call) >= CLAUDE_MIN_INTERVAL
+            for sig in signals[:3]:
                 if sig["ev"] >= CONFIG["CLAUDE_EV_THR"]:
                     cached = claude_cache.get(sig["market_id"])
                     if cached:
                         result = cached[1]
                         log.debug(f"[CLAUDE] Cache hit for {sig['market_id'][:8]}")
-                    else:
+                    elif can_call_claude:
                         result = await claude_confirm(sig, CONFIG)
                         claude_cache[sig["market_id"]] = (now, result)
+                        last_claude_call = now
+                        can_call_claude = False
+                    else:
+                        # Rate limited — skip Claude, pass signal through without confirmation
+                        confirmed.append(sig)
+                        continue
                     if result.get("confirm"):
                         sig["p_claude"] = result.get("p_claude", sig["p_final"])
                         sig["p_final"]  = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
