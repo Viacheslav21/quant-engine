@@ -50,7 +50,7 @@ class PolymarketScanner:
             markets = []
             filtered = 0
             offset  = 0
-            while len(markets) < 200:
+            while len(markets) < 500:
                 r = await self.client.get(f"{GAMMA_API}/markets", params={
                     "active": "true", "closed": "false",
                     "order": "volume24hr", "ascending": "false",

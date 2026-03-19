@@ -149,7 +149,7 @@ class Database:
 
     async def get_active_markets(self) -> list:
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM markets WHERE is_active=TRUE ORDER BY volume DESC LIMIT 200")
+            rows = await conn.fetch("SELECT * FROM markets WHERE is_active=TRUE ORDER BY volume DESC LIMIT 500")
             return [dict(r) for r in rows]
 
     async def get_closed_markets(self, limit: int = 500) -> list:
