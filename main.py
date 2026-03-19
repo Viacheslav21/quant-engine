@@ -227,6 +227,8 @@ async def main():
 
     last_news = last_history = 0
     scan_count = 0
+    claude_cache = {}  # market_id -> (timestamp, result) — avoid re-calling for same market
+    CLAUDE_CACHE_TTL = 600  # 10 minutes
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -277,10 +279,19 @@ async def main():
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(signals)} сигналов")
 
+            # Clean expired cache entries
+            claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
+
             confirmed = []
             for sig in signals[:5]:
                 if sig["ev"] >= CONFIG["CLAUDE_EV_THR"]:
-                    result = await claude_confirm(sig, CONFIG)
+                    cached = claude_cache.get(sig["market_id"])
+                    if cached:
+                        result = cached[1]
+                        log.debug(f"[CLAUDE] Cache hit for {sig['market_id'][:8]}")
+                    else:
+                        result = await claude_confirm(sig, CONFIG)
+                        claude_cache[sig["market_id"]] = (now, result)
                     if result.get("confirm"):
                         sig["p_claude"] = result.get("p_claude", sig["p_final"])
                         sig["p_final"]  = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
