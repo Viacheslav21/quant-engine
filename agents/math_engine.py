@@ -75,7 +75,8 @@ class MathEngine:
         self.calibrator  = calibrator
         self._patterns: dict = {}
         self._vol_history: dict = {}
-        self._price_cache: dict = {}  # market_id -> list of recent prices
+        self._price_cache: dict = {}  # market_id -> list of recent prices (30 points, ~5 min)
+        self._long_price_cache: dict = {}  # market_id -> list of recent prices (180 points, ~30 min)
 
     async def load_patterns(self):
         self._patterns = await self.db.get_patterns()
@@ -101,10 +102,19 @@ class MathEngine:
         # 5. Price momentum — trend from recent snapshots
         p_momentum = self._price_momentum(market["id"], p_market)
 
+        # 6. Mean reversion / contrarian signal
+        # Update long price cache from short cache overflow
+        long_hist = self._long_price_cache.setdefault(market["id"], [])
+        long_hist.append(p_market)
+        if len(long_hist) > 180:
+            long_hist.pop(0)
+
+        p_contrarian, contrarian_conf = self._mean_reversion(market["id"], p_market)
+
         # --- Bayesian fusion in log-odds space ---
         # Prior: prospect-adjusted market price
-        # Evidence: history, volume, time, momentum
-        evidence = [e for e in [p_history, p_volume, p_time, p_momentum] if e is not None]
+        # Evidence: history, volume, time, momentum, contrarian
+        evidence = [e for e in [p_history, p_volume, p_time, p_momentum, p_contrarian] if e is not None]
         if evidence:
             p_final = bayesian_update(p_prospect, *evidence)
         else:
@@ -139,7 +149,17 @@ class MathEngine:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.05")
             return None
 
-        log.info(f"[MATH] Signal: {side} '{market['question'][:50]}' EV:+{ev*100:.1f}% Kelly:{kelly*100:.1f}% Edge:{edge*100:.1f}%")
+        # Determine if contrarian is the dominant evidence
+        is_contrarian = False
+        if p_contrarian is not None and contrarian_conf > 0.3:
+            # Contrarian is dominant if its contribution exceeds other evidence
+            contrarian_shift = abs(p_contrarian - p_market)
+            other_shifts = [abs(e - p_market) for e in [p_history, p_volume, p_time, p_momentum] if e is not None]
+            max_other = max(other_shifts) if other_shifts else 0
+            if contrarian_shift > max_other:
+                is_contrarian = True
+
+        log.info(f"[MATH] Signal: {side} '{market['question'][:50]}' EV:+{ev*100:.1f}% Kelly:{kelly*100:.1f}% Edge:{edge*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
         return {
             "market_id":  market["id"],
             "question":   market["question"],
@@ -151,6 +171,7 @@ class MathEngine:
             "p_prospect": p_prospect,
             "p_history":  p_history,
             "p_momentum": p_momentum,
+            "p_contrarian": p_contrarian,
             "p_final":    p_final,
             "p_side":     round(p_side, 4),
             "ev":         ev,
@@ -160,6 +181,8 @@ class MathEngine:
             "edge":       round(edge, 4),
             "vol_signal": round(vol_signal, 2),
             "vol_dir":    vol_dir,
+            "contrarian": is_contrarian,
+            "contrarian_conf": round(contrarian_conf, 3) if p_contrarian is not None else 0,
             "source":     "math",
         }
 
@@ -227,6 +250,60 @@ class MathEngine:
         momentum_shift = max(-0.05, min(0.05, slope * n * 0.5))
         p_mom = current_price + momentum_shift
         return round(max(0.02, min(0.98, p_mom)), 4)
+
+    def _mean_reversion(self, market_id: str, current_price: float) -> tuple:
+        """Detect sharp price moves on low volume that are likely to revert.
+        Returns (p_contrarian, confidence) or (None, 0) if no signal."""
+        # Use long price cache for detection (30 min of data)
+        long_hist = self._long_price_cache.get(market_id, [])
+        if len(long_hist) < 18:  # need ~3 min minimum history
+            return None, 0
+
+        # Price 30 min ago (or oldest available)
+        old_price = long_hist[0]
+        move = current_price - old_price
+
+        # Need >8% absolute move
+        if abs(move) < 0.08:
+            return None, 0
+
+        # Check volume ratio from _vol_history
+        vol_hist = self._vol_history.get(market_id, [])
+        if len(vol_hist) < 3:
+            vol_ratio = 1.0
+        else:
+            avg_vol = sum(vol_hist[:-1]) / len(vol_hist[:-1])
+            vol_ratio = vol_hist[-1] / avg_vol if avg_vol > 0 else 1.0
+
+        # Volume filter: high volume = informed money, skip
+        if vol_ratio > 2.5:
+            log.debug(f"[MATH] Contrarian skip {market_id[:8]}: vol_ratio {vol_ratio:.1f}x (informed money)")
+            return None, 0
+
+        # Confidence: lower volume = higher confidence, bigger move = higher confidence
+        vol_confidence = max(0, 1 - vol_ratio / 2.5)
+        move_confidence = min(1, abs(move) / 0.20)
+        confidence = vol_confidence * move_confidence
+
+        # Scale down for weak signal (volume 1.5-2.5x)
+        if vol_ratio >= 1.5:
+            confidence *= 0.5
+            log.info(f"[MATH] Contrarian WEAK {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
+        else:
+            log.info(f"[MATH] Contrarian STRONG {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
+
+        # Compute EWMA as reversion target
+        alpha = 2 / (len(long_hist) + 1)
+        ewma = long_hist[0]
+        for p in long_hist[1:]:
+            ewma = alpha * p + (1 - alpha) * ewma
+
+        # Shift probability toward EWMA (reversion target)
+        # Blend: current price shifted toward EWMA, weighted by confidence
+        p_contrarian = current_price + (ewma - current_price) * confidence * 0.5
+        p_contrarian = round(max(0.02, min(0.98, p_contrarian)), 4)
+
+        return p_contrarian, confidence
 
     def compute_stake(self, bankroll: float, kelly: float) -> float:
         stake = bankroll * kelly

@@ -14,6 +14,7 @@ class Database:
     async def init(self):
         self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10, command_timeout=30)
         await self._create_schema()
+        await self._migrate_positions_tp_sl()
         await self._init_stats()
         log.info("[DB] PostgreSQL подключён")
 
@@ -58,6 +59,7 @@ class Database:
                     unrealized_pnl REAL DEFAULT 0, outcome TEXT,
                     payout REAL DEFAULT 0, pnl REAL DEFAULT 0,
                     result TEXT, status TEXT DEFAULT 'open', url TEXT,
+                    tp_pct REAL DEFAULT 0.20, sl_pct REAL DEFAULT 0.50,
                     opened_at TIMESTAMPTZ DEFAULT NOW(), closed_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS patterns (
@@ -98,6 +100,31 @@ class Database:
                 "INSERT INTO stats (id, bankroll) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
                 bankroll
             )
+
+    async def _migrate_positions_tp_sl(self):
+        """Add tp_pct/sl_pct columns to positions if missing (existing DBs)."""
+        async with self.pool.acquire() as conn:
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='positions'"
+            )
+            col_names = {r["column_name"] for r in cols}
+            if "tp_pct" not in col_names:
+                await conn.execute("ALTER TABLE positions ADD COLUMN tp_pct REAL DEFAULT 0.20")
+                log.info("[DB] Added tp_pct column to positions")
+            if "sl_pct" not in col_names:
+                await conn.execute("ALTER TABLE positions ADD COLUMN sl_pct REAL DEFAULT 0.50")
+                log.info("[DB] Added sl_pct column to positions")
+
+    async def get_price_history(self, market_id: str, minutes: int = 60) -> list:
+        """Returns recent price snapshots [{yes_price, volume, snapshot_at}] ordered ASC."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT yes_price, volume, snapshot_at
+                FROM price_snapshots
+                WHERE market_id = $1 AND snapshot_at >= NOW() - ($2 || ' minutes')::INTERVAL
+                ORDER BY snapshot_at ASC
+            """, market_id, str(minutes))
+            return [dict(r) for r in rows]
 
     async def upsert_market(self, m: dict):
         async with self.pool.acquire() as conn:
@@ -173,12 +200,13 @@ class Database:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute("""
-                        INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                        INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url,tp_pct,sl_pct)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                     """, pos["id"], pos["market_id"], pos.get("signal_id"),
                         pos["question"], pos.get("theme","other"), pos["side"],
                         pos["side_price"], pos["p_final"], pos["ev"], pos["kl"],
-                        pos["kelly"], pos["stake_amt"], pos["side_price"], pos.get("url",""))
+                        pos["kelly"], pos["stake_amt"], pos["side_price"], pos.get("url",""),
+                        pos.get("tp_pct", 0.20), pos.get("sl_pct", 0.50))
                     await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", -pos["stake_amt"])
                     await conn.execute("""
                         UPDATE stats SET

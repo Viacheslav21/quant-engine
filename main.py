@@ -112,10 +112,23 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     stats    = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
     math_eng = MathEngine(config, db)
-    stake    = math_eng.compute_stake(bankroll, signal["kelly"])
+
+    # Contrarian trades: half Kelly, tighter TP/SL
+    kelly = signal["kelly"]
+    is_contrarian = signal.get("contrarian", False)
+    if is_contrarian:
+        kelly *= 0.5
+        tp_pct = 0.10
+        sl_pct = 0.25
+        log.info(f"[EXEC] Contrarian sizing: Kelly {signal['kelly']*100:.1f}%→{kelly*100:.1f}%, TP:10%, SL:25%")
+    else:
+        tp_pct = config["TAKE_PROFIT_PCT"]
+        sl_pct = config["STOP_LOSS_PCT"]
+
+    stake = math_eng.compute_stake(bankroll, kelly)
     if stake < 1.0: return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
-    log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%")
+    log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
     pos = {
         "id":         f"pos_{signal['market_id'][:8]}_{int(time.time())}",
         "market_id":  signal["market_id"],
@@ -127,9 +140,11 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         "p_final":    signal["p_final"],
         "ev":         signal["ev"],
         "kl":         signal["kl"],
-        "kelly":      signal["kelly"],
+        "kelly":      kelly,
         "stake_amt":  stake,
         "url":        signal.get("url",""),
+        "tp_pct":     tp_pct,
+        "sl_pct":     sl_pct,
     }
     await db.save_position(pos)
     src_emoji = {"math":"🔢","news":"📰","claude":"🧠"}.get(signal.get("source","math"),"🎯")
@@ -151,9 +166,6 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
     markets  = await scanner.fetch()
     mmap     = {m["id"]: m for m in markets}
 
-    tp_pct = config["TAKE_PROFIT_PCT"]
-    sl_pct = config["STOP_LOSS_PCT"]
-
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
         if not m: continue
@@ -163,6 +175,10 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
 
         pnl_pct  = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
+
+        # Per-position TP/SL (contrarian: 10%/25%, normal: from config)
+        tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
+        sl_pct = pos.get("sl_pct") or config["STOP_LOSS_PCT"]
 
         # 1. Market fully resolved
         is_resolved = m.get("yes_price", 0.5) >= 0.98 or m.get("yes_price", 0.5) <= 0.02

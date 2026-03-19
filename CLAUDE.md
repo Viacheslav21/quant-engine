@@ -1,6 +1,6 @@
-# CLAUDE.md
+ ?# CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Thanais file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Is
 
