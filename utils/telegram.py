@@ -1,0 +1,31 @@
+import httpx
+import logging
+
+log = logging.getLogger("telegram")
+
+class TelegramBot:
+    def __init__(self, token: str, chat_id: str):
+        self.token   = token
+        self.chat_id = chat_id
+        self.client  = httpx.AsyncClient(timeout=10.0)
+
+    async def send(self, text: str):
+        if not self.token or not self.chat_id:
+            return
+        try:
+            await self.client.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+            )
+        except Exception:
+            try:
+                plain = text.replace("<b>","").replace("</b>","").replace("<a href='","").replace("'>","").replace("</a>","")
+                await self.client.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": plain[:4096]}
+                )
+            except Exception as e:
+                log.error(f"[TG] {e}")
+
+    async def close(self):
+        await self.client.aclose()
