@@ -64,7 +64,7 @@ Polymarket API → Scanner (500 markets, paginated)
 - **agents/news_monitor.py** — Scans 8 RSS feeds, keyword sentiment, matches to markets. Triggers signals when price stale (< 2¢ change in 10 min).
 - **agents/history_agent.py** (~107 lines) — Self-learning. Base rates & prospect factors per theme from closed markets. Volume patterns. Calibration via Brier score on RESOLVED positions only (not TP/SL).
 - **ml/calibrator.py** (~76 lines) — Brier score, bias, logit-scale correction. `adjust()` applied to every `p_final`.
-- **utils/db.py** (~530 lines) — PostgreSQL schema (9 tables including config_history), connection pool, CRUD, analytics queries (by theme/source/side/config_tag/calibration), cumulative PnL, signal outcomes for backtest, DB cleanup with configurable retention. Migration for tp_pct/sl_pct/config_tag columns.
+- **utils/db.py** (~550 lines) — PostgreSQL schema (9 tables including config_history), connection pool, CRUD, analytics queries (by theme/source/side/config_tag/calibration), cumulative PnL, signal outcomes for backtest, DB cleanup with configurable retention. Migrations: tp_pct/sl_pct/config_tag columns, backfill executed signals from positions.
 - **utils/telegram.py** (~33 lines) — Async Telegram notifications with HTML formatting.
 - **dashboard/app.py** (~778 lines) — FastAPI web UI (dark theme):
   - `/` — Bankroll, ROI, Win Rate, EV, open positions, PnL chart (Chart.js), signals, history with pagination (100/page). Hover tooltips on all headers.
@@ -101,7 +101,7 @@ All config via environment variables. Key params:
 
 ### Database
 
-PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`. 9 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag). Cleanup runs every HISTORY_INTERVAL with configurable retention (snapshots: 3d, signals: 7d, news: 5d, positions: 14d, markets: 3d). VACUUM after cleanup. DB writes optimized: skip unchanged market prices.
+PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`. 9 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. Cleanup runs every HISTORY_INTERVAL with configurable retention (snapshots: 3d, signals: 7d, news: 5d, positions: 14d, markets: 3d). VACUUM after cleanup. DB writes optimized: skip unchanged market prices.
 
 ### Performance Optimizations
 
