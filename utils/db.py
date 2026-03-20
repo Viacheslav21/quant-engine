@@ -330,6 +330,104 @@ class Database:
             f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
         )
 
+    async def get_analytics(self) -> dict:
+        """Compute analytics for dashboard: win rates, calibration, timing."""
+        async with self.pool.acquire() as conn:
+            # Win rate by theme
+            by_theme = await conn.fetch("""
+                SELECT theme, COUNT(*) as total,
+                    SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(AVG(pnl)::numeric, 2) as avg_pnl
+                FROM positions WHERE status='closed' AND theme IS NOT NULL
+                GROUP BY theme ORDER BY total DESC
+            """)
+
+            # Win rate by source (from signal_id → signals.source)
+            by_source = await conn.fetch("""
+                SELECT s.source, COUNT(*) as total,
+                    SUM(CASE WHEN p.result='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(AVG(p.pnl)::numeric, 2) as avg_pnl
+                FROM positions p
+                LEFT JOIN signals s ON p.signal_id = s.id
+                WHERE p.status='closed'
+                GROUP BY s.source ORDER BY total DESC
+            """)
+
+            # Win rate by side
+            by_side = await conn.fetch("""
+                SELECT side, COUNT(*) as total,
+                    SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(AVG(pnl)::numeric, 2) as avg_pnl
+                FROM positions WHERE status='closed'
+                GROUP BY side
+            """)
+
+            # Close reason breakdown
+            by_reason = await conn.fetch("""
+                SELECT
+                    CASE
+                        WHEN outcome LIKE '%@%' AND pnl > 0 THEN 'TAKE_PROFIT'
+                        WHEN outcome LIKE '%@%' AND pnl <= 0 THEN 'STOP_LOSS'
+                        ELSE 'RESOLVED'
+                    END as reason,
+                    COUNT(*) as total,
+                    ROUND(AVG(pnl)::numeric, 2) as avg_pnl
+                FROM positions WHERE status='closed'
+                GROUP BY reason ORDER BY total DESC
+            """)
+
+            # Calibration buckets: predicted p_final vs actual outcome
+            calibration = await conn.fetch("""
+                SELECT
+                    CASE
+                        WHEN p_final < 0.3 THEN '0-30%'
+                        WHEN p_final < 0.5 THEN '30-50%'
+                        WHEN p_final < 0.7 THEN '50-70%'
+                        ELSE '70-100%'
+                    END as bucket,
+                    COUNT(*) as total,
+                    ROUND(AVG(p_final)::numeric, 3) as avg_predicted,
+                    ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)::numeric, 3) as actual_wr
+                FROM positions WHERE status='closed'
+                GROUP BY bucket ORDER BY bucket
+            """)
+
+            # Average position lifetime (hours)
+            avg_lifetime = await conn.fetchrow("""
+                SELECT ROUND(AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600)::numeric, 1) as avg_hours
+                FROM positions WHERE status='closed' AND closed_at IS NOT NULL
+            """)
+
+            # PnL over time (daily)
+            daily_pnl = await conn.fetch("""
+                SELECT DATE(closed_at) as day,
+                    ROUND(SUM(pnl)::numeric, 2) as pnl,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins
+                FROM positions WHERE status='closed' AND closed_at IS NOT NULL
+                GROUP BY day ORDER BY day DESC LIMIT 14
+            """)
+
+            # EV accuracy: predicted EV vs actual return
+            ev_accuracy = await conn.fetchrow("""
+                SELECT
+                    ROUND(AVG(ev)::numeric, 4) as avg_predicted_ev,
+                    ROUND(AVG(pnl / NULLIF(stake_amt, 0))::numeric, 4) as avg_actual_return
+                FROM positions WHERE status='closed' AND stake_amt > 0
+            """)
+
+        return {
+            "by_theme": [dict(r) for r in by_theme],
+            "by_source": [dict(r) for r in by_source],
+            "by_side": [dict(r) for r in by_side],
+            "by_reason": [dict(r) for r in by_reason],
+            "calibration": [dict(r) for r in calibration],
+            "avg_lifetime_hours": float(avg_lifetime["avg_hours"] or 0) if avg_lifetime else 0,
+            "daily_pnl": [dict(r) for r in daily_pnl],
+            "ev_predicted": float(ev_accuracy["avg_predicted_ev"] or 0) if ev_accuracy else 0,
+            "ev_actual": float(ev_accuracy["avg_actual_return"] or 0) if ev_accuracy else 0,
+        }
+
     async def cleanup(self, snap_days: int = 3, sig_days: int = 7, news_days: int = 5,
                        pos_days: int = 14, market_days: int = 3):
         """Delete old data to prevent DB bloat. All retention periods configurable."""
