@@ -1,9 +1,19 @@
 import os
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date as _date
+from decimal import Decimal
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
+
+def _json_serial(obj):
+    if isinstance(obj, (datetime, _date)): return obj.isoformat()
+    if isinstance(obj, Decimal): return float(obj)
+    return str(obj)
+
+def to_json(data):
+    return json.dumps(data, default=_json_serial)
 
 log = logging.getLogger("dashboard")
 app = FastAPI()
@@ -322,7 +332,7 @@ a.link-arrow:hover{{color:#3B82F6}}
 
 </div>
 <script>
-const pnlData = {pnl_data};
+const pnlData = {to_json(pnl_data)};
 if(pnlData.length > 0) {{
   const ctx = document.getElementById('pnlChart');
   new Chart(ctx, {{
@@ -554,10 +564,10 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
 
 </div>
 <script>
-const pnlData = {pnl_data};
-const dailyData = {[dict(r) for r in data['daily_pnl']]};
-const calData = {[dict(r) for r in data['calibration']]};
-const themeData = {[dict(r) for r in data['by_theme']]};
+const pnlData = {to_json(pnl_data)};
+const dailyData = {to_json(data['daily_pnl'])};
+const calData = {to_json(data['calibration'])};
+const themeData = {to_json(data['by_theme'])};
 
 const chartColors = {{
   blue: '#3B82F6', red: '#EF4444', yellow: '#F59E0B', green: '#10B981',

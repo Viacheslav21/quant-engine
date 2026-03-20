@@ -354,15 +354,15 @@ class Database:
                 GROUP BY theme ORDER BY total DESC
             """)
 
-            # Win rate by source (from signal_id → signals.source)
+            # Win rate by source (from signal_id → signals.source, fallback to 'math')
             by_source = await conn.fetch("""
-                SELECT s.source, COUNT(*) as total,
+                SELECT COALESCE(s.source, 'math') as source, COUNT(*) as total,
                     SUM(CASE WHEN p.result='WIN' THEN 1 ELSE 0 END) as wins,
                     ROUND(AVG(p.pnl)::numeric, 2) as avg_pnl
                 FROM positions p
                 LEFT JOIN signals s ON p.signal_id = s.id
                 WHERE p.status='closed'
-                GROUP BY s.source ORDER BY total DESC
+                GROUP BY COALESCE(s.source, 'math') ORDER BY total DESC
             """)
 
             # Win rate by side
