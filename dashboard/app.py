@@ -477,17 +477,15 @@ async def analytics():
     if not config_rows:
         config_rows = '<tr><td colspan="8" class="empty">No data yet</td></tr>'
 
-    # Signal backtest — resolved markets use position outcome (stable), active use live price
-    resolved = [s for s in sig_outcomes if not s.get("is_active", True) and s.get("price_move") is not None]
-    active = [s for s in sig_outcomes if s.get("is_active", True) and s.get("price_move") is not None]
-    exec_sigs = [s for s in resolved if s["executed"]]
-    rej_sigs = [s for s in resolved if not s["executed"]]
+    # Signal backtest — all signals with price_move data
+    # Resolved markets are stable (use position outcome), active use live price
+    valid_sigs = [s for s in sig_outcomes if s.get("price_move") is not None]
+    exec_sigs = [s for s in valid_sigs if s["executed"]]
+    rej_sigs = [s for s in valid_sigs if not s["executed"]]
     def _would_win(s): return s.get("price_move") and s["price_move"] > 0
     exec_right = sum(1 for s in exec_sigs if _would_win(s))
     rej_right = sum(1 for s in rej_sigs if _would_win(s))
     rej_saved = sum(1 for s in rej_sigs if not _would_win(s))
-    pending_exec = sum(1 for s in active if s["executed"])
-    pending_rej = sum(1 for s in active if not s["executed"])
 
     bt_rows = ""
     for s in sig_outcomes[:50]:
@@ -634,17 +632,17 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
 </div>
 
 <div class="row">
-  <div class="card" title="Сигналы которые мы исполнили — сколько из них цена двинулась в нашу сторону (только закрытые рынки)">
+  <div class="card" title="Сигналы которые мы исполнили — сколько из них цена двинулась в нашу сторону">
     <div class="label">Executed → Right</div>
     <div class="value num" style="color:#3B82F6">{exec_right}/{len(exec_sigs)}</div>
-    <div class="sub">{round(exec_right/len(exec_sigs)*100) if exec_sigs else 0}% resolved our way{f' · {pending_exec} pending' if pending_exec else ''}</div>
+    <div class="sub">{round(exec_right/len(exec_sigs)*100) if exec_sigs else 0}% of executed moved our way</div>
   </div>
-  <div class="card" title="Сигналы отвергнутые Claude, но цена двинулась в нашу сторону — мы упустили прибыль (только закрытые рынки)">
+  <div class="card" title="Сигналы отвергнутые Claude, но цена двинулась в нашу сторону — мы упустили прибыль">
     <div class="label">Missed Profit</div>
     <div class="value num" style="color:#F59E0B">{rej_right}</div>
-    <div class="sub">Rejected but would have won{f' · {pending_rej} pending' if pending_rej else ''}</div>
+    <div class="sub">Rejected but would have won</div>
   </div>
-  <div class="card" title="Сигналы отвергнутые Claude и цена пошла против нас — Claude спас от убытка (только закрытые рынки)">
+  <div class="card" title="Сигналы отвергнутые Claude и цена пошла против нас — Claude спас от убытка">
     <div class="label">Saved by Rejection</div>
     <div class="value num" style="color:#10B981">{rej_saved}</div>
     <div class="sub">Rejected and would have lost</div>
