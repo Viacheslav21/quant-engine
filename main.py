@@ -46,7 +46,7 @@ CONFIG = {
     "MIN_KL":           float(os.getenv("MIN_KL", "0.08")),
     "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.01")),
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
-    "MAX_OPEN":         int(os.getenv("MAX_OPEN", "5")),
+    "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.20")),
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
@@ -106,14 +106,75 @@ Return ONLY JSON in <json></json> tags:
 
 MAX_PER_THEME = 5  # no more than 5 positions in the same theme
 
-async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict):
+DISPLACE_MIN_EV = 0.25  # new signal must have EV > 25% to displace
+
+async def _find_displaceable(open_pos: list, signal: dict, scanner: PolymarketScanner) -> dict | None:
+    """Find the worst open position that can be displaced by a stronger signal."""
+    candidates = []
+    markets_cache = {}
+
+    for pos in open_pos:
+        # Never displace a position in the same market
+        if pos["market_id"] == signal["market_id"]:
+            continue
+        upnl_pct = pos.get("unrealized_pnl", 0) / pos["stake_amt"] if pos["stake_amt"] > 0 else 0
+        # Score: lower = worse position = better displacement candidate
+        # Positive PnL positions are easy to displace (we lock in profit)
+        # Negative PnL need the new signal to be 2x better
+        score = pos.get("ev", 0) - upnl_pct * 0.5  # blend remaining EV with current PnL
+        candidates.append((score, upnl_pct, pos))
+
+    if not candidates:
+        return None
+
+    # Sort: worst position first
+    candidates.sort(key=lambda x: x[0])
+    score, upnl_pct, worst = candidates[0]
+
+    # If worst position is in profit → displace (lock in gains + open better)
+    if upnl_pct > 0:
+        log.info(f"[DISPLACE] Candidate (in profit +{upnl_pct*100:.1f}%): {worst['question'][:50]}")
+        return worst
+
+    # If worst position is in loss → only displace if new signal EV > 2x worst EV
+    if signal["ev"] > 2 * worst.get("ev", 0):
+        log.info(f"[DISPLACE] Candidate (in loss {upnl_pct*100:.1f}%, new EV {signal['ev']*100:.0f}% >> old {worst.get('ev',0)*100:.0f}%): {worst['question'][:50]}")
+        return worst
+
+    return None
+
+async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot):
+    """Close a position to make room for a better signal."""
+    price = pos.get("current_price", pos["side_price"])
+    pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
+    payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+    pnl = round(payout - pos["stake_amt"], 2)
+    outcome = f"{pos['side']}@{price*100:.0f}¢"
+
+    await db.close_position(pos["id"], outcome, payout, pnl)
+    log.info(f"[DISPLACE] Closed {pos['id']} PnL:{pnl:+.2f} to make room")
+    await telegram.send(
+        f"🔄 <b>DISPLACEMENT</b> {'✅' if pnl > 0 else '❌'}\n\n"
+        f"❓ {pos['question'][:120]}\n"
+        f"💰 P&L:<b>{pnl:+.2f}$</b> → Freed slot for better signal"
+    )
+
+async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict, scanner: PolymarketScanner = None):
     open_pos = await db.get_open_positions()
-    if len(open_pos) >= config["MAX_OPEN"]: return False
     if any(p["market_id"] == signal["market_id"] for p in open_pos): return False
     theme_count = sum(1 for p in open_pos if p.get("theme") == signal.get("theme"))
     if theme_count >= MAX_PER_THEME:
         log.info(f"[EXEC] Skipped: theme '{signal.get('theme')}' already has {theme_count} positions")
         return False
+
+    # If full, try to displace worst position
+    if len(open_pos) >= config["MAX_OPEN"]:
+        if signal["ev"] < DISPLACE_MIN_EV or scanner is None:
+            return False
+        displace = await _find_displaceable(open_pos, signal, scanner)
+        if not displace:
+            return False
+        await _close_for_displacement(displace, db, telegram)
     stats    = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
     math_eng = MathEngine(config, db)
@@ -378,7 +439,7 @@ async def main():
                     "news_trigger":sig.get("news_trigger"),
                     "source":      sig.get("source","math"),
                 })
-                await execute_signal(sig, db, telegram, CONFIG)
+                await execute_signal(sig, db, telegram, CONFIG, scanner)
 
             await monitor_positions(db, telegram, scanner, CONFIG)
 
@@ -386,6 +447,7 @@ async def main():
                 last_history = now
                 await history.analyze()
                 await math_eng.load_patterns()
+                await db.cleanup()
 
             utc = datetime.now(timezone.utc)
             if utc.hour == 8 and utc.minute < 1:

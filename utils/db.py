@@ -330,6 +330,38 @@ class Database:
             f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
         )
 
+    async def cleanup(self, snap_days: int = 3, sig_days: int = 7, news_days: int = 5,
+                       pos_days: int = 14, market_days: int = 3):
+        """Delete old data to prevent DB bloat. All retention periods configurable."""
+        try:
+            async with self.pool.acquire() as conn:
+                r1 = await conn.execute(
+                    "DELETE FROM price_snapshots WHERE snapshot_at < NOW() - ($1 || ' days')::INTERVAL",
+                    str(snap_days)
+                )
+                r2 = await conn.execute(
+                    "DELETE FROM signals WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND executed = FALSE",
+                    str(sig_days)
+                )
+                r3 = await conn.execute(
+                    "DELETE FROM news WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND processed = TRUE",
+                    str(news_days)
+                )
+                r4 = await conn.execute(
+                    "DELETE FROM positions WHERE status = 'closed' AND closed_at < NOW() - ($1 || ' days')::INTERVAL",
+                    str(pos_days)
+                )
+                r5 = await conn.execute("""
+                    DELETE FROM markets WHERE is_active = FALSE
+                    AND updated_at < NOW() - ($1 || ' days')::INTERVAL
+                    AND id NOT IN (SELECT market_id FROM positions WHERE status = 'open')
+                """, str(market_days))
+                # reclaim disk space
+                await conn.execute("VACUUM")
+                log.info(f"[DB] Cleanup: snapshots={r1}, signals={r2}, news={r3}, positions={r4}, markets={r5}")
+        except Exception as e:
+            log.error(f"[DB] Cleanup failed: {e}")
+
     async def close(self):
         if self.pool:
             await self.pool.close()
