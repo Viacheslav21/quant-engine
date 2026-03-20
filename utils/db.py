@@ -330,6 +330,18 @@ class Database:
             f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
         )
 
+    async def get_cumulative_pnl(self) -> list:
+        """Returns cumulative PnL over time for charting."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT closed_at, pnl,
+                    SUM(pnl) OVER (ORDER BY closed_at) as cumulative
+                FROM positions
+                WHERE status='closed' AND closed_at IS NOT NULL
+                ORDER BY closed_at ASC
+            """)
+            return [{"t": r["closed_at"].isoformat(), "pnl": float(r["pnl"]), "cum": float(r["cumulative"])} for r in rows]
+
     async def get_analytics(self) -> dict:
         """Compute analytics for dashboard: win rates, calibration, timing."""
         async with self.pool.acquire() as conn:

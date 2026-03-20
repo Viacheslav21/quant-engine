@@ -18,6 +18,7 @@ async def dashboard():
     open_   = await _db.get_open_positions()
     closed  = await _db.get_closed_positions(limit=20)
     signals = await _db.get_recent_signals(limit=10)
+    pnl_data = await _db.get_cumulative_pnl()
 
     start = float(os.getenv("BANKROLL","1000"))
     roi   = ((stats["bankroll"]-start)/start*100)
@@ -65,6 +66,7 @@ async def dashboard():
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Quant Engine v3</title>
 <!-- auto-refresh disabled -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{
@@ -278,6 +280,11 @@ a.link-arrow:hover{{color:#3B82F6}}
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:20px;padding:20px">
+  <div class="panel-header" style="padding:0 0 12px 0"><h2>Cumulative P&amp;L</h2></div>
+  <div style="height:250px"><canvas id="pnlChart"></canvas></div>
+</div>
+
 <div class="panel">
   <div class="panel-header">
     <h2>Открытые позиции</h2>
@@ -314,6 +321,45 @@ a.link-arrow:hover{{color:#3B82F6}}
 <div class="footer">Quant Engine v3 &middot; {mode} Mode</div>
 
 </div>
+<script>
+const pnlData = {pnl_data};
+if(pnlData.length > 0) {{
+  const ctx = document.getElementById('pnlChart');
+  new Chart(ctx, {{
+    type: 'line',
+    data: {{
+      labels: pnlData.map(d => new Date(d.t).toLocaleDateString('en', {{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}})),
+      datasets: [{{
+        label: 'Cumulative P&L ($)',
+        data: pnlData.map(d => d.cum),
+        borderColor: pnlData[pnlData.length-1].cum >= 0 ? '#3B82F6' : '#EF4444',
+        backgroundColor: pnlData[pnlData.length-1].cum >= 0 ? 'rgba(59,130,246,0.08)' : 'rgba(239,68,68,0.08)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: pnlData.length > 50 ? 0 : 3,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          callbacks: {{
+            label: (c) => `P&L: ${{c.parsed.y >= 0 ? '+' : ''}}${{c.parsed.y.toFixed(2)}}`
+          }}
+        }}
+      }},
+      scales: {{
+        x: {{ ticks: {{ color: '#6B7280', maxTicksLimit: 8, font: {{ size: 11 }} }}, grid: {{ color: 'rgba(55,65,81,0.3)' }} }},
+        y: {{ ticks: {{ color: '#6B7280', callback: v => '$'+v.toFixed(0), font: {{ size: 11 }} }}, grid: {{ color: 'rgba(55,65,81,0.3)' }} }}
+      }}
+    }}
+  }});
+}}
+</script>
 </body></html>"""
   except Exception as e:
     log.error(f"[DASHBOARD] Render error: {e}", exc_info=True)
@@ -323,6 +369,7 @@ a.link-arrow:hover{{color:#3B82F6}}
 async def analytics():
   try:
     data = await _db.get_analytics()
+    pnl_data = await _db.get_cumulative_pnl()
     stats = await _db.get_stats()
     start = float(os.getenv("BANKROLL","1000"))
     roi   = ((stats["bankroll"]-start)/start*100)
@@ -389,6 +436,7 @@ async def analytics():
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Analytics &mdash; Quant Engine v3</title>
 <!-- auto-refresh disabled -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#111827;color:#E5E7EB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}}
@@ -469,19 +517,137 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
   </div>
 </div>
 
-<div class="panel" style="margin-bottom:20px">
-  <div class="panel-header"><h2>Calibration (Predicted vs Actual)</h2></div>
-  <table><tr><th>Bucket</th><th>Trades</th><th>Avg Predicted</th><th>Actual WR</th><th>Bias</th></tr>{cal_rows}</table>
+<div class="row">
+  <div class="panel" style="padding:20px">
+    <div class="panel-header" style="padding:0 0 12px 0"><h2>Cumulative P&amp;L</h2></div>
+    <div style="height:280px"><canvas id="cumPnlChart"></canvas></div>
+  </div>
+  <div class="panel" style="padding:20px">
+    <div class="panel-header" style="padding:0 0 12px 0"><h2>Daily P&amp;L</h2></div>
+    <div style="height:280px"><canvas id="dailyPnlChart"></canvas></div>
+  </div>
 </div>
 
-<div class="panel">
-  <div class="panel-header"><h2>Daily P&amp;L</h2></div>
-  <table><tr><th>Date</th><th>Trades</th><th>W/L (WR)</th><th>P&amp;L</th></tr>{daily_rows}</table>
+<div class="row">
+  <div class="panel" style="padding:20px">
+    <div class="panel-header" style="padding:0 0 12px 0"><h2>Calibration</h2></div>
+    <div style="height:280px"><canvas id="calChart"></canvas></div>
+  </div>
+  <div class="panel" style="padding:20px">
+    <div class="panel-header" style="padding:0 0 12px 0"><h2>Win Rate by Theme</h2></div>
+    <div style="height:280px"><canvas id="themeChart"></canvas></div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="panel" style="margin-bottom:20px">
+    <div class="panel-header"><h2>Calibration (table)</h2></div>
+    <table><tr><th>Bucket</th><th>Trades</th><th>Avg Predicted</th><th>Actual WR</th><th>Bias</th></tr>{cal_rows}</table>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><h2>Daily P&amp;L (table)</h2></div>
+    <table><tr><th>Date</th><th>Trades</th><th>W/L (WR)</th><th>P&amp;L</th></tr>{daily_rows}</table>
+  </div>
 </div>
 
 <div class="footer"><a href="/" style="color:#6B7280;text-decoration:none">Quant Engine v3</a> &middot; Analytics</div>
 
-</div></body></html>"""
+</div>
+<script>
+const pnlData = {pnl_data};
+const dailyData = {[dict(r) for r in data['daily_pnl']]};
+const calData = {[dict(r) for r in data['calibration']]};
+const themeData = {[dict(r) for r in data['by_theme']]};
+
+const chartColors = {{
+  blue: '#3B82F6', red: '#EF4444', yellow: '#F59E0B', green: '#10B981',
+  grid: 'rgba(55,65,81,0.3)', text: '#6B7280'
+}};
+const tickOpts = {{ color: chartColors.text, font: {{ size: 11 }} }};
+const gridOpts = {{ color: chartColors.grid }};
+
+// Cumulative PnL
+if(pnlData.length > 0) {{
+  new Chart(document.getElementById('cumPnlChart'), {{
+    type: 'line',
+    data: {{
+      labels: pnlData.map(d => new Date(d.t).toLocaleDateString('en',{{month:'short',day:'numeric'}})),
+      datasets: [{{
+        label: 'Cumulative P&L',
+        data: pnlData.map(d => d.cum),
+        borderColor: pnlData[pnlData.length-1].cum>=0 ? chartColors.blue : chartColors.red,
+        backgroundColor: pnlData[pnlData.length-1].cum>=0 ? 'rgba(59,130,246,0.08)' : 'rgba(239,68,68,0.08)',
+        fill: true, tension: 0.3, pointRadius: pnlData.length>50?0:3, borderWidth: 2
+      }}]
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{ legend:{{display:false}}, tooltip:{{callbacks:{{label:c=>`$${{c.parsed.y>=0?'+':''}}${{c.parsed.y.toFixed(2)}}`}}}} }},
+      scales:{{ x:{{ticks:{{...tickOpts,maxTicksLimit:8}},grid:gridOpts}}, y:{{ticks:{{...tickOpts,callback:v=>'$'+v}},grid:gridOpts}} }}
+    }}
+  }});
+}}
+
+// Daily PnL bars
+if(dailyData.length > 0) {{
+  const sorted = [...dailyData].reverse();
+  new Chart(document.getElementById('dailyPnlChart'), {{
+    type: 'bar',
+    data: {{
+      labels: sorted.map(d => d.day),
+      datasets: [{{
+        label: 'Daily P&L',
+        data: sorted.map(d => parseFloat(d.pnl)),
+        backgroundColor: sorted.map(d => parseFloat(d.pnl)>=0 ? 'rgba(59,130,246,0.7)' : 'rgba(239,68,68,0.7)'),
+        borderRadius: 4
+      }}]
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{ legend:{{display:false}}, tooltip:{{callbacks:{{label:c=>`$${{c.parsed.y>=0?'+':''}}${{c.parsed.y.toFixed(2)}}`}}}} }},
+      scales:{{ x:{{ticks:tickOpts,grid:gridOpts}}, y:{{ticks:{{...tickOpts,callback:v=>'$'+v}},grid:gridOpts}} }}
+    }}
+  }});
+}}
+
+// Calibration: predicted vs actual
+if(calData.length > 0) {{
+  new Chart(document.getElementById('calChart'), {{
+    type: 'bar',
+    data: {{
+      labels: calData.map(d => d.bucket),
+      datasets: [
+        {{ label: 'Predicted', data: calData.map(d => (parseFloat(d.avg_predicted)*100).toFixed(1)), backgroundColor: 'rgba(59,130,246,0.6)', borderRadius: 4 }},
+        {{ label: 'Actual WR', data: calData.map(d => (parseFloat(d.actual_wr)*100).toFixed(1)), backgroundColor: 'rgba(16,185,129,0.6)', borderRadius: 4 }}
+      ]
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{{ legend:{{labels:{{color:chartColors.text}}}}, tooltip:{{callbacks:{{label:c=>c.dataset.label+': '+c.parsed.y+'%'}}}} }},
+      scales:{{ x:{{ticks:tickOpts,grid:gridOpts}}, y:{{ticks:{{...tickOpts,callback:v=>v+'%'}},grid:gridOpts}} }}
+    }}
+  }});
+}}
+
+// Win rate by theme
+if(themeData.length > 0) {{
+  new Chart(document.getElementById('themeChart'), {{
+    type: 'bar',
+    data: {{
+      labels: themeData.map(d => d.theme),
+      datasets: [
+        {{ label: 'Win Rate %', data: themeData.map(d => d.total>0 ? Math.round(d.wins/d.total*100) : 0), backgroundColor: themeData.map(d => d.total>0 && d.wins/d.total>=0.5 ? 'rgba(59,130,246,0.7)' : 'rgba(239,68,68,0.5)'), borderRadius: 4 }}
+      ]
+    }},
+    options: {{
+      responsive:true, maintainAspectRatio:false, indexAxis: 'y',
+      plugins:{{ legend:{{display:false}}, tooltip:{{callbacks:{{label:c=>c.parsed.x+'% ('+themeData[c.dataIndex].wins+'/'+themeData[c.dataIndex].total+')'}}}} }},
+      scales:{{ x:{{ticks:{{...tickOpts,callback:v=>v+'%'}},grid:gridOpts,max:100}}, y:{{ticks:tickOpts,grid:gridOpts}} }}
+    }}
+  }});
+}}
+</script>
+</body></html>"""
   except Exception as e:
     log.error(f"[DASHBOARD] Analytics error: {e}", exc_info=True)
     return HTMLResponse(f"<h1>Analytics Error</h1><pre>{e}</pre>", status_code=500)
