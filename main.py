@@ -598,8 +598,9 @@ async def main():
                     confirmed.append(sig)
 
             for sig in confirmed[:3]:
+                sig_id = f"sig_{sig['market_id'][:8]}_{int(now)}"
                 await db.save_signal({
-                    "id":          f"sig_{sig['market_id'][:8]}_{int(now)}",
+                    "id":          sig_id,
                     "market_id":   sig["market_id"],
                     "question":    sig["question"],
                     "side":        sig["side"],
@@ -619,6 +620,7 @@ async def main():
                 })
                 _signal_cooldown[sig["market_id"]] = now
                 await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
+                await db.mark_signal_executed(sig_id)
 
             await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
 

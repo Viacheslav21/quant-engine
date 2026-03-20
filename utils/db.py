@@ -15,6 +15,7 @@ class Database:
         self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10, command_timeout=30)
         await self._create_schema()
         await self._migrate_positions_tp_sl()
+        await self._backfill_executed_signals()
         await self._init_stats()
         log.info("[DB] PostgreSQL подключён")
 
@@ -123,6 +124,21 @@ class Database:
                 await conn.execute("ALTER TABLE positions ADD COLUMN config_tag TEXT DEFAULT 'v0'")
                 log.info("[DB] Added config_tag column to positions")
 
+    async def _backfill_executed_signals(self):
+        """One-time: mark signals as executed if they have a matching position."""
+        try:
+            async with self.pool.acquire() as conn:
+                result = await conn.execute("""
+                    UPDATE signals SET executed = TRUE
+                    WHERE id IN (SELECT signal_id FROM positions WHERE signal_id IS NOT NULL)
+                    AND executed = FALSE
+                """)
+                count = int(result.split()[-1])
+                if count > 0:
+                    log.info(f"[DB] Backfilled {count} signals as executed")
+        except Exception as e:
+            log.warning(f"[DB] Backfill executed signals: {e}")
+
     async def get_price_history(self, market_id: str, minutes: int = 60) -> list:
         """Returns recent price snapshots [{yes_price, volume, snapshot_at}] ordered ASC."""
         async with self.pool.acquire() as conn:
@@ -197,6 +213,10 @@ class Database:
                 sig["p_market"], sig.get("p_math"), sig.get("p_history"), sig.get("p_claude"), sig["p_final"],
                 sig["ev"], sig["kl"], sig["kelly"], sig.get("confidence",0),
                 sig.get("volume_ratio",1.0), sig.get("news_trigger"), sig.get("source","math"))
+
+    async def mark_signal_executed(self, signal_id: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE signals SET executed = TRUE WHERE id = $1", signal_id)
 
     async def get_recent_signals(self, limit: int = 20) -> list:
         async with self.pool.acquire() as conn:
