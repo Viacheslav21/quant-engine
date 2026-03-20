@@ -83,18 +83,14 @@ class HistoryAgent:
             if not outcome:
                 continue
             p_final = float(p.get("p_final", 0.5))
-            # For RESOLVED positions: outcome is "YES" or "NO"
-            # For TP/SL positions: outcome is like "YES@65¢", extract the side
+            # Only use RESOLVED positions for calibration
+            # TP/SL outcomes like "YES@65¢" don't tell us the true outcome
             if outcome == "YES":
                 actual = 1.0
             elif outcome == "NO":
                 actual = 0.0
-            elif outcome.startswith("YES"):
-                actual = 1.0  # we bet YES and it was trending right
-            elif outcome.startswith("NO"):
-                actual = 0.0
             else:
-                continue
+                continue  # skip TP/SL — we don't know the true outcome
             preds.append(p_final)
             actuals.append(actual)
 

@@ -22,11 +22,16 @@ _db     = None
 _config = None
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(page: int = 1):
   try:
+    per_page = 100
     stats   = await _db.get_stats()
     open_   = await _db.get_open_positions()
-    closed  = await _db.get_closed_positions(limit=20)
+    all_closed = await _db.get_closed_positions(limit=per_page * page)
+    # Paginate: skip previous pages
+    closed = all_closed[(page-1)*per_page : page*per_page]
+    total_closed = stats["wins"] + stats["losses"]
+    total_pages = max(1, (total_closed + per_page - 1) // per_page)
     signals = await _db.get_recent_signals(limit=10)
     pnl_data = await _db.get_cumulative_pnl()
 
@@ -263,27 +268,27 @@ a.link-arrow:hover{{color:#3B82F6}}
 </div>
 
 <div class="grid">
-  <div class="card">
+  <div class="card" title="Текущий баланс. Банкролл = свободные деньги + замороженные в открытых позициях">
     <div class="label">Bankroll</div>
     <div class="value num" style="color:{pc(roi)}">${stats['bankroll']:.2f}</div>
     <div class="sub">Start: ${start:.0f}</div>
   </div>
-  <div class="card">
+  <div class="card" title="Return on Investment — общая доходность в % от начального банкролла">
     <div class="label">ROI</div>
     <div class="value num" style="color:{pc(roi)}">{roi:+.2f}%</div>
     <div class="sub">P&amp;L: {stats['total_pnl']:+.2f}$</div>
   </div>
-  <div class="card">
+  <div class="card" title="Процент выигранных сделок из закрытых. >50% = прибыльно">
     <div class="label">Win Rate</div>
     <div class="value num" style="color:{'#3B82F6' if wr>=50 else '#EF4444'}">{wr}%</div>
     <div class="sub">{stats['wins']}W / {stats['losses']}L / {total} total</div>
   </div>
-  <div class="card">
+  <div class="card" title="Expected Value — средняя ожидаемая прибыль на сделку при входе. Kelly — % банкролла на ставку">
     <div class="label">Avg EV</div>
     <div class="value num" style="color:#3B82F6">+{stats['avg_ev']*100:.1f}%</div>
     <div class="sub">Avg Kelly: {stats['avg_kelly']*100:.1f}%</div>
   </div>
-  <div class="card">
+  <div class="card" title="Количество открытых позиций прямо сейчас">
     <div class="label">Открытые</div>
     <div class="value num" style="color:#F59E0B">{len(open_)}</div>
     <div class="sub">Max: {os.getenv('MAX_OPEN','5')}</div>
@@ -301,7 +306,7 @@ a.link-arrow:hover{{color:#3B82F6}}
     <span class="count">{len(open_)}</span>
   </div>
   <table>
-    <tr><th>Вопрос</th><th>Side</th><th>Вход</th><th>Сейчас</th><th>uPnL</th><th>EV</th><th>KL</th><th>Ставка</th><th></th></tr>
+    <tr><th>Вопрос</th><th title="YES = ставка на ДА, NO = ставка на НЕТ">Side</th><th title="Цена при входе в позицию">Вход</th><th title="Текущая рыночная цена">Сейчас</th><th title="Unrealized P&amp;L — нереализованная прибыль/убыток">uPnL</th><th title="Expected Value — ожидаемая прибыль при входе">EV</th><th title="KL-дивергенция — расхождение нашей оценки от рыночной цены. Чем выше, тем сильнее сигнал">KL</th><th title="Размер ставки в долларах">Ставка</th><th></th></tr>
     {open_rows}
   </table>
 </div>
@@ -312,7 +317,7 @@ a.link-arrow:hover{{color:#3B82F6}}
     <span class="count">{len(signals)}</span>
   </div>
   <table>
-    <tr><th>Вопрос</th><th>Side</th><th>Рынок</th><th>pTrue</th><th>EV</th><th>KL</th><th>Источник</th></tr>
+    <tr><th>Вопрос</th><th title="YES = ставка на ДА, NO = ставка на НЕТ">Side</th><th title="Текущая рыночная цена">Рынок</th><th title="Наша расчётная вероятность (после Байесовского анализа)">pTrue</th><th title="Expected Value — ожидаемая прибыль">EV</th><th title="KL-дивергенция — мера расхождения от рынка">KL</th><th title="Источник сигнала: math=математика, news=новости, claude=AI подтверждение">Источник</th></tr>
     {sig_rows}
   </table>
 </div>
@@ -320,12 +325,17 @@ a.link-arrow:hover{{color:#3B82F6}}
 <div class="panel">
   <div class="panel-header">
     <h2>История</h2>
-    <span class="count">{len(closed)}</span>
+    <span class="count">{total_closed} total / page {page} of {total_pages}</span>
   </div>
   <table>
-    <tr><th>Вопрос</th><th>Side</th><th>Вход</th><th>Исход</th><th>P&amp;L</th><th>Итог</th><th>EV</th></tr>
+    <tr><th>Вопрос</th><th title="YES = ставка на ДА, NO = ставка на НЕТ">Side</th><th title="Цена при входе">Вход</th><th title="Как закрылась позиция: YES/NO = рынок решился, YES@65¢ = продали по цене">Исход</th><th title="Profit &amp; Loss — реальная прибыль или убыток">P&amp;L</th><th title="WIN = прибыль, LOSS = убыток">Итог</th><th title="Expected Value при входе">EV</th></tr>
     {closed_rows}
   </table>
+  <div style="padding:16px 20px;display:flex;justify-content:center;gap:12px">
+    {'<a href="/?page='+str(page-1)+'" style="color:#3B82F6;text-decoration:none">&larr; Prev</a>' if page > 1 else '<span style="color:#374151">&larr; Prev</span>'}
+    <span style="color:#6B7280">Page {page}/{total_pages}</span>
+    {'<a href="/?page='+str(page+1)+'" style="color:#3B82F6;text-decoration:none">Next &rarr;</a>' if page < total_pages else '<span style="color:#374151">Next &rarr;</span>'}
+  </div>
 </div>
 
 <div class="footer">Quant Engine v3 &middot; {mode} Mode</div>
@@ -380,6 +390,7 @@ async def analytics():
   try:
     data = await _db.get_analytics()
     pnl_data = await _db.get_cumulative_pnl()
+    sig_outcomes = await _db.get_signal_outcomes(limit=200)
     stats = await _db.get_stats()
     start = float(os.getenv("BANKROLL","1000"))
     roi   = ((stats["bankroll"]-start)/start*100)
@@ -441,6 +452,31 @@ async def analytics():
     ev_pred = data["ev_predicted"]*100
     ev_act  = data["ev_actual"]*100
 
+    # Signal backtest
+    exec_sigs = [s for s in sig_outcomes if s["executed"]]
+    rej_sigs = [s for s in sig_outcomes if not s["executed"]]
+    def _would_win(s): return s.get("price_move") and s["price_move"] > 0
+    exec_right = sum(1 for s in exec_sigs if _would_win(s))
+    rej_right = sum(1 for s in rej_sigs if _would_win(s))
+    rej_saved = sum(1 for s in rej_sigs if not _would_win(s))
+
+    bt_rows = ""
+    for s in sig_outcomes[:50]:
+        move = s.get("price_move") or 0
+        won = move > 0
+        status = "EXEC" if s["executed"] else "REJ"
+        bt_rows += f"""<tr>
+            <td class="q">{s['question'][:55]}...</td>
+            <td class="{'yes' if s['side']=='YES' else 'no'}">{s['side']}</td>
+            <td class="num">{s['side_price']*100:.1f}&#162;</td>
+            <td class="num">{(s.get('current_price') or 0)*100:.1f}&#162;</td>
+            <td class="num" style="color:{pc(move)}">{move*100:+.1f}&#162;</td>
+            <td style="color:{'#3B82F6' if won else '#EF4444'}">{'RIGHT' if won else 'WRONG'}</td>
+            <td style="color:{'#10B981' if s['executed'] else '#6B7280'}">{status}</td>
+        </tr>"""
+    if not bt_rows:
+        bt_rows = '<tr><td colspan="7" class="empty">No signals</td></tr>'
+
     return f"""<!DOCTYPE html>
 <html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -483,22 +519,22 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
 </div>
 
 <div class="grid">
-  <div class="card">
+  <div class="card" title="Процент выигранных сделок. >50% = прибыльно">
     <div class="label">Win Rate</div>
     <div class="value num" style="color:{'#3B82F6' if wr>=50 else '#EF4444'}">{wr}%</div>
     <div class="sub">{stats['wins']}W / {stats['losses']}L</div>
   </div>
-  <div class="card">
+  <div class="card" title="Средний Expected Value при входе — сколько модель обещала заработать на каждой сделке">
     <div class="label">EV Predicted</div>
     <div class="value num" style="color:#3B82F6">+{ev_pred:.1f}%</div>
     <div class="sub">Avg predicted EV at entry</div>
   </div>
-  <div class="card">
+  <div class="card" title="Реальная средняя доходность сделки. Если меньше EV Predicted — модель overconfident">
     <div class="label">EV Actual</div>
     <div class="value num" style="color:{pc(ev_act)}">{ev_act:+.1f}%</div>
     <div class="sub">Avg real return per trade</div>
   </div>
-  <div class="card">
+  <div class="card" title="Среднее время от открытия до закрытия позиции">
     <div class="label">Avg Lifetime</div>
     <div class="value num" style="color:#F59E0B">{data['avg_lifetime_hours']:.1f}h</div>
     <div class="sub">Avg position duration</div>
@@ -507,23 +543,23 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
 
 <div class="row">
   <div class="panel">
-    <div class="panel-header"><h2>Win Rate by Theme</h2></div>
-    <table><tr><th>Theme</th><th>Trades</th><th>W/L (WR)</th><th>Avg PnL</th></tr>{theme_rows}</table>
+    <div class="panel-header"><h2 title="Какие темы рынков прибыльнее: crypto, iran, election и т.д.">Win Rate by Theme</h2></div>
+    <table><tr><th>Theme</th><th>Trades</th><th title="Выигранные/Всего (Win Rate %)">W/L (WR)</th><th title="Средний P&amp;L на сделку в этой теме">Avg PnL</th></tr>{theme_rows}</table>
   </div>
   <div class="panel">
-    <div class="panel-header"><h2>Win Rate by Source</h2></div>
+    <div class="panel-header"><h2 title="Откуда пришёл сигнал: math=математика, news=новости, claude=AI подтвердил">Win Rate by Source</h2></div>
     <table><tr><th>Source</th><th>Trades</th><th>W/L (WR)</th><th>Avg PnL</th></tr>{source_rows}</table>
   </div>
 </div>
 
 <div class="row">
   <div class="panel">
-    <div class="panel-header"><h2>Win Rate by Side</h2></div>
+    <div class="panel-header"><h2 title="YES = ставка что событие произойдёт, NO = не произойдёт">Win Rate by Side</h2></div>
     <table><tr><th>Side</th><th>Trades</th><th>W/L (WR)</th><th>Avg PnL</th></tr>{side_rows}</table>
   </div>
   <div class="panel">
-    <div class="panel-header"><h2>Close Reason</h2></div>
-    <table><tr><th>Reason</th><th>Count</th><th>Avg PnL</th></tr>{reason_rows}</table>
+    <div class="panel-header"><h2 title="Как закрылись позиции: TAKE_PROFIT=забрали прибыль, STOP_LOSS=ограничили убыток, RESOLVED=рынок решился">Close Reason</h2></div>
+    <table><tr><th title="TAKE_PROFIT: цена выросла до +20%. STOP_LOSS: цена упала на -25%. RESOLVED: рынок закрылся окончательно">Reason</th><th>Count</th><th>Avg PnL</th></tr>{reason_rows}</table>
   </div>
 </div>
 
@@ -551,13 +587,38 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
 
 <div class="row">
   <div class="panel" style="margin-bottom:20px">
-    <div class="panel-header"><h2>Calibration (table)</h2></div>
-    <table><tr><th>Bucket</th><th>Trades</th><th>Avg Predicted</th><th>Actual WR</th><th>Bias</th></tr>{cal_rows}</table>
+    <div class="panel-header"><h2 title="Проверка точности модели: что мы предсказали vs что случилось. Если Bias положительный — модель overconfident">Calibration (table)</h2></div>
+    <table><tr><th title="Диапазон предсказанной вероятности">Bucket</th><th>Trades</th><th title="Средняя вероятность которую предсказала модель">Avg Predicted</th><th title="Реальный процент выигрышей в этом диапазоне">Actual WR</th><th title="Разница: Actual - Predicted. + = модель недооценивает (хорошо), - = переоценивает (плохо)">Bias</th></tr>{cal_rows}</table>
   </div>
   <div class="panel">
     <div class="panel-header"><h2>Daily P&amp;L (table)</h2></div>
     <table><tr><th>Date</th><th>Trades</th><th>W/L (WR)</th><th>P&amp;L</th></tr>{daily_rows}</table>
   </div>
+</div>
+
+<div class="row">
+  <div class="card" title="Сигналы которые мы исполнили — сколько из них цена двинулась в нашу сторону">
+    <div class="label">Executed → Right</div>
+    <div class="value num" style="color:#3B82F6">{exec_right}/{len(exec_sigs)}</div>
+    <div class="sub">{round(exec_right/len(exec_sigs)*100) if exec_sigs else 0}% of executed signals moved our way</div>
+  </div>
+  <div class="card" title="Сигналы отвергнутые Claude, но цена двинулась в нашу сторону — мы упустили прибыль">
+    <div class="label">Missed Profit</div>
+    <div class="value num" style="color:#F59E0B">{rej_right}</div>
+    <div class="sub">Rejected but would have been right</div>
+  </div>
+  <div class="card" title="Сигналы отвергнутые Claude и цена пошла против нас — Claude спас от убытка">
+    <div class="label">Saved by Rejection</div>
+    <div class="value num" style="color:#10B981">{rej_saved}</div>
+    <div class="sub">Rejected and would have lost</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-header"><h2>Signal Backtest (last 50)</h2></div>
+  <table><tr><th>Question</th><th>Side</th><th>Entry</th><th>Now</th><th>Move</th><th>Direction</th><th>Status</th></tr>
+    {bt_rows}
+  </table>
 </div>
 
 <div class="footer"><a href="/" style="color:#6B7280;text-decoration:none">Quant Engine v3</a> &middot; Analytics</div>

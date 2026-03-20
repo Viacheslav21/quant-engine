@@ -339,6 +339,23 @@ class Database:
             )
             log.info(f"[DB] Tightened SL to {new_sl*100:.0f}% on old positions: {result}")
 
+    async def get_signal_outcomes(self, limit: int = 200) -> list:
+        """Check what happened to signals after they were generated.
+        Compares signal side_price to current market price."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.id, s.question, s.side, s.side_price, s.p_market, s.p_final,
+                    s.ev, s.kelly, s.source, s.executed, s.created_at,
+                    m.yes_price as current_price, m.is_active,
+                    CASE WHEN s.side = 'YES' THEN m.yes_price - s.side_price
+                         ELSE (1 - m.yes_price) - s.side_price END as price_move
+                FROM signals s
+                JOIN markets m ON s.market_id = m.id
+                ORDER BY s.created_at DESC
+                LIMIT $1
+            """, limit)
+            return [dict(r) for r in rows]
+
     async def get_cumulative_pnl(self) -> list:
         """Returns cumulative PnL over time for charting."""
         async with self.pool.acquire() as conn:
