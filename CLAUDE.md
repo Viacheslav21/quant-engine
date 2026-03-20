@@ -48,7 +48,7 @@ Polymarket API → Scanner (500 markets, paginated)
 
 ### Module Responsibilities
 
-- **main.py** (~580 lines) — Orchestrator. Main event loop with tick intervals: market scan (10s), news scan (30s), historical learning (4h). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, position monitoring with trailing TP, daily AI analysis via Sonnet. DB write optimization (skip unchanged prices). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Graceful shutdown on SIGTERM/SIGINT.
+- **main.py** (~580 lines) — Orchestrator. Main event loop with tick intervals: market scan (10s), news scan (30s), historical learning (4h). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, position monitoring with trailing TP, daily AI analysis via Sonnet. DB write optimization (skip unchanged prices). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Marks signals as executed after successful trade for backtest tracking. Graceful shutdown on SIGTERM/SIGINT.
 - **engine/scanner.py** (~120 lines) — Fetches up to 500 markets from Polymarket's Gamma API with pagination. Filters by volume (>$50k), liquidity (>$5k), price bounds (3-97¢). Extracts: spread, bestAsk, competitive, oneWeekPriceChange, oneMonthPriceChange, negRisk, negRiskMarketID, volume1wk, volume1mo. Classifies into 13 themes via keyword matching.
 - **agents/math_engine.py** (~467 lines) — Core signal generation. 9 evidence sources fused via Bayesian log-odds:
   1. Prospect theory (prior) — inverts human probability weighting (γ=0.65)
