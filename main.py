@@ -52,6 +52,7 @@ CONFIG = {
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
+    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.08")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v2"),
 }
@@ -494,6 +495,7 @@ async def main():
     CLAUDE_CACHE_TTL = 1800  # 30 minutes
     last_claude_call = 0  # timestamp of last actual API call
     CLAUDE_MIN_INTERVAL = 60  # max 1 API call per minute
+    daily_report_sent = None  # date of last daily report
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -627,9 +629,9 @@ async def main():
                 await db.cleanup()
 
             utc = datetime.now(timezone.utc)
-            if utc.hour == 8 and utc.minute < 1:
+            if utc.hour == 8 and daily_report_sent != utc.date():
+                daily_report_sent = utc.date()
                 await telegram.send(await db.build_report())
-                # Daily AI analysis with Sonnet
                 try:
                     analysis = await daily_ai_analysis(db, CONFIG)
                     if analysis:
