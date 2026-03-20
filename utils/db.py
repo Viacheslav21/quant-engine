@@ -355,33 +355,6 @@ class Database:
             rows = await conn.fetch("SELECT * FROM config_history ORDER BY created_at DESC")
             return [dict(r) for r in rows]
 
-    async def close_long_dated_positions(self, max_days: int = 90):
-        """One-time: delete open positions on long-dated markets. Returns stake, no trace."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT p.id, p.question, p.stake_amt
-                FROM positions p
-                JOIN markets m ON p.market_id = m.id
-                WHERE p.status = 'open'
-                    AND m.end_date IS NOT NULL
-                    AND m.end_date > NOW() + ($1 || ' days')::INTERVAL
-            """, str(max_days))
-            for r in rows:
-                async with conn.transaction():
-                    await conn.execute("DELETE FROM positions WHERE id=$1", r["id"])
-                    await conn.execute("UPDATE stats SET bankroll=bankroll+$1, total_bets=total_bets-1, updated_at=NOW() WHERE id=1", r["stake_amt"])
-                log.info(f"[DB] Deleted long-dated: {r['question'][:50]} (returned ${r['stake_amt']:.2f})")
-            log.info(f"[DB] Deleted {len(rows)} long-dated positions (>{max_days} days)")
-
-    async def tighten_old_stop_losses(self, new_sl: float = 0.25):
-        """One-time: tighten SL on old positions that still have the default 50% SL."""
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE positions SET sl_pct = $1 WHERE status = 'open' AND sl_pct >= 0.50",
-                new_sl
-            )
-            log.info(f"[DB] Tightened SL to {new_sl*100:.0f}% on old positions: {result}")
-
     async def get_signal_outcomes(self, limit: int = 200) -> list:
         """Check what happened to signals after they were generated.
         Compares signal side_price to current market price."""

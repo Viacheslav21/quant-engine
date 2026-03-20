@@ -106,6 +106,75 @@ Return ONLY JSON in <json></json> tags:
         log.warning(f"[CLAUDE] {e}")
     return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0, "reasoning": "api_error"}
 
+async def bootstrap_history(db: Database, scanner: PolymarketScanner):
+    """Load historical closed markets from Polymarket for training. Skips if already done."""
+    existing = await db.get_closed_markets(limit=1)
+    if existing:
+        log.info(f"[BOOTSTRAP] Historical data already exists, skipping")
+        return
+
+    log.info("[BOOTSTRAP] Loading historical closed markets for training...")
+    import json as _json
+    from engine.scanner import detect_theme, _parse_end_date
+
+    total = 0
+    offset = 0
+    while offset < 5000:
+        try:
+            r = await scanner.client.get("https://gamma-api.polymarket.com/markets", params={
+                "closed": "true", "order": "volume", "ascending": "false",
+                "limit": 100, "offset": offset,
+            })
+            batch = r.json() or []
+            if not batch:
+                break
+            for m in batch:
+                vol = float(m.get("volume") or 0)
+                if vol < 10000:
+                    continue
+                raw_prices = m.get("outcomePrices") or ["0.5", "0.5"]
+                if isinstance(raw_prices, str):
+                    raw_prices = _json.loads(raw_prices)
+                yes_price = float(raw_prices[0])
+                no_price = float(raw_prices[1]) if len(raw_prices) > 1 else 1 - yes_price
+
+                # Determine outcome from final price
+                if yes_price >= 0.95:
+                    outcome = "YES"
+                elif yes_price <= 0.05:
+                    outcome = "NO"
+                else:
+                    continue  # not cleanly resolved
+
+                end_date = _parse_end_date(m.get("endDate"))
+                question = m.get("question", "")
+                await db.upsert_market({
+                    "id": str(m["id"]),
+                    "slug": m.get("slug", ""),
+                    "question": question,
+                    "theme": detect_theme(question),
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "volume": vol,
+                    "volume_24h": 0,
+                    "liquidity": 0,
+                    "end_date": end_date,
+                    "url": "",
+                })
+                # Mark as resolved
+                async with db.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE markets SET outcome=$1, is_active=FALSE, resolved_at=NOW() WHERE id=$2",
+                        outcome, str(m["id"])
+                    )
+                total += 1
+            offset += 100
+        except Exception as e:
+            log.warning(f"[BOOTSTRAP] Error at offset {offset}: {e}")
+            break
+
+    log.info(f"[BOOTSTRAP] Loaded {total} historical markets for training")
+
 async def daily_ai_analysis(db: Database, config: dict) -> str:
     """Once-daily Sonnet analysis of trading performance with recommendations."""
     client = _get_claude_client(config)
@@ -408,10 +477,10 @@ async def main():
         f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL"
     )
 
-    # One-time migrations (safe to re-run, idempotent)
-    await db.tighten_old_stop_losses(0.25)
-    await db.close_long_dated_positions(max_days=30)
     await db.save_config_snapshot(CONFIG["CONFIG_TAG"], CONFIG)
+
+    # Bootstrap: load historical closed markets for training (one-time, skips if data exists)
+    await bootstrap_history(db, scanner)
 
     await history.analyze()
     await math_eng.load_patterns()
