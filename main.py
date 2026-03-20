@@ -104,6 +104,69 @@ Return ONLY JSON in <json></json> tags:
         log.warning(f"[CLAUDE] {e}")
     return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0, "reasoning": "api_error"}
 
+async def daily_ai_analysis(db: Database, config: dict) -> str:
+    """Once-daily Sonnet analysis of trading performance with recommendations."""
+    client = _get_claude_client(config)
+    data = await db.get_analytics()
+    stats = await db.get_stats()
+    open_pos = await db.get_open_positions()
+    start = float(os.getenv("BANKROLL", "1000"))
+
+    summary = (
+        f"=== QUANT ENGINE DAILY STATS ===\n"
+        f"Bankroll: ${stats['bankroll']:.2f} (start: ${start:.0f}, ROI: {(stats['bankroll']-start)/start*100:+.1f}%)\n"
+        f"P&L: ${stats['total_pnl']:+.2f} | WR: {stats['wins']}W/{stats['losses']}L\n"
+        f"Open positions: {len(open_pos)} | Avg EV: {stats['avg_ev']*100:.1f}% | Avg Kelly: {stats['avg_kelly']*100:.1f}%\n\n"
+        f"=== WIN RATE BY THEME ===\n"
+    )
+    for r in data["by_theme"]:
+        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+        summary += f"  {r['theme']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
+
+    summary += f"\n=== WIN RATE BY SOURCE ===\n"
+    for r in data["by_source"]:
+        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+        summary += f"  {r['source']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
+
+    summary += f"\n=== WIN RATE BY SIDE ===\n"
+    for r in data["by_side"]:
+        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+        summary += f"  {r['side']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
+
+    summary += f"\n=== CALIBRATION ===\n"
+    for r in data["calibration"]:
+        summary += f"  {r['bucket']}: {r['total']} trades, predicted={float(r['avg_predicted'])*100:.1f}%, actual={float(r['actual_wr'])*100:.1f}%\n"
+
+    summary += (
+        f"\n=== EV ACCURACY ===\n"
+        f"  Predicted EV: +{data['ev_predicted']*100:.1f}% | Actual return: {data['ev_actual']*100:+.1f}%\n"
+        f"  Avg position lifetime: {data['avg_lifetime_hours']:.1f}h\n"
+        f"\n=== CLOSE REASONS ===\n"
+    )
+    for r in data["by_reason"]:
+        summary += f"  {r['reason']}: {r['total']} trades, avg_pnl={float(r['avg_pnl']):+.2f}\n"
+
+    summary += (
+        f"\n=== CONFIG ===\n"
+        f"  MIN_EV={config['MIN_EV']} MIN_KL={config['MIN_KL']} MAX_KELLY_FRAC={config['MAX_KELLY_FRAC']}\n"
+        f"  TAKE_PROFIT={config['TAKE_PROFIT_PCT']} STOP_LOSS={config['STOP_LOSS_PCT']}\n"
+        f"  MAX_DRIFT=0.15 Kelly_fraction=0.15\n"
+    )
+
+    try:
+        r = await client.messages.create(
+            model="claude-sonnet-4-6-20250514", max_tokens=800,
+            system="""You are a quantitative trading analyst reviewing a prediction market bot's performance.
+Give specific, actionable recommendations. Be direct and concise.
+Focus on: what's working, what's not, config changes to suggest (with specific numbers), and risks.
+Reply in English, max 500 words. Use plain text (no markdown).""",
+            messages=[{"role": "user", "content": summary}],
+        )
+        return "".join(b.text for b in r.content if hasattr(b, "text"))
+    except Exception as e:
+        log.warning(f"[ANALYSIS] Sonnet call failed: {e}")
+        return ""
+
 MAX_PER_THEME = 5  # no more than 5 positions in the same theme
 
 DISPLACE_MIN_EV = 0.25  # new signal must have EV > 25% to displace
@@ -492,6 +555,13 @@ async def main():
             utc = datetime.now(timezone.utc)
             if utc.hour == 8 and utc.minute < 1:
                 await telegram.send(await db.build_report())
+                # Daily AI analysis with Sonnet
+                try:
+                    analysis = await daily_ai_analysis(db, CONFIG)
+                    if analysis:
+                        await telegram.send(f"🧠 <b>AI DAILY ANALYSIS</b>\n\n{analysis}")
+                except Exception as e:
+                    log.warning(f"[ANALYSIS] {e}")
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
