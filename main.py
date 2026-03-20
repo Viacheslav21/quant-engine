@@ -159,7 +159,8 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
         f"💰 P&L:<b>{pnl:+.2f}$</b> → Freed slot for better signal"
     )
 
-async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict, scanner: PolymarketScanner = None):
+async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict,
+                         scanner: PolymarketScanner = None, math_eng: MathEngine = None):
     open_pos = await db.get_open_positions()
     if any(p["market_id"] == signal["market_id"] for p in open_pos): return False
     theme_count = sum(1 for p in open_pos if p.get("theme") == signal.get("theme"))
@@ -177,7 +178,8 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         await _close_for_displacement(displace, db, telegram)
     stats    = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
-    math_eng = MathEngine(config, db)
+    if math_eng is None:
+        math_eng = MathEngine(config, db)
 
     # Contrarian trades: half Kelly, tighter TP/SL
     kelly = signal["kelly"]
@@ -226,11 +228,15 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     )
     return True
 
-async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner, config: dict):
+async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner, config: dict,
+                            markets: list = None, trailing_highs: dict = None):
     open_pos = await db.get_open_positions()
     if not open_pos: return
-    markets  = await scanner.fetch()
-    mmap     = {m["id"]: m for m in markets}
+    if markets is None:
+        markets = await scanner.fetch()
+    if trailing_highs is None:
+        trailing_highs = {}
+    mmap = {m["id"]: m for m in markets}
 
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
@@ -270,11 +276,23 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
             pnl     = round(payout - pos["stake_amt"], 2)
             close_reason = "RESOLVED"
 
-        # 2. Take profit — price moved in our favor
+        # 2. Take profit — fixed or trailing
         elif pnl_pct >= tp_pct:
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
             pnl    = round(payout - pos["stake_amt"], 2)
             close_reason = "TAKE_PROFIT"
+
+        # 2b. Trailing take profit — if price hit 50%+ of TP, track high and close on 5% pullback
+        elif config.get("TRAILING_TP") and pnl_pct >= tp_pct * 0.5:
+            prev_high = trailing_highs.get(pos["id"], 0)
+            current_high = max(prev_high, pnl_pct)
+            trailing_highs[pos["id"]] = current_high
+            pullback = current_high - pnl_pct
+            if pullback >= 0.05 and current_high >= tp_pct * 0.5:
+                payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+                pnl    = round(payout - pos["stake_amt"], 2)
+                close_reason = "TRAILING_TP"
+                log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}%)")
 
         # 3. Stop loss — price moved against us
         elif pnl_pct <= -sl_pct:
@@ -287,11 +305,12 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
 
         outcome = outcome if close_reason == "RESOLVED" else f"{pos['side']}@{price*100:.0f}¢"
         await db.close_position(pos["id"], outcome, payout, pnl)
+        trailing_highs.pop(pos["id"], None)  # clean up trailing state
         stats = await db.get_stats()
         total = stats["wins"] + stats["losses"]
         wr    = round(stats["wins"]/total*100) if total > 0 else 0
 
-        reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑"}[close_reason]
+        reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
         won = pnl > 0
         log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
         await telegram.send(
@@ -330,6 +349,9 @@ async def main():
 
     last_news = last_history = 0
     scan_count = 0
+    _market_price_cache = {}  # market_id -> last yes_price, skip DB if unchanged
+    _signal_cooldown = {}  # market_id -> timestamp of last signal, avoid spam
+    trailing_highs = {}  # pos_id -> max pnl_pct seen (for trailing TP)
     claude_cache = {}  # market_id -> (timestamp, result) — avoid re-calling for same market
     CLAUDE_CACHE_TTL = 1800  # 30 minutes
     last_claude_call = 0  # timestamp of last actual API call
@@ -352,7 +374,12 @@ async def main():
             scan_count += 1
 
             markets = await scanner.fetch()
+            # Only write to DB for markets whose price actually changed
             for m in markets:
+                prev = _market_price_cache.get(m["id"])
+                if prev and abs(prev - m["yes_price"]) < 0.001:
+                    continue  # price unchanged, skip DB write
+                _market_price_cache[m["id"]] = m["yes_price"]
                 await db.upsert_market(m)
                 await db.save_snapshot(m["id"], m["yes_price"], m["volume"], m.get("volume_24h", 0))
 
@@ -372,8 +399,11 @@ async def main():
                             sig["news_trigger"] = item["title"][:200]
                             news_signals.append(sig)
 
+            news_market_ids = {s["market_id"] for s in news_signals}
             math_signals = []
             for m in markets:
+                if m["id"] in news_market_ids:
+                    continue  # already analyzed in news loop
                 sig = math_eng.analyze(m)
                 if sig:
                     math_signals.append(sig)
@@ -381,6 +411,11 @@ async def main():
             all_signals = {s["market_id"]: s for s in math_signals}
             for s in news_signals:
                 all_signals[s["market_id"]] = s
+
+            # Cooldown: skip signals for markets that already signaled in last 5 min
+            SIGNAL_COOLDOWN = 300
+            _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
+            all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
 
             # Rank by Kelly (already incorporates EV), penalize high-entropy (uncertain) markets
             signals = sorted(all_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
@@ -439,9 +474,10 @@ async def main():
                     "news_trigger":sig.get("news_trigger"),
                     "source":      sig.get("source","math"),
                 })
-                await execute_signal(sig, db, telegram, CONFIG, scanner)
+                _signal_cooldown[sig["market_id"]] = now
+                await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
 
-            await monitor_positions(db, telegram, scanner, CONFIG)
+            await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
 
             if now - last_history >= CONFIG["HISTORY_INTERVAL"]:
                 last_history = now

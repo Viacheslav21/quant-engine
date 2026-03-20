@@ -124,8 +124,23 @@ class MathEngine:
         # --- Bayesian fusion in log-odds space ---
         # Prior: prospect-adjusted market price
         # Evidence: history, volume, time, momentum, contrarian, long momentum, vol trend, arb
-        evidence = [e for e in [p_history, p_volume, p_time, p_momentum, p_contrarian,
-                                p_long_mom, p_vol_trend, p_arb] if e is not None]
+        #
+        # Correlated signals: pick the stronger of each correlated pair to avoid double-counting
+        # - p_momentum (short-term) vs p_long_mom (long-term): keep the one with larger shift
+        # - p_volume (spike) vs p_vol_trend (trend): keep the one with larger shift
+        p_mom_final = None
+        if p_momentum is not None and p_long_mom is not None:
+            p_mom_final = p_momentum if abs(p_momentum - p_market) >= abs(p_long_mom - p_market) else p_long_mom
+        else:
+            p_mom_final = p_momentum or p_long_mom
+
+        p_vol_final = None
+        if p_volume is not None and p_vol_trend is not None:
+            p_vol_final = p_volume if abs(p_volume - p_market) >= abs(p_vol_trend - p_market) else p_vol_trend
+        else:
+            p_vol_final = p_volume or p_vol_trend
+
+        evidence = [e for e in [p_history, p_vol_final, p_time, p_mom_final, p_contrarian, p_arb] if e is not None]
         if evidence:
             p_final = bayesian_update(p_prospect, *evidence)
         else:
@@ -142,10 +157,11 @@ class MathEngine:
         else:
             side, p_side, price_side = "NO", 1-p_final, 1-p_market
 
-        # Use bestAsk as real entry price when available (more accurate than mid-price)
+        # Use bestAsk as real entry price for YES side only
+        # (API doesn't provide bestBid, so can't compute real NO entry price)
         best_ask = market.get("best_ask")
-        if best_ask and 0.01 < best_ask < 0.99:
-            real_price = best_ask if p_final > p_market else (1 - best_ask)
+        if side == "YES" and best_ask and 0.01 < best_ask < 0.99:
+            real_price = best_ask
         else:
             real_price = price_side
 
@@ -223,14 +239,15 @@ class MathEngine:
 
     def _volume_signal(self, market_id: str, volume_24h: float) -> tuple:
         history = self._vol_history.setdefault(market_id, [])
-        history.append(volume_24h)
+        # Only record if value actually changed (volume_24h updates infrequently in API)
+        if not history or abs(history[-1] - volume_24h) > 1.0:
+            history.append(volume_24h)
         if len(history) > 48: history.pop(0)
         if len(history) < 3: return 1.0, "neutral"
         avg = sum(history[:-1]) / len(history[:-1])
         if avg <= 0: return 1.0, "neutral"
         ratio = volume_24h / avg
         if ratio > VOLUME_SPIKE_THR:
-            # Compare to average, not just previous point (less noisy)
             direction = "up" if volume_24h > avg * 1.2 else "down"
             log.info(f"[MATH] Volume spike {market_id[:8]}: {ratio:.1f}x avg → {direction}")
             return ratio, direction
@@ -242,20 +259,24 @@ class MathEngine:
         if direction == "up":   return min(0.98, p_market * (1 + strength))
         return max(0.02, p_market * (1 - strength))
 
-    def _time_decay(self, p_market: float, end_date) -> float:
-        if not end_date: return p_market
+    def _time_decay(self, p_market: float, end_date) -> Optional[float]:
+        if not end_date: return None
         try:
             if isinstance(end_date, str):
                 end_date = datetime.fromisoformat(end_date.replace("Z","+00:00"))
             days_left = (end_date - datetime.now(timezone.utc)).days
         except Exception:
-            return p_market
-        if days_left <= 0:  return p_market
+            return None
+        if days_left <= 0: return None
         # Smooth decay: blend market → prospect as time increases
         # Near expiry: trust market price more (it's converging to truth)
         # Far from expiry: prospect theory has more room to add value
         decay = min(1.0, max(0.0, (days_left - 3) / 30))
-        return p_market * (1 - decay) + prospect_true_price(p_market) * decay
+        p_time = p_market * (1 - decay) + prospect_true_price(p_market) * decay
+        # Only return if meaningfully different from market price
+        if abs(p_time - p_market) < 0.005:
+            return None
+        return p_time
 
     def _price_momentum(self, market_id: str, current_price: float) -> Optional[float]:
         """Track price trend from recent snapshots. Rising prices = more YES signal."""
@@ -348,7 +369,8 @@ class MathEngine:
         """Use API-provided week/month price changes as long-term momentum signal."""
         chg_1wk = market.get("price_change_1wk", 0)
         chg_1mo = market.get("price_change_1mo", 0)
-        if chg_1wk == 0 and chg_1mo == 0:
+        # Require at least 2% weekly or 5% monthly change to signal
+        if abs(chg_1wk) < 0.02 and abs(chg_1mo) < 0.05:
             return None
         # Weighted: week is more recent, weight 0.7; month gives context, weight 0.3
         blended = chg_1wk * 0.7 + chg_1mo * 0.3
