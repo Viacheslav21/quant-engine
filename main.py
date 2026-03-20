@@ -42,8 +42,8 @@ CONFIG = {
     "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "10")),
     "NEWS_INTERVAL":    int(os.getenv("NEWS_INTERVAL", "30")),
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
-    "MIN_EV":           float(os.getenv("MIN_EV", "0.08")),
-    "MIN_KL":           float(os.getenv("MIN_KL", "0.08")),
+    "MIN_EV":           float(os.getenv("MIN_EV", "0.15")),
+    "MIN_KL":           float(os.getenv("MIN_KL", "0.12")),
     "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.01")),
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
@@ -111,8 +111,6 @@ DISPLACE_MIN_EV = 0.25  # new signal must have EV > 25% to displace
 async def _find_displaceable(open_pos: list, signal: dict, scanner: PolymarketScanner) -> dict | None:
     """Find the worst open position that can be displaced by a stronger signal."""
     candidates = []
-    markets_cache = {}
-
     for pos in open_pos:
         # Never displace a position in the same market
         if pos["market_id"] == signal["market_id"]:
@@ -344,6 +342,9 @@ async def main():
         f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL"
     )
 
+    # One-time: tighten SL on old positions from 50% to 25%
+    await db.tighten_old_stop_losses(0.25)
+
     await history.analyze()
     await math_eng.load_patterns()
 
@@ -445,7 +446,10 @@ async def main():
                         continue
                     if result.get("confirm"):
                         sig["p_claude"] = result.get("p_claude", sig["p_final"])
-                        sig["p_final"]  = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
+                        blended = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
+                        # Re-apply drift cap after Claude blend
+                        max_drift = 0.15
+                        sig["p_final"] = max(sig["p_market"] - max_drift, min(sig["p_market"] + max_drift, blended))
                         sig["source"]   = "claude"
                         confirmed.append(sig)
                         log.info(f"[CLAUDE] ✅ {sig['question'][:50]}")

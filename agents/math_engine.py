@@ -30,7 +30,7 @@ def expected_value(p_true: float, price: float) -> float:
     if not (0 < price < 1): return 0.0
     return round(p_true * ((1/price)-1) - (1-p_true), 4)
 
-def kelly_fraction(p_true: float, price: float, fraction: float = 0.25) -> float:
+def kelly_fraction(p_true: float, price: float, fraction: float = 0.15) -> float:
     if not (0 < price < 1) or not (0 < p_true < 1): return 0.0
     b = (1/price)-1
     k = (b*p_true-(1-p_true))/b
@@ -95,7 +95,7 @@ class MathEngine:
 
         # 3. Volume spike detection
         vol_signal, vol_dir = self._volume_signal(market["id"], market.get("volume_24h",0))
-        p_volume = self._vol_adjusted(p_market, vol_signal, vol_dir) if vol_signal > 1.5 else None
+        p_volume = self._vol_adjusted(p_market, vol_signal, vol_dir) if vol_signal > VOLUME_SPIKE_THR else None
 
         # 4. Time decay — markets converge to truth near expiry
         p_time = self._time_decay(p_market, market.get("end_date"))
@@ -146,9 +146,17 @@ class MathEngine:
         else:
             p_final = p_prospect
 
-        # 6. Apply calibration correction if available
+        # Apply calibration correction if available
         if self.calibrator:
             p_final = self.calibrator.adjust(p_final)
+
+        # Cap max drift: model can't deviate more than 15% from market price
+        # If it thinks edge is >15%, it's more likely the model is wrong than the market
+        MAX_DRIFT = 0.15
+        if p_final > p_market + MAX_DRIFT:
+            p_final = p_market + MAX_DRIFT
+        elif p_final < p_market - MAX_DRIFT:
+            p_final = p_market - MAX_DRIFT
 
         p_final = max(0.02, min(0.98, round(p_final, 4)))
 
@@ -184,8 +192,8 @@ class MathEngine:
         if kelly < self.config["MIN_KELLY_FRAC"]:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: Kelly {kelly:.4f} < {self.config['MIN_KELLY_FRAC']}")
             return None
-        if edge < 0.05:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.05")
+        if edge < 0.10:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.10")
             return None
 
         # Determine if contrarian is the dominant evidence

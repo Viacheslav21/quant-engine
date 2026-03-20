@@ -330,6 +330,15 @@ class Database:
             f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
         )
 
+    async def tighten_old_stop_losses(self, new_sl: float = 0.25):
+        """One-time: tighten SL on old positions that still have the default 50% SL."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE positions SET sl_pct = $1 WHERE status = 'open' AND sl_pct >= 0.50",
+                new_sl
+            )
+            log.info(f"[DB] Tightened SL to {new_sl*100:.0f}% on old positions: {result}")
+
     async def get_cumulative_pnl(self) -> list:
         """Returns cumulative PnL over time for charting."""
         async with self.pool.acquire() as conn:
