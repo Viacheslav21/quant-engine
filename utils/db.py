@@ -377,16 +377,26 @@ class Database:
 
     async def get_signal_outcomes(self, limit: int = 200) -> list:
         """Check what happened to signals after they were generated.
-        Compares signal side_price to current market price."""
+        Uses market price if available, otherwise position outcome."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT s.id, s.question, s.side, s.side_price, s.p_market, s.p_final,
                     s.ev, s.kelly, s.source, s.executed, s.created_at,
-                    m.yes_price as current_price, m.is_active,
-                    CASE WHEN s.side = 'YES' THEN m.yes_price - s.side_price
-                         ELSE (1 - m.yes_price) - s.side_price END as price_move
+                    COALESCE(m.yes_price, CASE WHEN p.result='WIN' THEN
+                        CASE WHEN s.side='YES' THEN 0.95 ELSE 0.05 END
+                        ELSE CASE WHEN s.side='YES' THEN 0.05 ELSE 0.95 END
+                    END) as current_price,
+                    COALESCE(m.is_active, FALSE) as is_active,
+                    CASE WHEN m.id IS NOT NULL THEN
+                        CASE WHEN s.side = 'YES' THEN m.yes_price - s.side_price
+                             ELSE (1 - m.yes_price) - s.side_price END
+                    WHEN p.id IS NOT NULL THEN
+                        CASE WHEN p.result = 'WIN' THEN ABS(s.side_price)
+                             ELSE -s.side_price END
+                    END as price_move
                 FROM signals s
-                JOIN markets m ON s.market_id = m.id
+                LEFT JOIN markets m ON s.market_id = m.id
+                LEFT JOIN positions p ON s.id = p.signal_id
                 ORDER BY s.created_at DESC
                 LIMIT $1
             """, limit)
@@ -515,9 +525,10 @@ class Database:
             "ev_actual": float(ev_accuracy["avg_actual_return"] or 0) if ev_accuracy else 0,
         }
 
-    async def cleanup(self, snap_days: int = 3, sig_days: int = 7, news_days: int = 5,
-                       pos_days: int = 14, market_days: int = 3):
-        """Delete old data to prevent DB bloat. All retention periods configurable."""
+    async def cleanup(self, snap_days: int = 1, sig_days: int = 7, news_days: int = 5):
+        """Delete old data to prevent DB bloat.
+        KEEP FOREVER: positions (analytics/calibration), markets (backtest), executed signals.
+        DELETE: price_snapshots, unexecuted signals, processed news."""
         try:
             async with self.pool.acquire() as conn:
                 r1 = await conn.execute(
@@ -532,18 +543,9 @@ class Database:
                     "DELETE FROM news WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND processed = TRUE",
                     str(news_days)
                 )
-                r4 = await conn.execute(
-                    "DELETE FROM positions WHERE status = 'closed' AND closed_at < NOW() - ($1 || ' days')::INTERVAL",
-                    str(pos_days)
-                )
-                r5 = await conn.execute("""
-                    DELETE FROM markets WHERE is_active = FALSE
-                    AND updated_at < NOW() - ($1 || ' days')::INTERVAL
-                    AND id NOT IN (SELECT market_id FROM positions WHERE status = 'open')
-                """, str(market_days))
                 # reclaim disk space
                 await conn.execute("VACUUM")
-                log.info(f"[DB] Cleanup: snapshots={r1}, signals={r2}, news={r3}, positions={r4}, markets={r5}")
+                log.info(f"[DB] Cleanup: snapshots={r1}, signals={r2}, news={r3}")
         except Exception as e:
             log.error(f"[DB] Cleanup failed: {e}")
 
