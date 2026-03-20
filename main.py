@@ -50,7 +50,7 @@ CONFIG = {
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.20")),
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
-    "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.50")),
+    "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
 }
 
