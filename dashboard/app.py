@@ -391,6 +391,8 @@ async def analytics():
     data = await _db.get_analytics()
     pnl_data = await _db.get_cumulative_pnl()
     sig_outcomes = await _db.get_signal_outcomes(limit=200)
+    config_hist = await _db.get_config_history()
+    config_map = {c["tag"]: c["params"] for c in config_hist}
     stats = await _db.get_stats()
     start = float(os.getenv("BANKROLL","1000"))
     roi   = ((stats["bankroll"]-start)/start*100)
@@ -451,6 +453,29 @@ async def analytics():
     # EV accuracy
     ev_pred = data["ev_predicted"]*100
     ev_act  = data["ev_actual"]*100
+
+    # Config A/B comparison
+    config_rows = ""
+    for r in data["by_config"]:
+        wr_val = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+        tag = r['config_tag']
+        params = config_map.get(tag, {})
+        if isinstance(params, str):
+            import json as _j
+            params = _j.loads(params)
+        param_str = f"EV≥{params.get('MIN_EV','')} KL≥{params.get('MIN_KL','')} Kelly:{params.get('MAX_KELLY_FRAC','')} SL:{params.get('STOP_LOSS_PCT','')}" if params else "—"
+        config_rows += f"""<tr>
+            <td style="font-weight:600" title="{param_str}">{tag}</td>
+            <td class="num">{r['total']}</td>
+            <td class="num" style="color:{wr_color(r['wins'],r['total'])}">{r['wins']}/{r['total']} ({wr_val}%)</td>
+            <td class="num" style="color:{pc(float(r['total_pnl']))}">{float(r['total_pnl']):+.2f}$</td>
+            <td class="num" style="color:{pc(float(r['avg_pnl']))}">{float(r['avg_pnl']):+.2f}$</td>
+            <td class="num">{float(r['avg_ev'])*100:.1f}%</td>
+            <td class="num">${float(r['avg_stake']):.2f}</td>
+            <td class="q" style="font-size:11px">{param_str}</td>
+        </tr>"""
+    if not config_rows:
+        config_rows = '<tr><td colspan="8" class="empty">No data yet</td></tr>'
 
     # Signal backtest
     exec_sigs = [s for s in sig_outcomes if s["executed"]]
@@ -539,6 +564,14 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
     <div class="value num" style="color:#F59E0B">{data['avg_lifetime_hours']:.1f}h</div>
     <div class="sub">Avg position duration</div>
   </div>
+</div>
+
+<div class="panel" style="margin-bottom:20px">
+  <div class="panel-header"><h2 title="Сравнение разных конфигураций. Меняй CONFIG_TAG в env при смене параметров чтобы отслеживать какая настройка лучше">Config A/B Testing</h2></div>
+  <table>
+    <tr><th title="Тег конфигурации (env CONFIG_TAG)">Config</th><th>Trades</th><th>W/L (WR)</th><th title="Суммарный P&amp;L">Total PnL</th><th title="Средний P&amp;L на сделку">Avg PnL</th><th title="Средний EV при входе">Avg EV</th><th title="Средний размер ставки">Avg Stake</th><th title="Ключевые параметры этого конфига">Params</th></tr>
+    {config_rows}
+  </table>
 </div>
 
 <div class="row">

@@ -82,6 +82,11 @@ class Database:
                     avg_ev REAL DEFAULT 0, avg_kelly REAL DEFAULT 0,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS config_history (
+                    tag TEXT PRIMARY KEY,
+                    params JSONB NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON price_snapshots(market_id, snapshot_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
@@ -114,6 +119,9 @@ class Database:
             if "sl_pct" not in col_names:
                 await conn.execute("ALTER TABLE positions ADD COLUMN sl_pct REAL DEFAULT 0.50")
                 log.info("[DB] Added sl_pct column to positions")
+            if "config_tag" not in col_names:
+                await conn.execute("ALTER TABLE positions ADD COLUMN config_tag TEXT DEFAULT 'v0'")
+                log.info("[DB] Added config_tag column to positions")
 
     async def get_price_history(self, market_id: str, minutes: int = 60) -> list:
         """Returns recent price snapshots [{yes_price, volume, snapshot_at}] ordered ASC."""
@@ -200,13 +208,14 @@ class Database:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute("""
-                        INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url,tp_pct,sl_pct)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                        INSERT INTO positions (id,market_id,signal_id,question,theme,side,side_price,p_final,ev,kl,kelly,stake_amt,current_price,url,tp_pct,sl_pct,config_tag)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                     """, pos["id"], pos["market_id"], pos.get("signal_id"),
                         pos["question"], pos.get("theme","other"), pos["side"],
                         pos["side_price"], pos["p_final"], pos["ev"], pos["kl"],
                         pos["kelly"], pos["stake_amt"], pos["side_price"], pos.get("url",""),
-                        pos.get("tp_pct", 0.20), pos.get("sl_pct", 0.50))
+                        pos.get("tp_pct", 0.20), pos.get("sl_pct", 0.50),
+                        pos.get("config_tag", "v0"))
                     await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", -pos["stake_amt"])
                     await conn.execute("""
                         UPDATE stats SET
@@ -330,6 +339,22 @@ class Database:
             f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
         )
 
+    async def save_config_snapshot(self, tag: str, config: dict):
+        """Save config params for A/B tracking. Skips if tag already exists."""
+        import json
+        # Only save trading-relevant params
+        params = {k: v for k, v in config.items() if k not in ("ANTHROPIC_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")}
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO config_history (tag, params) VALUES ($1, $2)
+                ON CONFLICT (tag) DO NOTHING
+            """, tag, json.dumps(params))
+
+    async def get_config_history(self) -> list:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM config_history ORDER BY created_at DESC")
+            return [dict(r) for r in rows]
+
     async def close_long_dated_positions(self, max_days: int = 90):
         """One-time: delete open positions on long-dated markets. Returns stake, no trace."""
         async with self.pool.acquire() as conn:
@@ -432,6 +457,18 @@ class Database:
                 GROUP BY reason ORDER BY total DESC
             """)
 
+            # Win rate by config tag (A/B testing)
+            by_config = await conn.fetch("""
+                SELECT COALESCE(config_tag, 'v0') as config_tag, COUNT(*) as total,
+                    SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(SUM(pnl)::numeric, 2) as total_pnl,
+                    ROUND(AVG(pnl)::numeric, 2) as avg_pnl,
+                    ROUND(AVG(ev)::numeric, 4) as avg_ev,
+                    ROUND(AVG(stake_amt)::numeric, 2) as avg_stake
+                FROM positions WHERE status='closed'
+                GROUP BY COALESCE(config_tag, 'v0') ORDER BY config_tag
+            """)
+
             # Calibration buckets: predicted p_final vs actual outcome
             calibration = await conn.fetch("""
                 SELECT
@@ -473,6 +510,7 @@ class Database:
             """)
 
         return {
+            "by_config": [dict(r) for r in by_config],
             "by_theme": [dict(r) for r in by_theme],
             "by_source": [dict(r) for r in by_source],
             "by_side": [dict(r) for r in by_side],

@@ -53,6 +53,7 @@ CONFIG = {
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
+    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v1"),
 }
 
 _claude_client = None
@@ -275,6 +276,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         "url":        signal.get("url",""),
         "tp_pct":     tp_pct,
         "sl_pct":     sl_pct,
+        "config_tag": config.get("CONFIG_TAG", "v1"),
     }
     await db.save_position(pos)
     src_emoji = {"math":"🔢","news":"📰","claude":"🧠"}.get(signal.get("source","math"),"🎯")
@@ -409,6 +411,7 @@ async def main():
     # One-time migrations (safe to re-run, idempotent)
     await db.tighten_old_stop_losses(0.25)
     await db.close_long_dated_positions(max_days=30)
+    await db.save_config_snapshot(CONFIG["CONFIG_TAG"], CONFIG)
 
     await history.analyze()
     await math_eng.load_patterns()
