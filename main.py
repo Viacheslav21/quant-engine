@@ -42,8 +42,8 @@ CONFIG = {
     "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "10")),
     "NEWS_INTERVAL":    int(os.getenv("NEWS_INTERVAL", "30")),
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
-    "MIN_EV":           float(os.getenv("MIN_EV", "0.15")),
-    "MIN_KL":           float(os.getenv("MIN_KL", "0.12")),
+    "MIN_EV":           float(os.getenv("MIN_EV", "0.12")),
+    "MIN_KL":           float(os.getenv("MIN_KL", "0.10")),
     "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.01")),
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
@@ -53,7 +53,7 @@ CONFIG = {
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
-    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v1"),
+    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v2"),
 }
 
 _claude_client = None

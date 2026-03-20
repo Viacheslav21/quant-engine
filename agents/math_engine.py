@@ -206,8 +206,8 @@ class MathEngine:
         if kelly < self.config["MIN_KELLY_FRAC"]:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: Kelly {kelly:.4f} < {self.config['MIN_KELLY_FRAC']}")
             return None
-        if edge < 0.10:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.10")
+        if edge < 0.08:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < 0.08")
             return None
 
         # Determine if contrarian is the dominant evidence
