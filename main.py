@@ -52,6 +52,7 @@ CONFIG = {
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
+    "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
 }
 
 _claude_client = None
@@ -405,8 +406,9 @@ async def main():
         f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL"
     )
 
-    # One-time: tighten SL on old positions from 50% to 25%
+    # One-time migrations (safe to re-run, idempotent)
     await db.tighten_old_stop_losses(0.25)
+    await db.close_long_dated_positions(max_days=30)
 
     await history.analyze()
     await math_eng.load_patterns()

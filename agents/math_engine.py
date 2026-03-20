@@ -87,6 +87,20 @@ class MathEngine:
         p_market = market["yes_price"]
         theme    = market.get("theme","other")
 
+        # 0. Skip markets too far in the future (don't freeze capital)
+        max_days = int(self.config.get("MAX_MARKET_DAYS", 90))
+        end_date = market.get("end_date")
+        if end_date:
+            try:
+                if isinstance(end_date, str):
+                    from datetime import datetime as _dt, timezone as _tz
+                    end_date = _dt.fromisoformat(end_date.replace("Z", "+00:00"))
+                days_left = (end_date - datetime.now(timezone.utc)).days
+                if days_left > max_days:
+                    return None
+            except Exception:
+                pass
+
         # 1. Prospect theory — invert human probability weighting
         p_prospect = prospect_true_price(p_market)
 
