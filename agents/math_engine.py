@@ -471,6 +471,48 @@ class MathEngine:
         log.debug(f"[MATH] NegRisk arb {market['id'][:8]}: sum={total:.3f} price={market['yes_price']:.3f}→{fair_price:.3f}")
         return round(max(0.02, min(0.98, fair_price)), 4)
 
+    def get_market_metrics(self, market_id: str) -> dict:
+        """Export current metrics for a market (for DB persistence)."""
+        short = self._price_cache.get(market_id, [])
+        long_ = self._long_price_cache.get(market_id, [])
+        vol = self._market_volatility(market_id)
+
+        # Momentum slope
+        momentum = 0.0
+        if len(short) >= 5:
+            n = len(short)
+            x_mean = (n - 1) / 2
+            y_mean = sum(short) / n
+            num = sum((i - x_mean) * (short[i] - y_mean) for i in range(n))
+            den = sum((i - x_mean) ** 2 for i in range(n))
+            if den > 0:
+                momentum = round(num / den * n * 0.5, 5)
+
+        # Volume ratio
+        vol_hist = self._vol_history.get(market_id, [])
+        vol_ratio = 1.0
+        if len(vol_hist) >= 3:
+            avg = sum(vol_hist) / len(vol_hist)
+            if avg > 0:
+                vol_ratio = round(vol_hist[-1] / avg, 2)
+
+        return {
+            "volatility": vol,
+            "momentum": momentum,
+            "vol_ratio": vol_ratio,
+            "long_prices": long_[-180:],
+            "short_prices": short[-30:],
+        }
+
+    def restore_market_metrics(self, market_id: str, metrics: dict):
+        """Restore caches from DB on startup."""
+        long_p = metrics.get("long_prices") or []
+        short_p = metrics.get("short_prices") or []
+        if long_p:
+            self._long_price_cache[market_id] = list(long_p)
+        if short_p:
+            self._price_cache[market_id] = list(short_p)
+
     def compute_stake(self, bankroll: float, kelly: float) -> float:
         stake = bankroll * kelly
         stake = round(max(1.0, min(stake, bankroll*self.config["MAX_KELLY_FRAC"])), 2)

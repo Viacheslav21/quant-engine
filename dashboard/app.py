@@ -391,6 +391,7 @@ async def analytics():
     data = await _db.get_analytics()
     pnl_data = await _db.get_cumulative_pnl()
     sig_outcomes = await _db.get_signal_outcomes(limit=200)
+    market_metrics = await _db.get_all_market_metrics()
     config_hist = await _db.get_config_history()
     config_map = {c["tag"]: c["params"] for c in config_hist}
     stats = await _db.get_stats()
@@ -503,6 +504,28 @@ async def analytics():
         </tr>"""
     if not bt_rows:
         bt_rows = '<tr><td colspan="7" class="empty">No signals</td></tr>'
+
+    # Market metrics table
+    mm_rows = ""
+    for m in market_metrics[:50]:
+        vol = m.get("volatility") or 0
+        mom = m.get("momentum") or 0
+        vr = m.get("vol_ratio") or 1.0
+        q = (m.get("question") or "")[:55]
+        price = (m.get("yes_price") or 0) * 100
+        theme = m.get("theme") or "other"
+        vol_color = "#EF4444" if vol > 0.02 else "#F59E0B" if vol > 0.005 else "#10B981"
+        mom_color = "#3B82F6" if mom > 0 else "#EF4444" if mom < 0 else "#6B7280"
+        mm_rows += f"""<tr>
+            <td class="q">{q}...</td>
+            <td class="num">{price:.1f}&#162;</td>
+            <td class="num">{theme}</td>
+            <td class="num" style="color:{vol_color}">{vol*100:.3f}%</td>
+            <td class="num" style="color:{mom_color}">{mom*100:+.2f}%</td>
+            <td class="num">{vr:.2f}x</td>
+        </tr>"""
+    if not mm_rows:
+        mm_rows = '<tr><td colspan="6" class="empty">No metrics yet</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html lang="ru"><head>
@@ -653,6 +676,18 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
   <div class="panel-header"><h2>Signal Backtest (last 50)</h2></div>
   <table><tr><th>Question</th><th>Side</th><th>Entry</th><th>Now</th><th>Move</th><th>Direction</th><th>Status</th></tr>
     {bt_rows}
+  </table>
+</div>
+
+<div class="panel">
+  <div class="panel-header"><h2 title="Волатильность и моментум по рынкам. Volatility = ATR (средний размер колебания). Momentum = направление тренда">Market Metrics (top 50)</h2></div>
+  <table><tr>
+    <th>Question</th><th>Price</th><th>Theme</th>
+    <th title="ATR — средний размер колебания цены за 30 мин. Зелёный=спокойный, жёлтый=средний, красный=волатильный">Volatility</th>
+    <th title="Направление тренда. Синий=растёт, красный=падает">Momentum</th>
+    <th title="Объём сейчас / средний. >2.5x = кто-то что-то знает">Vol Ratio</th>
+  </tr>
+    {mm_rows}
   </table>
 </div>
 

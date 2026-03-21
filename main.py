@@ -495,10 +495,22 @@ async def main():
     await history.analyze()
     await math_eng.load_patterns()
 
-    last_news = last_history = 0
+    last_news = last_history = last_metrics_save = 0
+    METRICS_SAVE_INTERVAL = 300  # save market metrics every 5 minutes
     scan_count = 0
     _market_price_cache = {}  # market_id -> last yes_price, skip DB if unchanged
-    _signal_cooldown = {}  # market_id -> timestamp of last signal, avoid spam
+    # Restore caches and cooldowns from market_metrics table
+    _signal_cooldown = {}
+    try:
+        saved_metrics = await db.get_all_market_metrics()
+        for m in saved_metrics:
+            mid = m["market_id"]
+            math_eng.restore_market_metrics(mid, m)
+            if m.get("last_signal_at"):
+                _signal_cooldown[mid] = m["last_signal_at"].timestamp()
+        log.info(f"[MAIN] Restored {len(saved_metrics)} market caches, {len(_signal_cooldown)} cooldowns from DB")
+    except Exception as e:
+        log.warning(f"[MAIN] Could not restore metrics: {e}")
     trailing_highs = {}  # pos_id -> max pnl_pct seen (for trailing TP)
     claude_cache = {}  # market_id -> (timestamp, result) — avoid re-calling for same market
     CLAUDE_CACHE_TTL = 1800  # 30 minutes
@@ -534,6 +546,15 @@ async def main():
 
             # Build neg-risk groups for arbitrage detection
             math_eng.build_neg_risk_groups(markets)
+
+            # Warmup: skip signal generation briefly to fill price caches for new markets
+            WARMUP_TICKS = 6  # ~1 min at 10s interval
+            if scan_count <= WARMUP_TICKS:
+                if scan_count == WARMUP_TICKS:
+                    log.info(f"[MAIN] Warmup complete ({WARMUP_TICKS} ticks), starting signal generation")
+                await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
+                await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+                continue
 
             news_signals = []
             if now - last_news >= CONFIG["NEWS_INTERVAL"]:
@@ -628,10 +649,21 @@ async def main():
                     "source":      sig.get("source","math"),
                 })
                 _signal_cooldown[sig["market_id"]] = now
+                await db.mark_signal_cooldown(sig["market_id"])
                 await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
                 await db.mark_signal_executed(sig_id)
 
             await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
+
+            # Persist market metrics every 5 min for warm restart & analytics
+            if now - last_metrics_save >= METRICS_SAVE_INTERVAL:
+                last_metrics_save = now
+                try:
+                    for m in markets[:100]:  # top 100 by volume
+                        metrics = math_eng.get_market_metrics(m["id"])
+                        await db.save_market_metrics(m["id"], metrics)
+                except Exception as e:
+                    log.warning(f"[MAIN] Metrics save failed: {e}")
 
             if now - last_history >= CONFIG["HISTORY_INTERVAL"]:
                 last_history = now

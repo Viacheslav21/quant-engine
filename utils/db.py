@@ -88,6 +88,17 @@ class Database:
                     params JSONB NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS market_metrics (
+                    market_id TEXT PRIMARY KEY REFERENCES markets(id),
+                    volatility REAL DEFAULT 0,
+                    momentum REAL DEFAULT 0,
+                    vol_ratio REAL DEFAULT 1.0,
+                    vol_direction TEXT DEFAULT 'neutral',
+                    long_prices REAL[] DEFAULT '{}',
+                    short_prices REAL[] DEFAULT '{}',
+                    last_signal_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON price_snapshots(market_id, snapshot_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
@@ -138,6 +149,44 @@ class Database:
                     log.info(f"[DB] Backfilled {count} signals as executed")
         except Exception as e:
             log.warning(f"[DB] Backfill executed signals: {e}")
+
+    async def save_market_metrics(self, market_id: str, metrics: dict):
+        """Upsert market metrics (volatility, momentum, caches)."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO market_metrics (market_id, volatility, momentum, vol_ratio, vol_direction,
+                    long_prices, short_prices, last_signal_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (market_id) DO UPDATE SET
+                    volatility = $2, momentum = $3, vol_ratio = $4, vol_direction = $5,
+                    long_prices = $6, short_prices = $7,
+                    last_signal_at = COALESCE($8, market_metrics.last_signal_at),
+                    updated_at = NOW()
+            """, market_id, metrics.get("volatility", 0), metrics.get("momentum", 0),
+                metrics.get("vol_ratio", 1.0), metrics.get("vol_direction", "neutral"),
+                metrics.get("long_prices", []), metrics.get("short_prices", []),
+                metrics.get("last_signal_at"))
+
+    async def mark_signal_cooldown(self, market_id: str):
+        """Update last_signal_at for cooldown tracking."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO market_metrics (market_id, last_signal_at, updated_at)
+                VALUES ($1, NOW(), NOW())
+                ON CONFLICT (market_id) DO UPDATE SET last_signal_at = NOW(), updated_at = NOW()
+            """, market_id)
+
+    async def get_all_market_metrics(self) -> list:
+        """Load all market metrics for warm restart and analytics."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT mm.*, m.question, m.yes_price, m.theme
+                FROM market_metrics mm
+                JOIN markets m ON mm.market_id = m.id
+                WHERE m.is_active = TRUE
+                ORDER BY mm.updated_at DESC
+            """)
+            return [dict(r) for r in rows]
 
     async def get_price_history(self, market_id: str, minutes: int = 60) -> list:
         """Returns recent price snapshots [{yes_price, volume, snapshot_at}] ordered ASC."""
