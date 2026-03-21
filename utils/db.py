@@ -16,6 +16,7 @@ class Database:
         await self._create_schema()
         await self._migrate_positions_tp_sl()
         await self._backfill_executed_signals()
+        await self._cleanup_arb_positions()
         await self._init_stats()
         log.info("[DB] PostgreSQL подключён")
 
@@ -149,6 +150,38 @@ class Database:
                     log.info(f"[DB] Backfilled {count} signals as executed")
         except Exception as e:
             log.warning(f"[DB] Backfill executed signals: {e}")
+
+    async def _cleanup_arb_positions(self):
+        """One-time: remove arb positions and recalculate stats."""
+        try:
+            async with self.pool.acquire() as conn:
+                # Check if any arb positions exist
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM positions WHERE config_tag LIKE 'arb%'")
+                if count == 0:
+                    return
+                # Delete arb positions
+                await conn.execute("DELETE FROM positions WHERE config_tag LIKE 'arb%'")
+                # Delete arb signals table if exists
+                await conn.execute("DELETE FROM arb_signals WHERE TRUE")
+                # Recalculate stats from remaining positions
+                row = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status='closed') as total_bets,
+                        COUNT(*) FILTER (WHERE result='WIN') as wins,
+                        COUNT(*) FILTER (WHERE result='LOSS') as losses,
+                        COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl
+                    FROM positions
+                """)
+                starting = float(os.getenv("BANKROLL", "1000"))
+                bankroll = starting + float(row["total_pnl"])
+                await conn.execute("""
+                    UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
+                    WHERE id=1
+                """, bankroll, float(row["total_pnl"]), row["total_bets"], row["wins"], row["losses"])
+                log.info(f"[DB] Cleaned {count} arb positions. Bankroll=${bankroll:.2f}, PnL=${row['total_pnl']:.2f}, W:{row['wins']}/L:{row['losses']}")
+        except Exception as e:
+            log.warning(f"[DB] Arb cleanup: {e}")
 
     async def save_market_metrics(self, market_id: str, metrics: dict):
         """Upsert market metrics (volatility, momentum, caches)."""
@@ -521,7 +554,9 @@ class Database:
                 GROUP BY COALESCE(config_tag, 'v0') ORDER BY config_tag
             """)
 
-            # Calibration buckets: predicted p_final vs actual outcome
+            # Calibration buckets: predicted p_final (YES probability) vs actual YES outcome
+            # p_final = probability of YES. Compare against actual YES outcome, not bet result.
+            # YES outcome: side=YES+WIN or side=NO+LOSS means YES happened
             calibration = await conn.fetch("""
                 SELECT
                     CASE
@@ -532,7 +567,10 @@ class Database:
                     END as bucket,
                     COUNT(*) as total,
                     ROUND(AVG(p_final)::numeric, 3) as avg_predicted,
-                    ROUND(AVG(CASE WHEN result='WIN' THEN 1.0 ELSE 0.0 END)::numeric, 3) as actual_wr
+                    ROUND(AVG(CASE
+                        WHEN (side='YES' AND result='WIN') OR (side='NO' AND result='LOSS')
+                        THEN 1.0 ELSE 0.0
+                    END)::numeric, 3) as actual_wr
                 FROM positions WHERE status='closed'
                 GROUP BY bucket ORDER BY bucket
             """)
