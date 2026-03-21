@@ -478,7 +478,7 @@ async def main():
     math_eng   = MathEngine(CONFIG, db, calibrator)
     history    = HistoryAgent(db, calibrator)
 
-    asyncio.create_task(start_dashboard(db, CONFIG))
+    asyncio.create_task(start_dashboard(db, CONFIG, analysis_func=daily_ai_analysis))
 
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
@@ -488,6 +488,9 @@ async def main():
     )
 
     await db.save_config_snapshot(CONFIG["CONFIG_TAG"], CONFIG)
+
+    # One-time: clean up arb positions if any exist
+    await db._cleanup_arb_positions()
 
     # Bootstrap: load historical closed markets for training (one-time, skips if data exists)
     await bootstrap_history(db, scanner)

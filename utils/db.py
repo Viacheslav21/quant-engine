@@ -16,7 +16,6 @@ class Database:
         await self._create_schema()
         await self._migrate_positions_tp_sl()
         await self._backfill_executed_signals()
-        await self._cleanup_arb_positions()
         await self._init_stats()
         log.info("[DB] PostgreSQL подключён")
 
@@ -100,6 +99,17 @@ class Database:
                     last_signal_at TIMESTAMPTZ,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    id BIGSERIAL PRIMARY KEY,
+                    report_text TEXT,
+                    analysis_text TEXT,
+                    bankroll REAL,
+                    total_pnl REAL,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    open_positions INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON price_snapshots(market_id, snapshot_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
@@ -152,29 +162,27 @@ class Database:
             log.warning(f"[DB] Backfill executed signals: {e}")
 
     async def _cleanup_arb_positions(self):
-        """One-time: remove arb positions and recalculate stats."""
+        """One-time: remove arb positions and recalculate stats from real positions only."""
         try:
             async with self.pool.acquire() as conn:
-                # Check if any arb positions exist
-                count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM positions WHERE config_tag LIKE 'arb%'")
-                if count == 0:
-                    return
-                # Delete arb positions
+                # Delete any remaining arb positions and signals
                 await conn.execute("DELETE FROM positions WHERE config_tag LIKE 'arb%'")
-                # Delete arb signals table if exists
-                await conn.execute("DELETE FROM arb_signals WHERE TRUE")
+                try:
+                    await conn.execute("DELETE FROM arb_signals WHERE TRUE")
+                except Exception:
+                    pass  # table may not exist
                 # Recalculate stats from remaining positions
                 row = await conn.fetchrow("""
                     SELECT
                         COUNT(*) FILTER (WHERE status='closed') as total_bets,
                         COUNT(*) FILTER (WHERE result='WIN') as wins,
                         COUNT(*) FILTER (WHERE result='LOSS') as losses,
-                        COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl
+                        COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl,
+                        COALESCE(SUM(stake_amt) FILTER (WHERE status='open'), 0) as open_stakes
                     FROM positions
                 """)
                 starting = float(os.getenv("BANKROLL", "1000"))
-                bankroll = starting + float(row["total_pnl"])
+                bankroll = starting + float(row["total_pnl"]) - float(row["open_stakes"])
                 await conn.execute("""
                     UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
                     WHERE id=1
@@ -208,6 +216,21 @@ class Database:
                 VALUES ($1, NOW(), NOW())
                 ON CONFLICT (market_id) DO UPDATE SET last_signal_at = NOW(), updated_at = NOW()
             """, market_id)
+
+    async def save_daily_report(self, report: str, analysis: str):
+        """Save daily report and Sonnet analysis to DB."""
+        try:
+            async with self.pool.acquire() as conn:
+                stats = await self.get_stats()
+                open_count = await conn.fetchval("SELECT COUNT(*) FROM positions WHERE status='open'")
+                await conn.execute("""
+                    INSERT INTO daily_reports (report_text, analysis_text, bankroll, total_pnl, wins, losses, open_positions)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, report, analysis, stats.get("bankroll", 0), stats.get("total_pnl", 0),
+                    stats.get("wins", 0), stats.get("losses", 0), open_count)
+                log.info("[DB] Daily report saved")
+        except Exception as e:
+            log.warning(f"[DB] Save daily report failed: {e}")
 
     async def get_all_market_metrics(self) -> list:
         """Load all market metrics for warm restart and analytics."""

@@ -17,6 +17,7 @@ def to_json(data):
 
 log = logging.getLogger("dashboard")
 app = FastAPI()
+_analysis_func = None  # set by start_dashboard
 
 _db     = None
 _config = None
@@ -672,6 +673,14 @@ tr:hover td{{background:rgba(55,65,81,0.3)}}
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:20px">
+  <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center">
+    <h2>AI Analysis (Sonnet)</h2>
+    <button id="runAnalysis" onclick="runSonnetAnalysis()" style="padding:8px 20px;background:#3B82F6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">Run Analysis</button>
+  </div>
+  <pre id="analysisResult" style="white-space:pre-wrap;color:#E5E7EB;font-size:13px;padding:12px;background:#1a1f2e;border-radius:6px;min-height:40px">Click "Run Analysis" to get Sonnet recommendations</pre>
+</div>
+
 <div class="panel">
   <div class="panel-header"><h2>Signal Backtest (last 50)</h2></div>
   <table><tr><th>Question</th><th>Side</th><th>Entry</th><th>Now</th><th>Move</th><th>Direction</th><th>Status</th></tr>
@@ -787,6 +796,30 @@ if(themeData.length > 0) {{
     }}
   }});
 }}
+async function runSonnetAnalysis() {{
+  const btn = document.getElementById('runAnalysis');
+  const result = document.getElementById('analysisResult');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  btn.style.background = '#6B7280';
+  result.textContent = 'Requesting Sonnet analysis...';
+  try {{
+    const r = await fetch('/api/run-analysis', {{method: 'POST'}});
+    const data = await r.json();
+    if (data.analysis) {{
+      result.textContent = data.analysis;
+    }} else {{
+      result.textContent = 'Error: ' + (data.error || 'Unknown error');
+      result.style.color = '#EF4444';
+    }}
+  }} catch(e) {{
+    result.textContent = 'Request failed: ' + e.message;
+    result.style.color = '#EF4444';
+  }}
+  btn.disabled = false;
+  btn.textContent = 'Run Analysis';
+  btn.style.background = '#3B82F6';
+}}
 </script>
 </body></html>"""
   except Exception as e:
@@ -804,10 +837,25 @@ async def api_stats():
         log.warning(f"[DASHBOARD] API error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
-async def start_dashboard(db, config: dict):
-    global _db, _config
+@app.post("/api/run-analysis")
+async def run_analysis():
+    """Run Sonnet analysis on demand via dashboard button."""
+    try:
+        if not _analysis_func:
+            return JSONResponse({"error": "Analysis function not configured"}, status_code=500)
+        analysis = await _analysis_func(_db, _config)
+        if analysis:
+            return JSONResponse({"analysis": analysis})
+        return JSONResponse({"error": "Analysis returned empty"}, status_code=500)
+    except Exception as e:
+        log.error(f"[DASHBOARD] Analysis error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+async def start_dashboard(db, config: dict, analysis_func=None):
+    global _db, _config, _analysis_func
     _db     = db
     _config = config
+    _analysis_func = analysis_func
     port    = int(os.getenv("PORT","3000"))
     cfg     = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
     server  = uvicorn.Server(cfg)
