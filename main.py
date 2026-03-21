@@ -227,7 +227,7 @@ async def daily_ai_analysis(db: Database, config: dict) -> str:
 
     try:
         r = await client.messages.create(
-            model="claude-sonnet-4-5-20250514", max_tokens=800,
+            model="claude-sonnet-4-5", max_tokens=800,
             system="""You are a quantitative trading analyst reviewing a prediction market bot's performance.
 Give specific, actionable recommendations. Be direct and concise.
 Focus on: what's working, what's not, config changes to suggest (with specific numbers), and risks.
