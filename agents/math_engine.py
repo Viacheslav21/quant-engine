@@ -251,8 +251,18 @@ class MathEngine:
             "vol_dir":    vol_dir,
             "contrarian": is_contrarian,
             "contrarian_conf": round(contrarian_conf, 3) if p_contrarian is not None else 0,
+            "volatility": self._market_volatility(market["id"]),
             "source":     "math",
         }
+
+    def _market_volatility(self, market_id: str) -> float:
+        """Calculate market volatility as average absolute price change (ATR-style).
+        Uses long price cache (up to 180 points / ~30 min)."""
+        hist = self._long_price_cache.get(market_id, [])
+        if len(hist) < 10:
+            return 0.0
+        changes = [abs(hist[i] - hist[i-1]) for i in range(1, len(hist))]
+        return round(sum(changes) / len(changes), 5)
 
     def _apply_history(self, p_market: float, theme: str) -> Optional[float]:
         pat = self._patterns.get(theme)

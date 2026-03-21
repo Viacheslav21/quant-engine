@@ -60,7 +60,7 @@ Polymarket API → Scanner (500 markets, paginated)
   7. Long-term momentum (week/month price changes from API, threshold 2%/5%)
   8. Volume trend (24h vs weekly average)
   9. NegRisk arbitrage (multi-outcome events, sum ≠ 1.0)
-  Correlated evidence de-duplication (max of momentum pair, max of volume pair). Drift cap ±15% from market price. Spread penalty on Kelly. bestAsk for YES-side real entry price. Rejects: EV < 15%, KL < 0.12, edge < 10%, market > 30 days out.
+  Correlated evidence de-duplication (max of momentum pair, max of volume pair). Drift cap ±15% from market price. Spread penalty on Kelly. bestAsk for YES-side real entry price. Per-market volatility calculation (ATR-style from 30-min price cache). Rejects: EV < 15%, KL < 0.12, edge < 10%, market > 30 days out.
 - **agents/news_monitor.py** — Scans 8 RSS feeds, keyword sentiment, matches to markets. Triggers signals when price stale (< 2¢ change in 10 min).
 - **agents/history_agent.py** (~107 lines) — Self-learning. Base rates & prospect factors per theme from closed markets. Volume patterns. Calibration via Brier score on RESOLVED positions only (not TP/SL).
 - **ml/calibrator.py** (~76 lines) — Brier score, bias, logit-scale correction. `adjust()` applied to every `p_final`.
@@ -80,10 +80,10 @@ Polymarket API → Scanner (500 markets, paginated)
 - **NegRisk arbitrage**: Groups markets by negRiskMarketID, normalizes prices to sum=1.0.
 - **Kelly criterion**: 0.15 fraction (conservative), spread penalty (3-10¢ → 1.0-0.3x multiplier), capped at MAX_KELLY_FRAC of bankroll. Contrarian trades: Kelly × 0.5.
 - **Signal ranking**: `kelly × (1 - entropy × 0.3)` — penalizes 50/50 markets.
-- **Position management**: Per-position TP/SL (normal: 20%/30%, contrarian: 10%/25%). Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: fetches closed markets directly via API, threshold 95¢/5¢.
+- **Position management**: Per-position TP/SL with volatility-based SL. SL = 2.5 × ATR / entry_price (floor 8%, cap at default). Default SL: normal 30%, contrarian 25%. TP: normal 20%, contrarian 10%. Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: fetches closed markets directly via API, threshold 95¢/5¢.
 - **Displacement**: When 50 slots full, new signal (EV > 25%) can close worst position. Profitable positions displaced easily; losing positions only if new EV > 2× old EV.
 - **Claude confirmation**: Haiku with web search, max 1 call/min, 30-min cache, drift re-cap after p_final blending. Fallback: reject (not confirm).
-- **Daily AI analysis**: Sonnet once at 8:00 UTC, full analytics summary → actionable recommendations in Telegram.
+- **Daily AI analysis**: Sonnet once daily (first tick after 8:00 UTC), full analytics summary → actionable recommendations in Telegram.
 
 ### Configuration
 
@@ -101,7 +101,7 @@ All config via environment variables. Key params:
 
 ### Database
 
-PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`. 9 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. Cleanup runs every HISTORY_INTERVAL with configurable retention (snapshots: 3d, signals: 7d, news: 5d, positions: 14d, markets: 3d). VACUUM after cleanup. DB writes optimized: skip unchanged market prices.
+PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`. 9 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. Cleanup runs every HISTORY_INTERVAL: snapshots (1d), unexecuted signals (7d), processed news (5d). Positions and markets kept forever (needed for analytics/backtest). VACUUM after cleanup. DB writes optimized: skip unchanged market prices.
 
 ### Performance Optimizations
 

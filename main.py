@@ -326,6 +326,15 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         tp_pct = config["TAKE_PROFIT_PCT"]
         sl_pct = config["STOP_LOSS_PCT"]
 
+    # Volatility-based SL: SL = max(MIN_SL, 2.5 × ATR / entry_price)
+    # Low volatility → tight SL, high volatility → wider SL
+    volatility = signal.get("volatility", 0)
+    if volatility > 0 and signal["side_price"] > 0:
+        vol_sl = 2.5 * volatility / signal["side_price"]
+        vol_sl = max(0.08, min(sl_pct, round(vol_sl, 3)))  # floor 8%, cap at default SL
+        log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
+        sl_pct = vol_sl
+
     stake = math_eng.compute_stake(bankroll, kelly)
     if stake < 1.0: return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
@@ -631,7 +640,7 @@ async def main():
                 await db.cleanup()
 
             utc = datetime.now(timezone.utc)
-            if utc.hour == 8 and daily_report_sent != utc.date():
+            if utc.hour >= 8 and daily_report_sent != utc.date():
                 daily_report_sent = utc.date()
                 await telegram.send(await db.build_report())
                 try:
