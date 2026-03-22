@@ -262,6 +262,7 @@ class MathEngine:
             "entropy":    entropy(p_market),
             "edge":       round(edge, 4),
             "spread":     market.get("spread", 0),
+            "liquidity":  market.get("liquidity", 0),
             "spread_mult": spread_mult,
             "vol_signal": round(vol_signal, 2),
             "vol_dir":    vol_dir,
@@ -532,23 +533,28 @@ class MathEngine:
             self._price_cache[market_id] = list(short_p)
 
     def compute_stake(self, bankroll: float, kelly: float, theme: str = None,
-                       open_positions: list = None) -> float:
-        """Compute stake with portfolio concentration penalty.
-        If >20% of bankroll is in one theme, reduce Kelly proportionally."""
+                       open_positions: list = None, liquidity: float = 0) -> float:
+        """Compute stake with portfolio concentration and liquidity penalties."""
         stake = bankroll * kelly
         stake = min(stake, bankroll * self.config["MAX_KELLY_FRAC"])
 
         # Portfolio correlation penalty: reduce stake if theme is concentrated
         if theme and open_positions:
             theme_stake = sum(p.get("stake_amt", 0) for p in open_positions if p.get("theme") == theme)
-            total_stake = sum(p.get("stake_amt", 0) for p in open_positions)
-            if total_stake > 0:
+            if bankroll > 0:
                 theme_pct = theme_stake / bankroll
-                # >20% in one theme → scale down: 20%→1.0x, 30%→0.5x, 40%+→0.25x
                 if theme_pct > 0.20:
                     penalty = max(0.25, 1.0 - (theme_pct - 0.20) / 0.20)
                     stake *= penalty
                     log.info(f"[MATH] Theme concentration: '{theme}' {theme_pct*100:.0f}% of bankroll → Kelly ×{penalty:.2f}")
+
+        # Liquidity penalty: thin markets → smaller stake to avoid slippage
+        # $5k liq → 0.10x, $25k → 0.50x, $50k+ → 1.0x
+        if liquidity > 0:
+            liq_mult = min(1.0, liquidity / 50_000)
+            if liq_mult < 1.0:
+                stake *= liq_mult
+                log.info(f"[MATH] Liquidity penalty: ${liquidity:,.0f} → stake ×{liq_mult:.2f}")
 
         stake = round(max(1.0, stake), 2)
         log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")

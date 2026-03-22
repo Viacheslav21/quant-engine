@@ -353,7 +353,8 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
         sl_pct = vol_sl
 
-    stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos)
+    stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos,
+                                   signal.get("liquidity", 0))
     if stake < 1.0: return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
     log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
