@@ -56,6 +56,7 @@ CONFIG = {
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v3"),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
+    "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
 }
 
 _claude_client = None
@@ -70,9 +71,10 @@ def _get_claude_client(config: dict):
 async def claude_confirm(signal: dict, config: dict, db=None) -> dict:
     import re, json
     client = _get_claude_client(config)
-    SYSTEM = """Prediction market analyst. Confirm or reject signal based on your knowledge.
+    use_web = config.get("CLAUDE_WEB_SEARCH", False)
+    SYSTEM = f"""Prediction market analyst. Confirm or reject signal{' — search web for latest news first' if use_web else ' based on your knowledge'}.
 If theme has losing record, be more skeptical. Return ONLY:
-<json>{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}</json>"""
+<json>{{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}}</json>"""
 
     # Build compact track record
     track = ""
@@ -93,11 +95,28 @@ If theme has losing record, be more skeptical. Return ONLY:
         f"{track}\nConfirm?"
     )
     try:
-        r = await client.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=200, system=SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        call_args = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 200 if not use_web else 300,
+            "system": SYSTEM,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if use_web:
+            call_args["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        r = await client.messages.create(**call_args)
         final = r.content
+        if use_web and r.stop_reason == "tool_use":
+            tu = next(b for b in r.content if b.type == "tool_use")
+            r2 = await client.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[
+                    {"role": "user",      "content": prompt},
+                    {"role": "assistant", "content": r.content},
+                    {"role": "user",      "content": [{"type":"tool_result","tool_use_id":tu.id,"content":"Return your answer as JSON in <json></json> tags."}]},
+                ],
+            )
+            final = r2.content
         txt   = "".join(b.text for b in final if hasattr(b,"text"))
         match = re.search(r"<json>([\s\S]*?)</json>", txt)
         if match:
