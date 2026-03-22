@@ -755,8 +755,14 @@ async def main():
             claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
 
             confirmed = []
+            CLAUDE_SKIP_THR = 0.25  # EV > 25% = strong enough, skip Claude
             can_call_claude = (now - last_claude_call) >= CLAUDE_MIN_INTERVAL
             for sig in signals[:3]:
+                if sig["ev"] >= CLAUDE_SKIP_THR:
+                    # Strong signal — pass without Claude
+                    confirmed.append(sig)
+                    log.info(f"[MATH] Auto-confirmed EV:{sig['ev']*100:.0f}% >= {CLAUDE_SKIP_THR*100:.0f}%: {sig['question'][:50]}")
+                    continue
                 if sig["ev"] >= CONFIG["CLAUDE_EV_THR"]:
                     cached = claude_cache.get(sig["market_id"])
                     if cached:
