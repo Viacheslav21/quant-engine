@@ -70,7 +70,7 @@ def _get_claude_client(config: dict):
 async def claude_confirm(signal: dict, config: dict, db=None) -> dict:
     import re, json
     client = _get_claude_client(config)
-    SYSTEM = """Prediction market analyst. Confirm or reject signal. Search web for latest news first.
+    SYSTEM = """Prediction market analyst. Confirm or reject signal based on your knowledge.
 If theme has losing record, be more skeptical. Return ONLY:
 <json>{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}</json>"""
 
@@ -94,23 +94,10 @@ If theme has losing record, be more skeptical. Return ONLY:
     )
     try:
         r = await client.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            model="claude-haiku-4-5-20251001", max_tokens=200, system=SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         )
         final = r.content
-        if r.stop_reason == "tool_use":
-            tu = next(b for b in r.content if b.type == "tool_use")
-            r2 = await client.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                messages=[
-                    {"role": "user",      "content": prompt},
-                    {"role": "assistant", "content": r.content},
-                    {"role": "user",      "content": [{"type":"tool_result","tool_use_id":tu.id,"content":"Done. Now return your answer as JSON in <json></json> tags."}]},
-                ],
-            )
-            final = r2.content
         txt   = "".join(b.text for b in final if hasattr(b,"text"))
         match = re.search(r"<json>([\s\S]*?)</json>", txt)
         if match:
@@ -632,9 +619,9 @@ async def main():
     except Exception as e:
         log.warning(f"[MAIN] Could not restore metrics: {e}")
     claude_cache = {}
-    CLAUDE_CACHE_TTL = 1800
+    CLAUDE_CACHE_TTL = 3600       # cache 1 hour (was 30 min)
     last_claude_call = 0
-    CLAUDE_MIN_INTERVAL = 60
+    CLAUDE_MIN_INTERVAL = 300     # max 1 call per 5 min (was 1/min)
     daily_report_sent = None
     peak_equity = CONFIG["BANKROLL"]  # track peak equity for drawdown
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.25"))  # 25% from peak → stop

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Quant Engine v3 — a prediction market trading bot for Polymarket. Uses Bayesian probability fusion (9 evidence sources), prospect theory, price momentum, mean reversion, negRisk arbitrage, news monitoring, ML calibration, and Claude AI confirmation to generate and execute trading signals with Kelly criterion position sizing.
+Quant Engine v3 — a prediction market trading bot for Polymarket. Uses Bayesian probability fusion (9 raw evidence sources → 6 de-duplicated), prospect theory, price momentum, mean reversion, negRisk arbitrage, news monitoring, ML calibration, and Claude AI confirmation to generate and execute trading signals with Kelly criterion position sizing. Includes drawdown protection and theme concentration limits.
 
 ## Commands
 
@@ -31,12 +31,13 @@ Deployed via Railway (`Procfile: worker: python main.py`). Graceful shutdown on 
 
 ```
 Polymarket API → Scanner (500 markets, paginated, every 5 min)
-    → Math Engine (9 evidence sources → Bayesian fusion → drift cap ±15%)
-    → News Monitor (RSS feeds)
+    → Drawdown Check (halt new trades if equity drops ≥25% from peak)
+    → Math Engine (9 evidence sources → de-duplicate correlated pairs → 6 sources → Bayesian fusion → adaptive drift cap)
+    → News Monitor (RSS feeds, 30s interval)
     → Signal Ranking (Kelly × entropy penalty)
     → Signal Cooldown (5 min per market)
     → Claude Confirmation (if EV > 20%, max 1/min, cache 30min)
-    → Kelly Sizing (0.15 fraction, spread penalty)
+    → Kelly Sizing (0.15 fraction, spread penalty, theme concentration penalty)
     → Execution (max 5 per theme, 50 total, displacement)
     → WS Subscribe (on new position)
     → Position Monitoring:
@@ -48,63 +49,78 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
 
 ### Module Responsibilities
 
-- **main.py** — Orchestrator. Two-speed architecture: REST market scan every 5 min (signal generation, news, DB), WebSocket real-time position monitoring (<1s SL/TP reaction). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, dynamic WS subscribe/unsubscribe on position open/close, trailing TP, daily AI analysis via Sonnet. DB write optimization (skip unchanged prices). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Marks signals as executed after successful trade for backtest tracking. Whale alert on positions ($500+). Graceful shutdown on SIGTERM/SIGINT.
-- **engine/ws_client.py** — WebSocket client for real-time Polymarket price updates. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Handles `price_change`, `last_trade_price`, `book` events. Dynamic subscribe/unsubscribe per market. YES/NO token price conversion. Heartbeat (10s), auto-reconnect (5s delay). Batch subscriptions (100 tokens). Callbacks: `on_price_change` triggers instant SL/TP check, `on_trade` triggers whale alerts.
-- **engine/scanner.py** — Fetches up to 500 markets from Polymarket's Gamma API with pagination. Filters by volume (>$50k), liquidity (>$5k), price bounds (3-97¢). Extracts: spread, bestAsk, competitive, oneWeekPriceChange, oneMonthPriceChange, negRisk, negRiskMarketID, volume1wk, volume1mo, clobTokenIds (YES/NO token IDs for WS). Classifies into 13 themes via keyword matching.
-- **agents/math_engine.py** (~467 lines) — Core signal generation. 9 evidence sources fused via Bayesian log-odds:
-  1. Prospect theory (prior) — inverts human probability weighting (γ=0.65)
-  2. Historical base rates per theme
-  3. Volume spike detection (>2.5x average, only records changed values)
-  4. Time decay (near expiry → trust market more)
+- **main.py** (~864 lines) — Orchestrator. Two-speed architecture: REST market scan every 5 min (signal generation, news, DB), WebSocket real-time position monitoring (<1s SL/TP reaction). Drawdown halt (≥25% equity drop from peak stops new trades). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, dynamic WS subscribe/unsubscribe on position open/close, trailing TP, daily AI analysis via Sonnet. DB write optimization (throttled to 30s per position). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Marks signals as executed after successful trade for backtest tracking. Whale alert on positions ($500+). Graceful shutdown on SIGTERM/SIGINT.
+- **engine/ws_client.py** (~250 lines) — WebSocket client for real-time Polymarket price updates. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Handles `price_change`, `last_trade_price`, `book` events. Dynamic subscribe/unsubscribe per market. YES/NO token price conversion. Heartbeat (10s), auto-reconnect (5s delay). Batch subscriptions (100 tokens). Callbacks: `on_price_change` triggers instant SL/TP check, `on_trade` triggers whale alerts.
+- **engine/scanner.py** (~138 lines) — Fetches up to 500 markets from Polymarket's Gamma API with pagination. Filters by volume (>$50k), liquidity (>$5k), price bounds (3-97¢). Extracts: spread, bestAsk, oneWeekPriceChange, oneMonthPriceChange, negRisk, negRiskMarketID, volume1wk, volume1mo, clobTokenIds (YES/NO token IDs for WS). Classifies into 13 themes via keyword matching.
+- **agents/math_engine.py** (~555 lines) — Core signal generation. 9 raw evidence sources, de-duplicated to 6 via max() on correlated pairs, fused via weighted Bayesian log-odds:
+  1. Prospect theory (prior) — inverts human probability weighting (γ=0.65), configurable via `USE_PROSPECT` env var
+  2. Historical base rates per theme (requires ≥10 bets)
+  3. Volume spike detection (>2.5x average)
+  4. Time decay (near expiry → trust market more), weight 0.5
   5. Price momentum (5-min linear regression, ±5% cap)
   6. Mean reversion / contrarian (>8% move on low volume → bet on reversion via EWMA)
   7. Long-term momentum (week/month price changes from API, threshold 2%/5%)
   8. Volume trend (24h vs weekly average)
   9. NegRisk arbitrage (multi-outcome events, sum ≠ 1.0)
-  Correlated evidence de-duplication (max of momentum pair, max of volume pair). Drift cap ±15% from market price. Spread penalty on Kelly. bestAsk for YES-side real entry price. Per-market volatility calculation (ATR-style from 30-min price cache). Rejects: EV < 15%, KL < 0.12, edge < 10%, market > 30 days out.
-- **agents/news_monitor.py** — Scans 8 RSS feeds, keyword sentiment, matches to markets. Triggers signals when price stale (< 2¢ change in 10 min).
-- **agents/history_agent.py** (~107 lines) — Self-learning. Base rates & prospect factors per theme from closed markets. Volume patterns. Calibration via Brier score on RESOLVED positions only (not TP/SL).
-- **ml/calibrator.py** (~76 lines) — Brier score, bias, logit-scale correction. `adjust()` applied to every `p_final`.
-- **utils/db.py** (~550 lines) — PostgreSQL schema (9 tables including config_history), connection pool, CRUD, analytics queries (by theme/source/side/config_tag/calibration), cumulative PnL, signal outcomes for backtest, DB cleanup with configurable retention. Migrations: tp_pct/sl_pct/config_tag columns, backfill executed signals from positions.
+  Correlated pair de-duplication: max(p_momentum, p_long_mom) and max(p_volume, p_vol_trend) before fusion → 6 independent sources. Evidence weights: history=1.0, vol_combined=1.0, time=0.5, mom_combined=1.0, contrarian=1.0, arb=1.0. Adaptive drift cap: ±8% (0-1 sources), ±12% (2-3), ±18% (4+). Spread penalty on Kelly. bestAsk for YES-side real entry price. Per-market volatility (ATR from 30-min price cache). Theme concentration penalty: >20% bankroll in one theme → Kelly reduced (down to 0.25× at 40%+). Rejects: EV < 12%, KL < 0.10, Kelly < 0.01, edge < 8%, market > 30 days out.
+- **agents/news_monitor.py** (~163 lines) — Scans 8 RSS feeds (BBC, AlJazeera, Guardian, NPR, CNBC, CNBC_Politics, SkyNews, DeutscheWelle), keyword sentiment, matches to markets by theme. Triggers signals when price stale (< 2¢ change in 10 min).
+- **agents/history_agent.py** (~112 lines) — Self-learning. Base rates & prospect factors per theme from closed markets. Volume patterns (high vs low volume win rates). Calibration via Brier score on RESOLVED positions only (not TP/SL).
+- **ml/calibrator.py** (~90 lines) — Brier score, bias, logit-scale correction. Window: last 300 positions (both executed and rejected signals with known outcomes). Factor bounds [0.7, 1.3]. Only adjusts if |bias| > 0.05 and Brier < 0.25. `adjust()` applied to every `p_final`.
+- **utils/db.py** (~688 lines) — PostgreSQL schema (10 tables including market_metrics), connection pool, CRUD, analytics queries (by theme/source/side/config_tag/calibration), cumulative PnL, signal outcomes for backtest, DB cleanup with configurable retention. Migrations: tp_pct/sl_pct/config_tag columns, backfill executed signals from positions.
 - **utils/telegram.py** (~33 lines) — Async Telegram notifications with HTML formatting.
+
 ### Key Algorithms
 
-- **Bayesian fusion**: Prior (prospect-adjusted price) updated with up to 6 de-duplicated evidence sources in log-odds space. Drift capped at ±15% from market price.
-- **Prospect weighting**: Kahneman-Tversky with γ=0.65, binary search to invert.
+- **Bayesian fusion**: Prior (prospect-adjusted price) updated with up to 6 de-duplicated evidence sources in weighted log-odds space. Correlated pairs combined via max() before fusion. Adaptive drift cap: ±8% (0-1 sources), ±12% (2-3), ±18% (4+).
+- **Prospect weighting**: Kahneman-Tversky with γ=0.65, binary search to invert. Configurable via `USE_PROSPECT` env var for A/B testing.
 - **Price momentum**: Linear regression slope over 30-point cache, capped at ±5%.
 - **Mean reversion**: 180-point long cache (~30 min). Detects >8% moves, volume filter (>2.5x = skip, 1.5-2.5x = weak, <1.5x = strong), EWMA reversion target, confidence-weighted shift.
 - **NegRisk arbitrage**: Groups markets by negRiskMarketID, normalizes prices to sum=1.0.
-- **Kelly criterion**: 0.15 fraction (conservative), spread penalty (3-10¢ → 1.0-0.3x multiplier), capped at MAX_KELLY_FRAC of bankroll. Contrarian trades: Kelly × 0.5.
+- **Kelly criterion**: 0.15 fraction (conservative), spread penalty (3-10¢ → 1.0-0.3x multiplier), capped at MAX_KELLY_FRAC of bankroll. Contrarian trades: Kelly × 0.5. Theme concentration penalty reduces Kelly when >20% bankroll in one theme.
 - **Signal ranking**: `kelly × (1 - entropy × 0.3)` — penalizes 50/50 markets.
-- **Position management**: Per-position TP/SL with volatility-based SL. SL = 2.5 × ATR / entry_price (floor 8%, cap at default). Default SL: normal 30%, contrarian 25%. TP: normal 20%, contrarian 10%. Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: fetches closed markets directly via API, threshold 95¢/5¢.
+- **Position management**: Per-position TP/SL with volatility-based SL. SL = 2.5 × ATR / entry_price (floor 8%, cap at default). Default SL: normal 30%, contrarian 25%. TP: normal 20%, contrarian 10%. Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: threshold 95¢/5¢.
 - **Displacement**: When 50 slots full, new signal (EV > 25%) can close worst position. Profitable positions displaced easily; losing positions only if new EV > 2× old EV.
-- **Claude confirmation**: Haiku with web search, max 1 call/min, 30-min cache, drift re-cap after p_final blending. Fallback: reject (not confirm).
+- **Drawdown protection**: Tracks peak equity (free cash + position values). Halts all new trades when drawdown ≥ 25%. Continues monitoring and closing existing positions.
+- **Claude confirmation**: Haiku (claude-haiku-4-5-20251001) with web search, max 1 call/min, 30-min cache. Blends: 0.6 × p_final + 0.4 × p_claude, then re-caps drift to ±15%. Fallback: reject (not confirm).
 - **Daily AI analysis**: Sonnet once daily (first tick after 8:00 UTC), full analytics summary → actionable recommendations in Telegram.
 
 ### Configuration
 
 All config via environment variables. Key params:
 - `SIMULATION=true` (default, no real trades)
-- `MIN_EV=0.15`, `MIN_KL=0.12` (tight thresholds, quality over quantity)
+- `USE_PROSPECT=true` (prospect theory prior, disable for A/B testing)
+- `MIN_EV=0.12`, `MIN_KL=0.10` (signal acceptance thresholds)
+- `MIN_EDGE=0.08` (minimum |p_final - p_market|)
 - `MAX_KELLY_FRAC=0.15`, `MAX_OPEN=50` (conservative sizing, many positions)
 - `CLAUDE_EV_THR=0.20` (only strong signals get Claude confirmation)
 - `TAKE_PROFIT_PCT=0.20`, `STOP_LOSS_PCT=0.30`
 - `TRAILING_TP=true` (trailing take-profit enabled)
 - `MAX_MARKET_DAYS=30` (skip markets closing > 30 days out)
-- `CONFIG_TAG=v1` (A/B testing tag, saved to DB with full config snapshot)
+- `MAX_DRAWDOWN=0.25` (halt trading at 25% equity drawdown from peak)
+- `CONFIG_TAG=v3` (A/B testing tag, saved to DB with full config snapshot)
 - `HISTORY_INTERVAL=14400` (recalibrate every 4 hours)
 - `SCAN_INTERVAL=300` (seconds between REST market scans; positions monitored in real-time via WebSocket)
 
 ### Database
 
-PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`. 9 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. Cleanup runs every HISTORY_INTERVAL: snapshots (1d), unexecuted signals (7d), processed news (5d). Positions and markets kept forever (needed for analytics/backtest). VACUUM after cleanup. DB writes optimized: skip unchanged market prices.
+PostgreSQL required. Schema auto-created on startup by `db.init()`. 10 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history, market_metrics. Migrations run automatically for new columns (tp_pct, sl_pct, config_tag) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. Cleanup runs every HISTORY_INTERVAL: snapshots (1d), unexecuted signals (7d), processed news (5d). Positions and markets kept forever (needed for analytics/backtest). VACUUM after cleanup. DB writes throttled: price updates every 30s per position, market upserts skip unchanged prices.
+
+### Risk Management
+
+- **Drawdown halt**: Equity = free cash + sum(position values). Peak tracked continuously. If drawdown ≥ 25% → halt all new trades, continue monitoring/closing existing positions.
+- **Theme concentration**: If >20% of bankroll in one theme, Kelly penalty applied (0.5× at 30%, 0.25× at 40%+).
+- **Position limits**: Max 50 open, max 5 per theme.
+- **Volatility-based SL**: ATR-scaled stop loss (2.5 × ATR / entry_price), floor 8%, cap at default SL.
+- **Trailing TP**: Tracks peak profit, closes on 5% pullback once peak ≥ 50% of TP target.
+- **Displacement**: Only when EV > 25%; losing positions protected unless new signal is 2× better.
+- **Conservative Kelly**: 0.15 fraction of full Kelly. Contrarian trades halved again.
 
 ### Performance Optimizations
 
-- **WebSocket position monitoring** — sub-second SL/TP reaction vs 10s polling. REST scan reduced from 10s to 5min (~30x fewer API calls)
+- **WebSocket position monitoring** — sub-second SL/TP reaction vs polling. REST scan every 5 min (~30x fewer API calls)
 - Dynamic WS subscribe/unsubscribe — only track tokens of open positions, not all 500 markets
 - REST fallback — monitor_positions still runs each scan cycle as safety net
-- DB writes only for changed prices (~80% reduction)
+- DB write throttling — price updates every 30s per position, market upserts skip unchanged prices
 - Signal cooldown 5 min per market (prevents spam)
 - Claude: 1 call/min max, 30-min cache
 - News markets not re-analyzed in math loop
