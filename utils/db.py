@@ -99,17 +99,6 @@ class Database:
                     last_signal_at TIMESTAMPTZ,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                CREATE TABLE IF NOT EXISTS daily_reports (
-                    id BIGSERIAL PRIMARY KEY,
-                    report_text TEXT,
-                    analysis_text TEXT,
-                    bankroll REAL,
-                    total_pnl REAL,
-                    wins INTEGER DEFAULT 0,
-                    losses INTEGER DEFAULT 0,
-                    open_positions INTEGER DEFAULT 0,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
-                );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON price_snapshots(market_id, snapshot_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
@@ -187,7 +176,7 @@ class Database:
                     UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
                     WHERE id=1
                 """, bankroll, float(row["total_pnl"]), row["total_bets"], row["wins"], row["losses"])
-                log.info(f"[DB] Cleaned {count} arb positions. Bankroll=${bankroll:.2f}, PnL=${row['total_pnl']:.2f}, W:{row['wins']}/L:{row['losses']}")
+                log.info(f"[DB] Arb cleanup done. Bankroll=${bankroll:.2f}, PnL=${row['total_pnl']:.2f}, W:{row['wins']}/L:{row['losses']}")
         except Exception as e:
             log.warning(f"[DB] Arb cleanup: {e}")
 
@@ -216,21 +205,6 @@ class Database:
                 VALUES ($1, NOW(), NOW())
                 ON CONFLICT (market_id) DO UPDATE SET last_signal_at = NOW(), updated_at = NOW()
             """, market_id)
-
-    async def save_daily_report(self, report: str, analysis: str):
-        """Save daily report and Sonnet analysis to DB."""
-        try:
-            async with self.pool.acquire() as conn:
-                stats = await self.get_stats()
-                open_count = await conn.fetchval("SELECT COUNT(*) FROM positions WHERE status='open'")
-                await conn.execute("""
-                    INSERT INTO daily_reports (report_text, analysis_text, bankroll, total_pnl, wins, losses, open_positions)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                """, report, analysis, stats.get("bankroll", 0), stats.get("total_pnl", 0),
-                    stats.get("wins", 0), stats.get("losses", 0), open_count)
-                log.info("[DB] Daily report saved")
-        except Exception as e:
-            log.warning(f"[DB] Save daily report failed: {e}")
 
     async def get_all_market_metrics(self) -> list:
         """Load all market metrics for warm restart and analytics."""

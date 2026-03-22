@@ -21,7 +21,6 @@ from agents.news_monitor  import NewsMonitor
 from agents.math_engine   import MathEngine
 from agents.history_agent import HistoryAgent
 from ml.calibrator        import Calibrator
-from dashboard.app        import start_dashboard
 
 logging.basicConfig(
     level    = logging.INFO,
@@ -405,6 +404,7 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
 
         pnl_pct  = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
+        outcome = None
 
         # Per-position TP/SL (contrarian: 10%/25%, normal: from config)
         tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
@@ -446,7 +446,8 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         if not close_reason:
             continue
 
-        outcome = outcome if close_reason == "RESOLVED" else f"{pos['side']}@{price*100:.0f}¢"
+        if close_reason != "RESOLVED":
+            outcome = f"{pos['side']}@{price*100:.0f}¢"
         await db.close_position(pos["id"], outcome, payout, pnl)
         trailing_highs.pop(pos["id"], None)  # clean up trailing state
         stats = await db.get_stats()
@@ -478,7 +479,6 @@ async def main():
     math_eng   = MathEngine(CONFIG, db, calibrator)
     history    = HistoryAgent(db, calibrator)
 
-    asyncio.create_task(start_dashboard(db, CONFIG, analysis_func=daily_ai_analysis))
 
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
@@ -653,8 +653,9 @@ async def main():
                 })
                 _signal_cooldown[sig["market_id"]] = now
                 await db.mark_signal_cooldown(sig["market_id"])
-                await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
-                await db.mark_signal_executed(sig_id)
+                executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
+                if executed:
+                    await db.mark_signal_executed(sig_id)
 
             await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
 
@@ -678,12 +679,6 @@ async def main():
             if utc.hour >= 8 and daily_report_sent != utc.date():
                 daily_report_sent = utc.date()
                 await telegram.send(await db.build_report())
-                try:
-                    analysis = await daily_ai_analysis(db, CONFIG)
-                    if analysis:
-                        await telegram.send(f"🧠 <b>AI DAILY ANALYSIS</b>\n\n{analysis}")
-                except Exception as e:
-                    log.warning(f"[ANALYSIS] {e}")
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
