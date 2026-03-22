@@ -37,9 +37,11 @@ class PolymarketWS:
         tokens_to_add = []
         if yes_token:
             self._token_to_market[yes_token] = market_id
+            self._subscribed_tokens.add(yes_token)
             tokens_to_add.append(yes_token)
         if no_token:
             self._token_to_market[no_token] = market_id
+            self._subscribed_tokens.add(no_token)
             tokens_to_add.append(no_token)
         if market_id not in self.prices:
             self.prices[market_id] = {
