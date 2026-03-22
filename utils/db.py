@@ -260,6 +260,40 @@ class Database:
             rows = await conn.fetch("SELECT * FROM markets WHERE outcome IS NOT NULL ORDER BY resolved_at DESC LIMIT $1", limit)
             return [dict(r) for r in rows]
 
+    async def get_signal_prices_by_theme(self) -> dict:
+        """Get average p_market at signal time per theme (from signals + markets join)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT m.theme, AVG(s.p_market) as avg_p_market, COUNT(*) as n
+                FROM signals s
+                JOIN markets m ON s.market_id = m.id
+                WHERE s.p_market IS NOT NULL AND s.p_market > 0.01 AND s.p_market < 0.99
+                GROUP BY m.theme
+                HAVING COUNT(*) >= 5
+            """)
+            return {r["theme"]: float(r["avg_p_market"]) for r in rows}
+
+    async def get_win_loss_stats(self, theme: str = None) -> dict:
+        """Get W/L counts for Claude context. Returns {theme_w, theme_l, total_w, total_l}."""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchrow("""
+                SELECT COUNT(*) FILTER (WHERE result='WIN') as w,
+                       COUNT(*) FILTER (WHERE result='LOSS') as l
+                FROM positions WHERE status='closed' AND result IS NOT NULL
+            """)
+            theme_row = None
+            if theme:
+                theme_row = await conn.fetchrow("""
+                    SELECT COUNT(*) FILTER (WHERE result='WIN') as w,
+                           COUNT(*) FILTER (WHERE result='LOSS') as l
+                    FROM positions WHERE status='closed' AND result IS NOT NULL AND theme=$1
+                """, theme)
+            return {
+                "total_w": total["w"], "total_l": total["l"],
+                "theme_w": theme_row["w"] if theme_row else 0,
+                "theme_l": theme_row["l"] if theme_row else 0,
+            }
+
     async def save_news(self, item: dict) -> bool:
         async with self.pool.acquire() as conn:
             try:

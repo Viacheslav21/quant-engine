@@ -30,5 +30,8 @@ logs/
 *~
 .DS_Store
 
+# Docs (internal plans, not for public repo)
+docs/
+
 # Claude Code
 .claude/

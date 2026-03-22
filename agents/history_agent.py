@@ -32,17 +32,22 @@ class HistoryAgent:
             if m.get("outcome"):
                 by_theme[m["theme"]].append(1 if m["outcome"]=="YES" else 0)
 
+        # Get entry prices from our signals (p_market at time of signal, not final price)
+        signal_prices = await self.db.get_signal_prices_by_theme()
+
         for theme, outcomes in by_theme.items():
             if len(outcomes) < 5: continue
             arr       = np.array(outcomes)
             base_rate = float(np.mean(arr))
 
-            market_prices = [
-                m["yes_price"] for m in markets
-                if m["theme"]==theme and m.get("outcome") and m.get("yes_price")
-            ]
-            avg_mp         = float(np.mean(market_prices)) if market_prices else 0.5
-            prospect_factor = max(0.3, min(3.0, base_rate/avg_mp if avg_mp>0 else 1.0))
+            # prospect_factor: how much does the market misprice this theme?
+            # base_rate = actual P(YES) for theme, avg_entry = what market was pricing at signal time
+            # pf > 1 = market underprices YES, pf < 1 = market overprices YES
+            avg_entry = signal_prices.get(theme)
+            if avg_entry and avg_entry > 0:
+                prospect_factor = max(0.3, min(3.0, base_rate / avg_entry))
+            else:
+                prospect_factor = 1.0  # no signal data yet, neutral
 
             await self.db.upsert_pattern(theme, {
                 "base_rate":       round(base_rate, 4),
@@ -50,7 +55,7 @@ class HistoryAgent:
                 "prospect_factor": round(prospect_factor, 4),
                 "win_rate":        round(base_rate, 4),
             })
-            log.info(f"[HISTORY] {theme}: base_rate={base_rate:.3f} n={len(outcomes)} pf={prospect_factor:.3f}")
+            log.info(f"[HISTORY] {theme}: base_rate={base_rate:.3f} n={len(outcomes)} pf={prospect_factor:.3f} avg_entry={avg_entry or 'N/A'}")
 
     async def _compute_volume_patterns(self, markets: list):
         volumes = [m["volume"] for m in markets if m.get("volume")]

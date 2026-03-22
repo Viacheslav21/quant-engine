@@ -66,19 +66,30 @@ def _get_claude_client(config: dict):
         _claude_client = AsyncAnthropic(api_key=config["ANTHROPIC_KEY"])
     return _claude_client
 
-async def claude_confirm(signal: dict, config: dict) -> dict:
+async def claude_confirm(signal: dict, config: dict, db=None) -> dict:
     import re, json
     client = _get_claude_client(config)
-    SYSTEM = """You are a prediction market analyst.
-Given a market signal found by mathematical analysis, confirm or reject it.
-Search the web for latest news about this market topic before deciding.
-Return ONLY JSON in <json></json> tags:
+    SYSTEM = """Prediction market analyst. Confirm or reject signal. Search web for latest news first.
+If theme has losing record, be more skeptical. Return ONLY:
 <json>{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}</json>"""
+
+    # Build compact track record
+    track = ""
+    if db:
+        theme = signal.get("theme", "other")
+        s = await db.get_win_loss_stats(theme)
+        if s["theme_w"] + s["theme_l"] > 0:
+            track = f"\n'{theme}': {s['theme_w']}W/{s['theme_l']}L."
+            if s["theme_l"] > s["theme_w"]:
+                track += " LOSING THEME."
+        if s["total_w"] + s["total_l"] > 0:
+            track += f" All: {s['total_w']}W/{s['total_l']}L."
+
     prompt = (
-        f"Market: {signal['question']}\n"
-        f"Side: {signal['side']} @ {signal['side_price']*100:.1f}¢\n"
-        f"Math: p_true={signal['p_final']*100:.1f}% vs market {signal['p_market']*100:.1f}%\n"
-        f"EV:+{signal['ev']*100:.1f}% KL:{signal['kl']:.3f}\nConfirm?"
+        f"{signal['question']}\n"
+        f"{signal['side']} @ {signal['side_price']*100:.0f}¢ | "
+        f"Our estimate: {signal['p_final']*100:.0f}% vs market: {signal['p_market']*100:.0f}%"
+        f"{track}\nConfirm?"
     )
     try:
         r = await client.messages.create(
@@ -371,12 +382,21 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     )
     return True
 
+_last_db_price_update: dict = {}  # pos_id -> timestamp of last DB write
+DB_PRICE_UPDATE_INTERVAL = 30  # update DB every 30 seconds, not every tick
+
 async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: float,
                           config: dict, trailing_highs: dict,
                           db: Database, telegram: TelegramBot, ws: PolymarketWS = None) -> bool:
     """Check a single position for TP/SL/resolution. Returns True if position was closed."""
+    import time as _time
     upnl = (price / pos["side_price"] - 1) * pos["stake_amt"]
-    await db.update_position_price(pos["id"], price, upnl)
+    # Throttle DB writes — update price every 30s, not every WS tick
+    now = _time.time()
+    last_update = _last_db_price_update.get(pos["id"], 0)
+    if now - last_update >= DB_PRICE_UPDATE_INTERVAL:
+        await db.update_position_price(pos["id"], price, upnl)
+        _last_db_price_update[pos["id"]] = now
 
     pnl_pct = (price - pos["side_price"]) / pos["side_price"]
     close_reason = None
@@ -423,8 +443,11 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
 
     if close_reason != "RESOLVED":
         outcome = f"{pos['side']}@{price*100:.0f}¢"
+    # Write final price to DB before closing
+    await db.update_position_price(pos["id"], price, upnl)
     await db.close_position(pos["id"], outcome, payout, pnl)
     trailing_highs.pop(pos["id"], None)
+    _last_db_price_update.pop(pos["id"], None)
 
     # Unsubscribe from WS after closing
     if ws:
@@ -695,7 +718,7 @@ async def main():
                         result = cached[1]
                         log.debug(f"[CLAUDE] Cache hit for {sig['market_id'][:8]}")
                     elif can_call_claude:
-                        result = await claude_confirm(sig, CONFIG)
+                        result = await claude_confirm(sig, CONFIG, db)
                         claude_cache[sig["market_id"]] = (now, result)
                         last_claude_call = now
                         can_call_claude = False
