@@ -1,12 +1,11 @@
 # CLAUDE.md
 
-This Saved by Rejection
-file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Is
 
 Quant Engine v3 — a prediction market trading bot for Polymarket. Uses Bayesian probability fusion (9 evidence sources), prospect theory, price momentum, mean reversion, negRisk arbitrage, news monitoring, ML calibration, and Claude AI confirmation to generate and execute trading signals with Kelly criterion position sizing.
-1.1
+
 ## Commands
 
 ```bash
@@ -28,12 +27,12 @@ Deployed via Railway (`Procfile: web: python main.py`). Graceful shutdown on SIG
 
 ## Architecture
 
-**Fully async Python** — all I/O uses `asyncio`, `httpx`, and `asyncpg`.
+**Fully async Python** — all I/O uses `asyncio`, `httpx`, `asyncpg`, and `websockets`.
 
 ### Pipeline Flow
 
 ```
-Polymarket API → Scanner (500 markets, paginated)
+Polymarket API → Scanner (500 markets, paginated, every 5 min)
     → Math Engine (9 evidence sources → Bayesian fusion → drift cap ±15%)
     → News Monitor (RSS feeds)
     → Signal Ranking (Kelly × entropy penalty)
@@ -41,15 +40,19 @@ Polymarket API → Scanner (500 markets, paginated)
     → Claude Confirmation (if EV > 20%, max 1/min, cache 30min)
     → Kelly Sizing (0.15 fraction, spread penalty)
     → Execution (max 5 per theme, 50 total, displacement)
-    → Position Monitoring (per-position TP/SL, trailing TP, resolution detection)
+    → WS Subscribe (on new position)
+    → Position Monitoring:
+        - Primary: WebSocket real-time (<1s reaction to SL/TP)
+        - Fallback: REST check every scan cycle (5 min)
     → History Agent → Calibrator → feedback into Math Engine
     → Daily Sonnet Analysis → Telegram
 ```
 
 ### Module Responsibilities
 
-- **main.py** (~580 lines) — Orchestrator. Main event loop with tick intervals: market scan (10s), news scan (30s), historical learning (4h). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, position monitoring with trailing TP, daily AI analysis via Sonnet. DB write optimization (skip unchanged prices). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Marks signals as executed after successful trade for backtest tracking. Graceful shutdown on SIGTERM/SIGINT.
-- **engine/scanner.py** (~120 lines) — Fetches up to 500 markets from Polymarket's Gamma API with pagination. Filters by volume (>$50k), liquidity (>$5k), price bounds (3-97¢). Extracts: spread, bestAsk, competitive, oneWeekPriceChange, oneMonthPriceChange, negRisk, negRiskMarketID, volume1wk, volume1mo. Classifies into 13 themes via keyword matching.
+- **main.py** — Orchestrator. Two-speed architecture: REST market scan every 5 min (signal generation, news, DB), WebSocket real-time position monitoring (<1s SL/TP reaction). Signal ranking, Claude confirmation with rate limiting (1/min, 30min cache), execution with displacement logic, dynamic WS subscribe/unsubscribe on position open/close, trailing TP, daily AI analysis via Sonnet. DB write optimization (skip unchanged prices). Signal cooldown (5 min per market). Config tag tracking for A/B testing. Marks signals as executed after successful trade for backtest tracking. Whale alert on positions ($500+). Graceful shutdown on SIGTERM/SIGINT.
+- **engine/ws_client.py** — WebSocket client for real-time Polymarket price updates. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Handles `price_change`, `last_trade_price`, `book` events. Dynamic subscribe/unsubscribe per market. YES/NO token price conversion. Heartbeat (10s), auto-reconnect (5s delay). Batch subscriptions (100 tokens). Callbacks: `on_price_change` triggers instant SL/TP check, `on_trade` triggers whale alerts.
+- **engine/scanner.py** — Fetches up to 500 markets from Polymarket's Gamma API with pagination. Filters by volume (>$50k), liquidity (>$5k), price bounds (3-97¢). Extracts: spread, bestAsk, competitive, oneWeekPriceChange, oneMonthPriceChange, negRisk, negRiskMarketID, volume1wk, volume1mo, clobTokenIds (YES/NO token IDs for WS). Classifies into 13 themes via keyword matching.
 - **agents/math_engine.py** (~467 lines) — Core signal generation. 9 evidence sources fused via Bayesian log-odds:
   1. Prospect theory (prior) — inverts human probability weighting (γ=0.65)
   2. Historical base rates per theme
@@ -97,7 +100,7 @@ All config via environment variables. Key params:
 - `MAX_MARKET_DAYS=30` (skip markets closing > 30 days out)
 - `CONFIG_TAG=v1` (A/B testing tag, saved to DB with full config snapshot)
 - `HISTORY_INTERVAL=14400` (recalibrate every 4 hours)
-- `SCAN_INTERVAL=10` (seconds between market scans)
+- `SCAN_INTERVAL=300` (seconds between REST market scans; positions monitored in real-time via WebSocket)
 
 ### Database
 
@@ -105,7 +108,9 @@ PostgreSQL required (500MB plan). Schema auto-created on startup by `db.init()`.
 
 ### Performance Optimizations
 
-- Single scanner.fetch() per cycle (shared with monitor_positions)
+- **WebSocket position monitoring** — sub-second SL/TP reaction vs 10s polling. REST scan reduced from 10s to 5min (~30x fewer API calls)
+- Dynamic WS subscribe/unsubscribe — only track tokens of open positions, not all 500 markets
+- REST fallback — monitor_positions still runs each scan cycle as safety net
 - DB writes only for changed prices (~80% reduction)
 - Signal cooldown 5 min per market (prevents spam)
 - Claude: 1 call/min max, 30-min cache

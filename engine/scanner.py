@@ -1,3 +1,4 @@
+import json as _json
 import logging
 import httpx
 from datetime import datetime, timezone
@@ -6,6 +7,16 @@ from typing import Optional
 log = logging.getLogger("scanner")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+def _parse_token_ids(m: dict) -> tuple:
+    """Extract YES and NO token IDs from market data."""
+    token_ids = m.get("clobTokenIds") or []
+    if isinstance(token_ids, str):
+        token_ids = _json.loads(token_ids)
+    yes_token = token_ids[0] if len(token_ids) > 0 else None
+    no_token = token_ids[1] if len(token_ids) > 1 else None
+    return yes_token, no_token
 
 THEME_KEYWORDS = {
     "iran":     ["iran","iranian","tehran","nuclear iran","iaea"],
@@ -66,13 +77,13 @@ class PolymarketScanner:
                         continue
                     raw_prices = m.get("outcomePrices") or ["0.5","0.5"]
                     if isinstance(raw_prices, str):
-                        import json as _json
                         raw_prices = _json.loads(raw_prices)
                     yes_price = float(raw_prices[0])
                     no_price  = float(raw_prices[1]) if len(raw_prices) > 1 else 1 - yes_price
                     if yes_price > 0.97 or yes_price < 0.03:
                         filtered += 1
                         continue
+                    yes_token, no_token = _parse_token_ids(m)
                     end_date = _parse_end_date(m.get("endDate"))
                     # URL: use event slug if available, fall back to market slug
                     events = m.get("events") or []
@@ -99,6 +110,8 @@ class PolymarketScanner:
                         "end_date":  end_date,
                         "theme":     detect_theme(m.get("question","")),
                         "url":       f"https://polymarket.com/event/{url_slug}",
+                        "yes_token": yes_token,
+                        "no_token":  no_token,
                     })
                 offset += 100
                 if len(batch) < 100: break
@@ -111,7 +124,12 @@ class PolymarketScanner:
     async def get_market(self, market_id: str) -> dict | None:
         try:
             r = await self.client.get(f"{GAMMA_API}/markets/{market_id}")
-            return r.json()
+            data = r.json()
+            if data:
+                yes_token, no_token = _parse_token_ids(data)
+                data["yes_token"] = yes_token
+                data["no_token"] = no_token
+            return data
         except Exception as e:
             log.error(f"[SCANNER] get_market {market_id}: {e}")
             return None

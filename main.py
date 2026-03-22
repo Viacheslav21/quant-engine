@@ -17,6 +17,7 @@ load_dotenv()
 from utils.db             import Database
 from utils.telegram       import TelegramBot
 from engine.scanner       import PolymarketScanner
+from engine.ws_client     import PolymarketWS
 from agents.news_monitor  import NewsMonitor
 from agents.math_engine   import MathEngine
 from agents.history_agent import HistoryAgent
@@ -38,7 +39,7 @@ CONFIG = {
     "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
     "BANKROLL":         float(os.getenv("BANKROLL", "1000")),
     "SIMULATION":       os.getenv("SIMULATION", "true").lower() == "true",
-    "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "10")),
+    "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "300")),
     "NEWS_INTERVAL":    int(os.getenv("NEWS_INTERVAL", "30")),
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
     "MIN_EV":           float(os.getenv("MIN_EV", "0.12")),
@@ -370,8 +371,87 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     )
     return True
 
+async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: float,
+                          config: dict, trailing_highs: dict,
+                          db: Database, telegram: TelegramBot, ws: PolymarketWS = None) -> bool:
+    """Check a single position for TP/SL/resolution. Returns True if position was closed."""
+    upnl = (price / pos["side_price"] - 1) * pos["stake_amt"]
+    await db.update_position_price(pos["id"], price, upnl)
+
+    pnl_pct = (price - pos["side_price"]) / pos["side_price"]
+    close_reason = None
+    outcome = None
+
+    tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
+    sl_pct = pos.get("sl_pct") or config["STOP_LOSS_PCT"]
+
+    # 1. Market resolved
+    is_resolved = is_closed or yes_price >= 0.95 or yes_price <= 0.05
+    if is_resolved:
+        outcome = "YES" if yes_price >= 0.50 else "NO"
+        won = outcome == pos["side"]
+        payout = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
+        pnl = round(payout - pos["stake_amt"], 2)
+        close_reason = "RESOLVED"
+
+    # 2. Take profit
+    elif pnl_pct >= tp_pct:
+        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+        pnl = round(payout - pos["stake_amt"], 2)
+        close_reason = "TAKE_PROFIT"
+
+    # 2b. Trailing take profit
+    elif config.get("TRAILING_TP") and pnl_pct >= tp_pct * 0.5:
+        prev_high = trailing_highs.get(pos["id"], 0)
+        current_high = max(prev_high, pnl_pct)
+        trailing_highs[pos["id"]] = current_high
+        pullback = current_high - pnl_pct
+        if pullback >= 0.05 and current_high >= tp_pct * 0.5:
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+            pnl = round(payout - pos["stake_amt"], 2)
+            close_reason = "TRAILING_TP"
+            log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}%)")
+
+    # 3. Stop loss
+    elif pnl_pct <= -sl_pct:
+        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+        pnl = round(payout - pos["stake_amt"], 2)
+        close_reason = "STOP_LOSS"
+
+    if not close_reason:
+        return False
+
+    if close_reason != "RESOLVED":
+        outcome = f"{pos['side']}@{price*100:.0f}¢"
+    await db.close_position(pos["id"], outcome, payout, pnl)
+    trailing_highs.pop(pos["id"], None)
+
+    # Unsubscribe from WS after closing
+    if ws:
+        log.info(f"[WS] Unsubscribing {pos['market_id'][:8]} after {close_reason}: {pos['question'][:60]}")
+        await ws.unsubscribe_market(pos["market_id"])
+
+    stats = await db.get_stats()
+    total = stats["wins"] + stats["losses"]
+    wr = round(stats["wins"] / total * 100) if total > 0 else 0
+
+    reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
+    won = pnl > 0
+    log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
+    await telegram.send(
+        f"{reason_emoji} <b>{close_reason}</b> {'✅' if won else '❌'}\n\n"
+        f"❓ {pos['question'][:120]}\n\n"
+        f"{pos['side']} @ {pos['side_price']*100:.1f}¢ → <b>{price*100:.1f}¢</b>\n"
+        f"📈 Движение:<b>{pnl_pct*100:+.1f}%</b>\n"
+        f"💰 P&L:<b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
+        f"📊 WR:{wr}% | Банкролл:${stats['bankroll']:.2f}"
+    )
+    return True
+
+
 async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner, config: dict,
-                            markets: list = None, trailing_highs: dict = None):
+                            markets: list = None, trailing_highs: dict = None, ws: PolymarketWS = None):
+    """REST fallback position monitor — runs every scan cycle."""
     open_pos = await db.get_open_positions()
     if not open_pos: return
     if markets is None:
@@ -383,8 +463,14 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
         is_closed = False
-        if not m:
-            # Market not in active scan — likely resolved/closed, fetch directly
+
+        # Try WS price first (fresher), fall back to REST
+        ws_price = ws.get_price(pos["market_id"]) if ws else 0
+        if ws_price > 0:
+            yes_price = ws_price
+            no_price = 1 - ws_price
+            m = m or {"id": pos["market_id"], "yes_price": yes_price, "no_price": no_price}
+        elif not m:
             raw = await scanner.get_market(pos["market_id"])
             if not raw:
                 continue
@@ -398,73 +484,15 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
                 "no_price": float(raw_prices[1]) if len(raw_prices) > 1 else 1 - float(raw_prices[0]),
             }
             is_closed = bool(raw.get("closed"))
-        price = m["yes_price"] if pos["side"] == "YES" else m.get("no_price", 1-m["yes_price"])
-        upnl  = (price / pos["side_price"] - 1) * pos["stake_amt"]
-        await db.update_position_price(pos["id"], price, upnl)
+            # Subscribe to WS for future real-time updates
+            if ws and raw.get("yes_token"):
+                await ws.subscribe_market(raw["id"], raw.get("yes_token"), raw.get("no_token"),
+                                          m["yes_price"], pos.get("question", ""))
+                log.info(f"[WS] +subscribe (REST fallback recovery) {raw['id'][:8]} | {pos.get('question', '')[:60]}")
 
-        pnl_pct  = (price - pos["side_price"]) / pos["side_price"]
-        close_reason = None
-        outcome = None
-
-        # Per-position TP/SL (contrarian: 10%/25%, normal: from config)
-        tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
-        sl_pct = pos.get("sl_pct") or config["STOP_LOSS_PCT"]
-
-        # 1. Market resolved — API says closed, or price hit 0/1
-        is_resolved = is_closed or m.get("yes_price", 0.5) >= 0.95 or m.get("yes_price", 0.5) <= 0.05
-        if is_resolved:
-            outcome = "YES" if m["yes_price"] >= 0.50 else "NO"
-            won     = outcome == pos["side"]
-            payout  = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
-            pnl     = round(payout - pos["stake_amt"], 2)
-            close_reason = "RESOLVED"
-
-        # 2. Take profit — fixed or trailing
-        elif pnl_pct >= tp_pct:
-            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-            pnl    = round(payout - pos["stake_amt"], 2)
-            close_reason = "TAKE_PROFIT"
-
-        # 2b. Trailing take profit — if price hit 50%+ of TP, track high and close on 5% pullback
-        elif config.get("TRAILING_TP") and pnl_pct >= tp_pct * 0.5:
-            prev_high = trailing_highs.get(pos["id"], 0)
-            current_high = max(prev_high, pnl_pct)
-            trailing_highs[pos["id"]] = current_high
-            pullback = current_high - pnl_pct
-            if pullback >= 0.05 and current_high >= tp_pct * 0.5:
-                payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-                pnl    = round(payout - pos["stake_amt"], 2)
-                close_reason = "TRAILING_TP"
-                log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}%)")
-
-        # 3. Stop loss — price moved against us
-        elif pnl_pct <= -sl_pct:
-            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-            pnl    = round(payout - pos["stake_amt"], 2)
-            close_reason = "STOP_LOSS"
-
-        if not close_reason:
-            continue
-
-        if close_reason != "RESOLVED":
-            outcome = f"{pos['side']}@{price*100:.0f}¢"
-        await db.close_position(pos["id"], outcome, payout, pnl)
-        trailing_highs.pop(pos["id"], None)  # clean up trailing state
-        stats = await db.get_stats()
-        total = stats["wins"] + stats["losses"]
-        wr    = round(stats["wins"]/total*100) if total > 0 else 0
-
-        reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
-        won = pnl > 0
-        log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
-        await telegram.send(
-            f"{reason_emoji} <b>{close_reason}</b> {'✅' if won else '❌'}\n\n"
-            f"❓ {pos['question'][:120]}\n\n"
-            f"{pos['side']} @ {pos['side_price']*100:.1f}¢ → <b>{price*100:.1f}¢</b>\n"
-            f"📈 Движение:<b>{pnl_pct*100:+.1f}%</b>\n"
-            f"💰 P&L:<b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
-            f"📊 WR:{wr}% | Банкролл:${stats['bankroll']:.2f}"
-        )
+        yes_price = m["yes_price"]
+        price = yes_price if pos["side"] == "YES" else m.get("no_price", 1 - yes_price)
+        await _check_position(pos, price, is_closed, yes_price, config, trailing_highs, db, telegram, ws)
 
 async def main():
     log.info("🚀 QUANT ENGINE v3")
@@ -478,31 +506,96 @@ async def main():
     calibrator = Calibrator(db)
     math_eng   = MathEngine(CONFIG, db, calibrator)
     history    = HistoryAgent(db, calibrator)
+    ws         = PolymarketWS()
 
+    trailing_highs = {}  # pos_id -> max pnl_pct seen (for trailing TP)
+
+    # --- WS real-time position monitoring callback ---
+    # Keep a live map of market_id -> position for instant SL/TP checks
+    _ws_positions: dict[str, dict] = {}  # market_id -> position dict
+
+    async def _refresh_ws_positions():
+        """Refresh the WS position map from DB."""
+        nonlocal _ws_positions
+        open_pos = await db.get_open_positions()
+        _ws_positions = {p["market_id"]: p for p in open_pos}
+
+    async def on_ws_price_change(market_id: str, old_price: float, new_price: float):
+        """Instant SL/TP check when WS delivers a price update."""
+        pos = _ws_positions.get(market_id)
+        if not pos:
+            return
+        yes_price = new_price
+        price = yes_price if pos["side"] == "YES" else 1 - yes_price
+        pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
+        sl_pct = pos.get("sl_pct") or CONFIG["STOP_LOSS_PCT"]
+        tp_pct = pos.get("tp_pct") or CONFIG["TAKE_PROFIT_PCT"]
+        # Log significant moves toward SL/TP
+        if pnl_pct <= -sl_pct * 0.7 or pnl_pct >= tp_pct * 0.7:
+            log.info(f"[WS] {market_id[:8]} {pos['side']} pnl:{pnl_pct*100:+.1f}% (SL:{-sl_pct*100:.0f}%/TP:{tp_pct*100:.0f}%) price:{old_price:.4f}→{new_price:.4f}")
+        closed = await _check_position(pos, price, False, yes_price, CONFIG, trailing_highs, db, telegram, ws)
+        if closed:
+            _ws_positions.pop(market_id, None)
+
+    async def on_ws_trade(market_id: str, price: float, size: float, side: str):
+        """Whale alert on positions we hold."""
+        if market_id in _ws_positions and size >= 500:
+            pos = _ws_positions[market_id]
+            log.info(f"[WHALE] ${size:.0f} {side} on {pos['question'][:50]}")
+
+    ws.set_callbacks(on_price_change=on_ws_price_change, on_trade=on_ws_trade)
 
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
         f"💼 ${CONFIG['BANKROLL']} | {'Симуляция 🧪' if CONFIG['SIMULATION'] else 'Реальный 💰'}\n"
         f"🔢 Math-first | Claude только EV>{CONFIG['CLAUDE_EV_THR']*100:.0f}%\n"
-        f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL"
+        f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL\n"
+        f"🔌 WebSocket position monitoring enabled"
     )
 
     await db.save_config_snapshot(CONFIG["CONFIG_TAG"], CONFIG)
-
-    # One-time: clean up arb positions if any exist
     await db._cleanup_arb_positions()
-
-    # Bootstrap: load historical closed markets for training (one-time, skips if data exists)
     await bootstrap_history(db, scanner)
-
     await history.analyze()
     await math_eng.load_patterns()
 
+    # Subscribe WS to all currently open positions
+    open_pos = await db.get_open_positions()
+    markets_initial = await scanner.fetch()
+    mmap_initial = {m["id"]: m for m in markets_initial}
+    ws_registered = 0
+    ws_failed = 0
+    for pos in open_pos:
+        m = mmap_initial.get(pos["market_id"])
+        if m and (m.get("yes_token") or m.get("no_token")):
+            ws.register_market(m["id"], m.get("yes_token"), m.get("no_token"),
+                               m["yes_price"], m.get("question", ""))
+            log.info(f"[WS] +subscribe {pos['market_id'][:8]} {pos['side']} @ {pos['side_price']*100:.1f}¢ | {pos['question'][:60]}")
+            ws_registered += 1
+        else:
+            raw = await scanner.get_market(pos["market_id"])
+            if raw and (raw.get("yes_token") or raw.get("no_token")):
+                raw_prices = raw.get("outcomePrices") or ["0.5", "0.5"]
+                if isinstance(raw_prices, str):
+                    import json as _json
+                    raw_prices = _json.loads(raw_prices)
+                ws.register_market(raw["id"], raw.get("yes_token"), raw.get("no_token"),
+                                   float(raw_prices[0]), raw.get("question", ""))
+                log.info(f"[WS] +subscribe {pos['market_id'][:8]} (fetched tokens) {pos['side']} @ {pos['side_price']*100:.1f}¢ | {pos['question'][:60]}")
+                ws_registered += 1
+            else:
+                log.warning(f"[WS] Failed to get tokens for {pos['market_id'][:8]} | {pos['question'][:60]}")
+                ws_failed += 1
+    await _refresh_ws_positions()
+    log.info(f"[WS] Startup: {ws_registered} positions subscribed, {ws_failed} failed, {len(ws.prices)} total markets")
+
+    # Start WS in background
+    ws_task = asyncio.create_task(ws.connect())
+
     last_news = last_history = last_metrics_save = 0
-    METRICS_SAVE_INTERVAL = 300  # save market metrics every 5 minutes
+    METRICS_SAVE_INTERVAL = 300
     scan_count = 0
-    _market_price_cache = {}  # market_id -> last yes_price, skip DB if unchanged
-    # Restore caches and cooldowns from market_metrics table
+    _market_price_cache = {}
     _signal_cooldown = {}
     try:
         saved_metrics = await db.get_all_market_metrics()
@@ -514,12 +607,11 @@ async def main():
         log.info(f"[MAIN] Restored {len(saved_metrics)} market caches, {len(_signal_cooldown)} cooldowns from DB")
     except Exception as e:
         log.warning(f"[MAIN] Could not restore metrics: {e}")
-    trailing_highs = {}  # pos_id -> max pnl_pct seen (for trailing TP)
-    claude_cache = {}  # market_id -> (timestamp, result) — avoid re-calling for same market
-    CLAUDE_CACHE_TTL = 1800  # 30 minutes
-    last_claude_call = 0  # timestamp of last actual API call
-    CLAUDE_MIN_INTERVAL = 60  # max 1 API call per minute
-    daily_report_sent = None  # date of last daily report
+    claude_cache = {}
+    CLAUDE_CACHE_TTL = 1800
+    last_claude_call = 0
+    CLAUDE_MIN_INTERVAL = 60
+    daily_report_sent = None
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -527,7 +619,7 @@ async def main():
             import signal as _signal
             loop.add_signal_handler(
                 getattr(_signal, sig_name),
-                lambda: asyncio.create_task(shutdown(db, telegram, scanner)),
+                lambda: asyncio.create_task(shutdown(db, telegram, scanner, ws)),
             )
         except (NotImplementedError, AttributeError):
             pass
@@ -538,37 +630,35 @@ async def main():
             scan_count += 1
 
             markets = await scanner.fetch()
-            # Only write to DB for markets whose price actually changed
             for m in markets:
                 prev = _market_price_cache.get(m["id"])
                 if prev and abs(prev - m["yes_price"]) < 0.001:
-                    continue  # price unchanged, skip DB write
+                    continue
                 _market_price_cache[m["id"]] = m["yes_price"]
                 await db.upsert_market(m)
                 await db.save_snapshot(m["id"], m["yes_price"], m["volume"], m.get("volume_24h", 0))
 
-            # Build neg-risk groups for arbitrage detection
             math_eng.build_neg_risk_groups(markets)
 
-            # Warmup: skip signal generation briefly to fill price caches for new markets
-            WARMUP_TICKS = 6  # ~1 min at 10s interval
-            if scan_count <= WARMUP_TICKS:
-                if scan_count == WARMUP_TICKS:
-                    log.info(f"[MAIN] Warmup complete ({WARMUP_TICKS} ticks), starting signal generation")
-                await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
+            # Warmup: first scan fills price caches
+            if scan_count <= 1:
+                log.info(f"[MAIN] First scan complete, {len(markets)} markets. Signal generation starts next cycle.")
+                # REST fallback check + refresh WS positions
+                await _refresh_ws_positions()
+                await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs, ws)
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
                 continue
 
             news_signals = []
             if now - last_news >= CONFIG["NEWS_INTERVAL"]:
                 last_news = now
-                new_news  = await news_mon.scan()
+                new_news = await news_mon.scan()
                 for item in new_news:
                     relevant = await news_mon.find_relevant_markets(item, markets)
                     for m in relevant:
                         sig = math_eng.analyze(m)
                         if sig:
-                            sig["source"]       = "news"
+                            sig["source"] = "news"
                             sig["news_trigger"] = item["title"][:200]
                             news_signals.append(sig)
 
@@ -576,7 +666,7 @@ async def main():
             math_signals = []
             for m in markets:
                 if m["id"] in news_market_ids:
-                    continue  # already analyzed in news loop
+                    continue
                 sig = math_eng.analyze(m)
                 if sig:
                     math_signals.append(sig)
@@ -585,18 +675,15 @@ async def main():
             for s in news_signals:
                 all_signals[s["market_id"]] = s
 
-            # Cooldown: skip signals for markets that already signaled in last 5 min
             SIGNAL_COOLDOWN = 300
             _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
             all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
 
-            # Rank by Kelly (already incorporates EV), penalize high-entropy (uncertain) markets
             signals = sorted(all_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
 
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(signals)} сигналов")
 
-            # Clean expired cache entries
             claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
 
             confirmed = []
@@ -613,16 +700,14 @@ async def main():
                         last_claude_call = now
                         can_call_claude = False
                     else:
-                        # Rate limited — skip Claude, pass signal through without confirmation
                         confirmed.append(sig)
                         continue
                     if result.get("confirm"):
                         sig["p_claude"] = result.get("p_claude", sig["p_final"])
                         blended = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
-                        # Re-apply drift cap after Claude blend
                         max_drift = 0.15
                         sig["p_final"] = max(sig["p_market"] - max_drift, min(sig["p_market"] + max_drift, blended))
-                        sig["source"]   = "claude"
+                        sig["source"] = "claude"
                         confirmed.append(sig)
                         log.info(f"[CLAUDE] ✅ {sig['question'][:50]}")
                     else:
@@ -630,6 +715,7 @@ async def main():
                 else:
                     confirmed.append(sig)
 
+            mmap = {m["id"]: m for m in markets}
             for sig in confirmed[:3]:
                 sig_id = f"sig_{sig['market_id'][:8]}_{int(now)}"
                 await db.save_signal({
@@ -656,14 +742,28 @@ async def main():
                 executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
                 if executed:
                     await db.mark_signal_executed(sig_id)
+                    # Subscribe WS to the new position's market
+                    m_data = mmap.get(sig["market_id"])
+                    if m_data and (m_data.get("yes_token") or m_data.get("no_token")):
+                        await ws.subscribe_market(m_data["id"], m_data.get("yes_token"), m_data.get("no_token"),
+                                                  m_data["yes_price"], m_data.get("question", ""))
+                        log.info(f"[WS] +subscribe (new position) {sig['market_id'][:8]} {sig['side']} | {sig['question'][:60]}")
+                    else:
+                        log.warning(f"[WS] No tokens for new position {sig['market_id'][:8]}, REST fallback only")
 
-            await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs)
+            # Refresh WS position map and run REST fallback check
+            await _refresh_ws_positions()
+            await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs, ws)
 
-            # Persist market metrics every 5 min for warm restart & analytics
+            # Log WS health
+            ws_active = ws.active_count()
+            log.info(f"[WS] {ws_active}/{len(ws.prices)} markets active | connected={ws.connected}")
+
+            # Persist market metrics every scan
             if now - last_metrics_save >= METRICS_SAVE_INTERVAL:
                 last_metrics_save = now
                 try:
-                    for m in markets[:100]:  # top 100 by volume
+                    for m in markets[:100]:
                         metrics = math_eng.get_market_metrics(m["id"])
                         await db.save_market_metrics(m["id"], metrics)
                 except Exception as e:
@@ -685,8 +785,10 @@ async def main():
 
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
-async def shutdown(db, telegram, scanner):
+async def shutdown(db, telegram, scanner, ws=None):
     log.info("🛑 Shutting down...")
+    if ws:
+        ws.stop()
     await scanner.close()
     await telegram.close()
     await db.close()
