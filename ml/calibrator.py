@@ -5,7 +5,7 @@ import numpy as np
 log = logging.getLogger("calibrator")
 
 class Calibrator:
-    def __init__(self, db, window: int = 100):
+    def __init__(self, db, window: int = 300):
         self.db      = db
         self.window  = window
         self.factor  = 1.0
@@ -15,11 +15,8 @@ class Calibrator:
         self._agent_factors: dict = {}
 
     async def update(self):
+        # 1. Executed positions with resolved outcomes (as before)
         closed = await self.db.get_closed_positions(limit=self.window)
-        if len(closed) < self._min_bets:
-            log.info(f"[CALIBRATOR] Skipped: {len(closed)} positions < {self._min_bets} minimum")
-            return
-        # Use actual market outcome, not bet result
         preds_list, actuals_list = [], []
         for p in closed:
             outcome = p.get("outcome", "")
@@ -34,8 +31,25 @@ class Calibrator:
             else:
                 continue
             preds_list.append(float(p.get("p_final", 0.5)))
+        n_executed = len(preds_list)
+
+        # 2. Rejected signals whose markets have since resolved
+        # This fixes confirmation bias: we see what we missed
+        rejected = await self.db.get_rejected_signal_outcomes(limit=self.window)
+        n_rejected = 0
+        for r in rejected:
+            outcome = r.get("outcome")
+            if outcome == "YES":
+                actuals_list.append(1.0)
+            elif outcome == "NO":
+                actuals_list.append(0.0)
+            else:
+                continue
+            preds_list.append(float(r.get("p_final", 0.5)))
+            n_rejected += 1
+
         if len(preds_list) < self._min_bets:
-            log.info(f"[CALIBRATOR] Skipped: only {len(preds_list)} resolved outcomes")
+            log.info(f"[CALIBRATOR] Skipped: only {len(preds_list)} total samples")
             return
         preds    = np.array(preds_list)
         outcomes = np.array(actuals_list)
@@ -45,7 +59,7 @@ class Calibrator:
             self.factor = max(0.7, min(1.3, 1.0-self.bias*0.5))
         else:
             self.factor = 1.0
-        log.info(f"[CALIBRATOR] Brier:{self._brier:.4f} Bias:{self.bias:+.4f} Factor:{self.factor:.4f} [{self.quality()}]")
+        log.info(f"[CALIBRATOR] Brier:{self._brier:.4f} Bias:{self.bias:+.4f} Factor:{self.factor:.4f} [{self.quality()}] (executed:{n_executed} + rejected:{n_rejected})")
 
     def update_from_history(self, agent: str, brier: float, bias: float, factor: float):
         log.debug(f"[CALIBRATOR] Updated from history: agent={agent} brier={brier:.4f} bias={bias:+.4f} factor={factor:.4f}")

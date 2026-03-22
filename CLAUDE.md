@@ -21,9 +21,7 @@ python main.py
 
 No build step, no test suite, no linter configured. Logging goes to `quant.log` and stdout. Set `logging.DEBUG` in main.py to see signal rejection details.
 
-Dashboard runs on `http://localhost:3000` (FastAPI + Uvicorn, started automatically by main.py).
-
-Deployed via Railway (`Procfile: web: python main.py`). Graceful shutdown on SIGTERM/SIGINT.
+Deployed via Railway (`Procfile: worker: python main.py`). Graceful shutdown on SIGTERM/SIGINT. Dashboard is a separate service (quant-dashboard).
 
 ## Architecture
 
@@ -69,11 +67,6 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
 - **ml/calibrator.py** (~76 lines) — Brier score, bias, logit-scale correction. `adjust()` applied to every `p_final`.
 - **utils/db.py** (~550 lines) — PostgreSQL schema (9 tables including config_history), connection pool, CRUD, analytics queries (by theme/source/side/config_tag/calibration), cumulative PnL, signal outcomes for backtest, DB cleanup with configurable retention. Migrations: tp_pct/sl_pct/config_tag columns, backfill executed signals from positions.
 - **utils/telegram.py** (~33 lines) — Async Telegram notifications with HTML formatting.
-- **dashboard/app.py** (~778 lines) — FastAPI web UI (dark theme):
-  - `/` — Bankroll, ROI, Win Rate, EV, open positions, PnL chart (Chart.js), signals, history with pagination (100/page). Hover tooltips on all headers.
-  - `/analytics` — Config A/B comparison table, WR by theme/source/side, close reasons, calibration chart + table, cumulative PnL chart, daily PnL bar chart, win rate by theme chart, signal backtest (executed vs rejected).
-  - `/api` — JSON stats endpoint.
-
 ### Key Algorithms
 
 - **Bayesian fusion**: Prior (prospect-adjusted price) updated with up to 6 de-duplicated evidence sources in log-odds space. Drift capped at ±15% from market price.

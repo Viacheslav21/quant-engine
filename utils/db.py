@@ -336,6 +336,21 @@ class Database:
             rows = await conn.fetch("SELECT * FROM signals ORDER BY created_at DESC LIMIT $1", limit)
             return [dict(r) for r in rows]
 
+    async def get_rejected_signal_outcomes(self, limit: int = 200) -> list:
+        """Get rejected (unexecuted) signals whose markets have since resolved.
+        Used for calibration to fix confirmation bias."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.p_final, s.p_market, s.market_id, m.outcome
+                FROM signals s
+                JOIN markets m ON s.market_id = m.id
+                WHERE s.executed = FALSE
+                  AND m.outcome IS NOT NULL
+                ORDER BY s.created_at DESC
+                LIMIT $1
+            """, limit)
+            return [dict(r) for r in rows]
+
     async def save_position(self, pos: dict):
         try:
             async with self.pool.acquire() as conn:

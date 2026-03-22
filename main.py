@@ -54,7 +54,8 @@ CONFIG = {
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
     "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.08")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
-    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v2"),
+    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v3"),
+    "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
 }
 
 _claude_client = None
@@ -340,13 +341,13 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     # Volatility-based SL: SL = max(MIN_SL, 2.5 × ATR / entry_price)
     # Low volatility → tight SL, high volatility → wider SL
     volatility = signal.get("volatility", 0)
-    if volatility > 0 and signal["side_price"] > 0:
+    if volatility > 0 and signal["side_price"] > 0.10:  # skip vol SL for very cheap positions
         vol_sl = 2.5 * volatility / signal["side_price"]
         vol_sl = max(0.08, min(sl_pct, round(vol_sl, 3)))  # floor 8%, cap at default SL
         log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
         sl_pct = vol_sl
 
-    stake = math_eng.compute_stake(bankroll, kelly)
+    stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos)
     if stake < 1.0: return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
     log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
@@ -635,6 +636,9 @@ async def main():
     last_claude_call = 0
     CLAUDE_MIN_INTERVAL = 60
     daily_report_sent = None
+    peak_equity = CONFIG["BANKROLL"]  # track peak equity for drawdown
+    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.25"))  # 25% from peak → stop
+    trading_halted = False
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -651,6 +655,40 @@ async def main():
         try:
             now = time.time()
             scan_count += 1
+
+            # Drawdown check: equity = free cash + value of all open positions
+            stats = await db.get_stats()
+            open_pos = await db.get_open_positions()
+            positions_value = sum((p.get("stake_amt", 0) + (p.get("unrealized_pnl", 0) or 0)) for p in open_pos)
+            equity = stats["bankroll"] + positions_value
+            if equity > peak_equity:
+                peak_equity = equity
+            drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
+            if drawdown >= MAX_DRAWDOWN and not trading_halted:
+                trading_halted = True
+                log.warning(f"[RISK] DRAWDOWN HALT: equity=${equity:.2f} peak=${peak_equity:.2f} dd={drawdown*100:.1f}% >= {MAX_DRAWDOWN*100:.0f}%")
+                await telegram.send(
+                    f"🚨 <b>TRADING HALTED — DRAWDOWN</b>\n\n"
+                    f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
+                    f"Drawdown: <b>{drawdown*100:.1f}%</b> >= {MAX_DRAWDOWN*100:.0f}% limit\n"
+                    f"Open positions: {len(open_pos)}\n\n"
+                    f"No new trades until manual restart."
+                )
+            if trading_halted:
+                # Recovery: if equity recovers to within 10% of peak, resume
+                if drawdown < MAX_DRAWDOWN * 0.5:
+                    trading_halted = False
+                    log.info(f"[RISK] TRADING RESUMED: equity=${equity:.2f} dd={drawdown*100:.1f}% recovered")
+                    await telegram.send(
+                        f"✅ <b>TRADING RESUMED</b>\n\n"
+                        f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
+                        f"Drawdown: {drawdown*100:.1f}% < {MAX_DRAWDOWN*50:.0f}% recovery threshold"
+                    )
+                else:
+                    # Still halted — monitor positions only
+                    await monitor_positions(db, telegram, scanner, CONFIG, await scanner.fetch(), trailing_highs, ws)
+                    await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+                    continue
 
             markets = await scanner.fetch()
             for m in markets:
@@ -715,11 +753,17 @@ async def main():
                 if sig["ev"] >= CONFIG["CLAUDE_EV_THR"]:
                     cached = claude_cache.get(sig["market_id"])
                     if cached:
+                        cache_time, result, cache_price = cached[0], cached[1], cached[2] if len(cached) > 2 else sig["p_market"]
+                        # Invalidate if price moved >5% since cache
+                        if abs(sig["p_market"] - cache_price) > 0.05:
+                            cached = None
+                            log.info(f"[CLAUDE] Cache invalidated for {sig['market_id'][:8]}: price moved {cache_price:.2f}→{sig['p_market']:.2f}")
+                    if cached:
                         result = cached[1]
                         log.debug(f"[CLAUDE] Cache hit for {sig['market_id'][:8]}")
                     elif can_call_claude:
                         result = await claude_confirm(sig, CONFIG, db)
-                        claude_cache[sig["market_id"]] = (now, result)
+                        claude_cache[sig["market_id"]] = (now, result, sig["p_market"])
                         last_claude_call = now
                         can_call_claude = False
                     else:

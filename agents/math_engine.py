@@ -54,17 +54,20 @@ def logodds_to_prob(lo: float) -> float:
 
 # --- Bayesian fusion: combine evidence in log-odds space ---
 
-def bayesian_update(prior: float, *evidence_probs) -> float:
-    """Combine prior with independent evidence using log-odds (Bayesian fusion).
-    Each evidence_prob is an independent estimate of P(YES).
-    Prior is typically the market price."""
+def bayesian_update(prior: float, evidence_with_weights: list) -> float:
+    """Combine prior with weighted evidence using log-odds (Bayesian fusion).
+    evidence_with_weights: list of (p_evidence, weight) tuples.
+    Weight < 1.0 discounts correlated or weak evidence."""
     lo = prob_to_logodds(prior)
-    base_lo = prob_to_logodds(0.5)  # uninformative prior in log-odds
-    for p_ev in evidence_probs:
+    base_lo = prob_to_logodds(0.5)
+    for item in evidence_with_weights:
+        if item is None:
+            continue
+        p_ev, weight = item
         if p_ev is None:
             continue
-        # Each evidence contributes its log-likelihood ratio vs base rate
-        lo += prob_to_logodds(p_ev) - base_lo
+        # Each evidence contributes its log-likelihood ratio, scaled by weight
+        lo += (prob_to_logodds(p_ev) - base_lo) * weight
     return max(0.02, min(0.98, logodds_to_prob(lo)))
 
 
@@ -101,8 +104,9 @@ class MathEngine:
             except Exception:
                 pass
 
-        # 1. Prospect theory — invert human probability weighting
-        p_prospect = prospect_true_price(p_market)
+        # 1. Prospect theory — invert human probability weighting (configurable)
+        use_prospect = self.config.get("USE_PROSPECT", True)
+        p_prospect = prospect_true_price(p_market) if use_prospect else p_market
 
         # 2. Historical base rate for this theme
         p_history = self._apply_history(p_market, theme)
@@ -136,27 +140,33 @@ class MathEngine:
         p_arb = self._neg_risk_arb(market)
 
         # --- Bayesian fusion in log-odds space ---
-        # Prior: prospect-adjusted market price
-        # Evidence: history, volume, time, momentum, contrarian, long momentum, vol trend, arb
-        #
-        # Correlated signals: pick the stronger of each correlated pair to avoid double-counting
-        # - p_momentum (short-term) vs p_long_mom (long-term): keep the one with larger shift
-        # - p_volume (spike) vs p_vol_trend (trend): keep the one with larger shift
-        p_mom_final = None
+        # Merge correlated pairs BEFORE fusion (one source each, not two at 0.5)
+        # Momentum: pick stronger of short-term vs long-term
         if p_momentum is not None and p_long_mom is not None:
-            p_mom_final = p_momentum if abs(p_momentum - p_market) >= abs(p_long_mom - p_market) else p_long_mom
+            p_mom_combined = p_momentum if abs(p_momentum - p_market) >= abs(p_long_mom - p_market) else p_long_mom
         else:
-            p_mom_final = p_momentum or p_long_mom
+            p_mom_combined = p_momentum or p_long_mom
 
-        p_vol_final = None
+        # Volume: pick stronger of spike vs trend
         if p_volume is not None and p_vol_trend is not None:
-            p_vol_final = p_volume if abs(p_volume - p_market) >= abs(p_vol_trend - p_market) else p_vol_trend
+            p_vol_combined = p_volume if abs(p_volume - p_market) >= abs(p_vol_trend - p_market) else p_vol_trend
         else:
-            p_vol_final = p_volume or p_vol_trend
+            p_vol_combined = p_volume or p_vol_trend
 
-        evidence = [e for e in [p_history, p_vol_final, p_time, p_mom_final, p_contrarian, p_arb] if e is not None]
-        if evidence:
-            p_final = bayesian_update(p_prospect, *evidence)
+        # 6 independent sources, each at weight 1.0
+        # time_decay at 0.5 (partially priced into market)
+        evidence = [
+            (p_history, 1.0),
+            (p_vol_combined, 1.0),
+            (p_time, 0.5),
+            (p_mom_combined, 1.0),
+            (p_contrarian, 1.0),
+            (p_arb, 1.0),
+        ]
+        active_evidence = [(p, w) for p, w in evidence if p is not None]
+
+        if active_evidence:
+            p_final = bayesian_update(p_prospect, active_evidence)
         else:
             p_final = p_prospect
 
@@ -164,13 +174,19 @@ class MathEngine:
         if self.calibrator:
             p_final = self.calibrator.adjust(p_final)
 
-        # Cap max drift: model can't deviate more than 15% from market price
-        # If it thinks edge is >15%, it's more likely the model is wrong than the market
-        MAX_DRIFT = 0.15
-        if p_final > p_market + MAX_DRIFT:
-            p_final = p_market + MAX_DRIFT
-        elif p_final < p_market - MAX_DRIFT:
-            p_final = p_market - MAX_DRIFT
+        # Adaptive drift cap: more evidence = wider cap
+        # 0-1 sources: ±8%, 2-3: ±12%, 4+: ±18%
+        n_evidence = len(active_evidence)
+        if n_evidence <= 1:
+            max_drift = 0.08
+        elif n_evidence <= 3:
+            max_drift = 0.12
+        else:
+            max_drift = 0.18
+        if p_final > p_market + max_drift:
+            p_final = p_market + max_drift
+        elif p_final < p_market - max_drift:
+            p_final = p_market - max_drift
 
         p_final = max(0.02, min(0.98, round(p_final, 4)))
 
@@ -305,7 +321,8 @@ class MathEngine:
         # Near expiry: trust market price more (it's converging to truth)
         # Far from expiry: prospect theory has more room to add value
         decay = min(1.0, max(0.0, (days_left - 3) / 30))
-        p_time = p_market * (1 - decay) + prospect_true_price(p_market) * decay
+        prospect = prospect_true_price(p_market) if self.config.get("USE_PROSPECT", True) else p_market
+        p_time = p_market * (1 - decay) + prospect * decay
         # Only return if meaningfully different from market price
         if abs(p_time - p_market) < 0.005:
             return None
@@ -351,9 +368,10 @@ class MathEngine:
             return None, 0
 
         # Check volume ratio from _vol_history
+        # Need enough volume data to assess — without it, can't tell informed vs noise
         vol_hist = self._vol_history.get(market_id, [])
-        if len(vol_hist) < 3:
-            vol_ratio = 1.0
+        if len(vol_hist) < 6:
+            return None, 0  # not enough volume data to assess contrarian signal
         else:
             avg_vol = sum(vol_hist[:-1]) / len(vol_hist[:-1])
             vol_ratio = vol_hist[-1] / avg_vol if avg_vol > 0 else 1.0
@@ -513,8 +531,25 @@ class MathEngine:
         if short_p:
             self._price_cache[market_id] = list(short_p)
 
-    def compute_stake(self, bankroll: float, kelly: float) -> float:
+    def compute_stake(self, bankroll: float, kelly: float, theme: str = None,
+                       open_positions: list = None) -> float:
+        """Compute stake with portfolio concentration penalty.
+        If >20% of bankroll is in one theme, reduce Kelly proportionally."""
         stake = bankroll * kelly
-        stake = round(max(1.0, min(stake, bankroll*self.config["MAX_KELLY_FRAC"])), 2)
+        stake = min(stake, bankroll * self.config["MAX_KELLY_FRAC"])
+
+        # Portfolio correlation penalty: reduce stake if theme is concentrated
+        if theme and open_positions:
+            theme_stake = sum(p.get("stake_amt", 0) for p in open_positions if p.get("theme") == theme)
+            total_stake = sum(p.get("stake_amt", 0) for p in open_positions)
+            if total_stake > 0:
+                theme_pct = theme_stake / bankroll
+                # >20% in one theme → scale down: 20%→1.0x, 30%→0.5x, 40%+→0.25x
+                if theme_pct > 0.20:
+                    penalty = max(0.25, 1.0 - (theme_pct - 0.20) / 0.20)
+                    stake *= penalty
+                    log.info(f"[MATH] Theme concentration: '{theme}' {theme_pct*100:.0f}% of bankroll → Kelly ×{penalty:.2f}")
+
+        stake = round(max(1.0, stake), 2)
         log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")
         return stake
