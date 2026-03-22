@@ -173,14 +173,19 @@ class PolymarketWS:
             best_bid = change.get("best_bid")
             best_ask = change.get("best_ask")
             if best_bid and best_ask:
-                mid_price = (float(best_bid) + float(best_ask)) / 2
-                spread = round(float(best_ask) - float(best_bid), 4)
+                bid_f = float(best_bid)
+                ask_f = float(best_ask)
+                spread = round(ask_f - bid_f, 4)
+                # Skip wide spreads — price is unreliable
+                if ask_f > 0 and spread / ask_f > 0.20:
+                    continue
+                mid_price = (bid_f + ask_f) / 2
                 is_yes = self.prices[market_id].get("yes_token") == asset_id
                 yes_price = round(mid_price, 4) if is_yes else round(1 - mid_price, 4)
                 old_price = self.prices[market_id].get("yes_price", 0)
                 self.prices[market_id]["yes_price"] = yes_price
-                self.prices[market_id]["best_bid"] = float(best_bid) if is_yes else round(1 - float(best_ask), 4)
-                self.prices[market_id]["best_ask"] = float(best_ask) if is_yes else round(1 - float(best_bid), 4)
+                self.prices[market_id]["best_bid"] = bid_f if is_yes else round(1 - ask_f, 4)
+                self.prices[market_id]["best_ask"] = ask_f if is_yes else round(1 - bid_f, 4)
                 self.prices[market_id]["spread"] = spread
                 self.prices[market_id]["last_update"] = time.time()
                 if self._on_price_change and abs(yes_price - old_price) > 0.0001:
@@ -196,10 +201,14 @@ class PolymarketWS:
         side = data.get("side", "")
         is_yes = self.prices[market_id].get("yes_token") == asset_id
         yes_price = round(price, 4) if is_yes else round(1 - price, 4)
+        old_price = self.prices[market_id].get("yes_price", 0)
         self.prices[market_id]["yes_price"] = yes_price
         self.prices[market_id]["last_trade_size"] = size
         self.prices[market_id]["last_trade_side"] = side
         self.prices[market_id]["last_update"] = time.time()
+        # Trades are real executed prices — trigger SL/TP check
+        if self._on_price_change and abs(yes_price - old_price) > 0.0001:
+            await self._on_price_change(market_id, old_price, yes_price)
         if self._on_trade and size > 0:
             await self._on_trade(market_id, yes_price, size, side)
 
@@ -213,8 +222,11 @@ class PolymarketWS:
         if bids and asks:
             best_bid = float(bids[0]["price"])
             best_ask = float(asks[0]["price"])
-            mid = (best_bid + best_ask) / 2
             spread = round(best_ask - best_bid, 4)
+            # Skip wide spreads — price is unreliable
+            if best_ask > 0 and spread / best_ask > 0.20:
+                return
+            mid = (best_bid + best_ask) / 2
             is_yes = self.prices[market_id].get("yes_token") == asset_id
             yes_price = round(mid, 4) if is_yes else round(1 - mid, 4)
             self.prices[market_id]["yes_price"] = yes_price
