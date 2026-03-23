@@ -81,6 +81,44 @@ class MathEngine:
         self._price_cache: dict = {}  # market_id -> list of recent prices (30 points, ~5 min)
         self._long_price_cache: dict = {}  # market_id -> list of recent prices (180 points, ~30 min)
         self._neg_risk_groups: dict = {}  # neg_risk_market_id -> [market dicts] for arbitrage
+        self._ml_url = config.get("ML_API_URL")  # e.g. http://quant-ml.railway.internal:8080
+        self._ml_client = None
+
+    def _get_ml_client(self):
+        if self._ml_client is None and self._ml_url:
+            import httpx
+            self._ml_client = httpx.AsyncClient(timeout=3.0)
+        return self._ml_client
+
+    async def ml_predict(self, market: dict) -> dict | None:
+        """Call ML API for prediction. Returns {p_yes, p_mispriced} or None."""
+        client = self._get_ml_client()
+        if not client:
+            return None
+        try:
+            from datetime import datetime, timezone
+            days_to_expiry = 30
+            end_date = market.get("end_date")
+            if end_date:
+                if isinstance(end_date, str):
+                    end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                days_to_expiry = max(0, (end_date - datetime.now(timezone.utc)).days)
+
+            r = await client.get(f"{self._ml_url}/predict", params={
+                "yes_price": market["yes_price"],
+                "theme": market.get("theme", "other"),
+                "volume": market.get("volume", 0),
+                "days_to_expiry": days_to_expiry,
+                "volume_per_day": market.get("volume_24h", 0),
+                "neg_risk": market.get("neg_risk", False),
+                "question_length": len(market.get("question", "")),
+                "has_numbers": any(c.isdigit() for c in market.get("question", "")),
+                "spread": market.get("spread", 0),
+            })
+            return r.json()
+        except Exception as e:
+            log.debug(f"[ML] Predict failed: {e}")
+            return None
 
     async def load_patterns(self):
         self._patterns = await self.db.get_patterns()
@@ -383,15 +421,15 @@ class MathEngine:
             return None, 0
 
         # Confidence: lower volume = higher confidence, bigger move = higher confidence
-        vol_confidence = max(0, 1 - vol_ratio / 2.5)
         move_confidence = min(1, abs(move) / 0.20)
-        confidence = vol_confidence * move_confidence
-
-        # Scale down for weak signal (volume 1.5-2.5x)
         if vol_ratio >= 1.5:
-            confidence *= 0.5
+            # Moderate volume: might be informed, lower confidence
+            vol_confidence = max(0.1, 1 - (vol_ratio - 1.5) / 1.0)  # 1.5x→1.0, 2.5x→0.1
+            confidence = vol_confidence * move_confidence
             log.info(f"[MATH] Contrarian WEAK {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
         else:
+            # Low volume: likely noise, high confidence in reversion
+            confidence = move_confidence
             log.info(f"[MATH] Contrarian STRONG {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
 
         # Compute EWMA as reversion target

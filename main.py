@@ -58,6 +58,7 @@ CONFIG = {
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
     "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
+    "ML_API_URL":       os.getenv("ML_API_URL", ""),  # e.g. http://quant-ml.railway.internal:8080
 }
 
 _claude_client = None
@@ -647,6 +648,8 @@ async def main():
     peak_equity = CONFIG["BANKROLL"]  # track peak equity for drawdown
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.25"))  # 25% from peak → stop
     trading_halted = False
+    halt_time = 0  # timestamp when halted
+    HALT_COOLDOWN = 1800  # 30 min cooldown before resume
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -674,17 +677,18 @@ async def main():
             drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
             if drawdown >= MAX_DRAWDOWN and not trading_halted:
                 trading_halted = True
+                halt_time = now
                 log.warning(f"[RISK] DRAWDOWN HALT: equity=${equity:.2f} peak=${peak_equity:.2f} dd={drawdown*100:.1f}% >= {MAX_DRAWDOWN*100:.0f}%")
                 await telegram.send(
                     f"🚨 <b>TRADING HALTED — DRAWDOWN</b>\n\n"
                     f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
                     f"Drawdown: <b>{drawdown*100:.1f}%</b> >= {MAX_DRAWDOWN*100:.0f}% limit\n"
                     f"Open positions: {len(open_pos)}\n\n"
-                    f"No new trades until manual restart."
+                    f"No new trades until recovery + 30 min cooldown."
                 )
             if trading_halted:
-                # Recovery: if equity recovers to within 10% of peak, resume
-                if drawdown < MAX_DRAWDOWN * 0.5:
+                # Recovery: drawdown recovered AND 30 min cooldown passed
+                if drawdown < MAX_DRAWDOWN * 0.5 and (now - halt_time) >= HALT_COOLDOWN:
                     trading_halted = False
                     log.info(f"[RISK] TRADING RESUMED: equity=${equity:.2f} dd={drawdown*100:.1f}% recovered")
                     await telegram.send(
@@ -752,6 +756,30 @@ async def main():
 
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(signals)} сигналов")
+
+            # ML enrichment: blend p_ml into p_final for top signals
+            mmap_for_ml = {m["id"]: m for m in markets}
+            for sig in signals[:5]:
+                m_data = mmap_for_ml.get(sig["market_id"])
+                if m_data:
+                    ml_result = await math_eng.ml_predict(m_data)
+                    if ml_result:
+                        p_ml = ml_result.get("p_yes")
+                        sig["p_ml"] = p_ml
+                        sig["p_mispriced"] = ml_result.get("p_mispriced", 0)
+                        # Blend ML into p_final: 80% math + 20% ML
+                        if p_ml is not None:
+                            old_final = sig["p_final"]
+                            sig["p_final"] = round(old_final * 0.8 + p_ml * 0.2, 4)
+                            # Recalculate EV and Kelly with updated p_final
+                            from agents.math_engine import expected_value, kelly_fraction
+                            sig["ev"] = expected_value(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                            sig["kelly"] = kelly_fraction(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                            log.info(f"[ML] {sig['market_id'][:8]} p_ml={p_ml:.2f} p_final:{old_final:.2f}→{sig['p_final']:.2f} EV:{sig['ev']*100:+.1f}%")
 
             claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
 
