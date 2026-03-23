@@ -57,6 +57,7 @@ CONFIG = {
     "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v3"),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
+    "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
 }
 
 _claude_client = None
@@ -755,7 +756,7 @@ async def main():
             claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
 
             confirmed = []
-            CLAUDE_SKIP_THR = 0.25  # EV > 25% = strong enough, skip Claude
+            CLAUDE_SKIP_THR = 0.20  # EV > 20% = strong enough, skip Claude
             can_call_claude = (now - last_claude_call) >= CLAUDE_MIN_INTERVAL
             for sig in signals[:3]:
                 if sig["ev"] >= CLAUDE_SKIP_THR:

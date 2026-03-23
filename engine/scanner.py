@@ -34,6 +34,24 @@ THEME_KEYWORDS = {
     "israel":   ["israel","hamas","gaza","hezbollah","netanyahu"],
 }
 
+SPORTS_KEYWORDS = [
+    "vs.", "vs ", "spread:", "o/u ", "over/under", "moneyline",
+    "winner", "win on 2026", "win on 2025", "nba", "nfl", "mlb", "nhl",
+    "ncaa", "premier league", "la liga", "serie a", "bundesliga",
+    "champions league", "ufc", "mma", "boxing", "tennis",
+    "miami open", "round of", "semifinal", "final",
+    "counter-strike", "dota", "league of legends", "valorant",
+    "panthers", "razorbacks", "hawkeyes", "gators", "wildcats",
+    "bulldogs", "tigers", "eagles", "bears", "lakers", "celtics",
+    "warriors", "nets", "yankees", "dodgers", "chiefs", "49ers",
+]
+
+
+def is_sports(question: str) -> bool:
+    lower = question.lower()
+    return any(kw in lower for kw in SPORTS_KEYWORDS)
+
+
 def _parse_end_date(raw) -> Optional[datetime]:
     if not raw:
         return None
@@ -73,6 +91,10 @@ class PolymarketScanner:
                     vol = float(m.get("volume") or 0)
                     liq = float(m.get("liquidity") or 0)
                     if vol < self.config["MIN_VOLUME"] or liq < 5000:
+                        filtered += 1
+                        continue
+                    # Skip sports/esports markets
+                    if self.config.get("SKIP_SPORTS", True) and is_sports(m.get("question", "")):
                         filtered += 1
                         continue
                     raw_prices = m.get("outcomePrices") or ["0.5","0.5"]
