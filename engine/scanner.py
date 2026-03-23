@@ -41,7 +41,9 @@ THEME_KEYWORDS = {
     "usgov":      ["doge","government shutdown","federal budget","pentagon","cia","fbi","doj","attorney general",
                    "secretary of state","cabinet","impeach","pardon","classified"],
     "election":   ["election","vote","president","referendum","governor","mayor","minister","parliament",
-                   "primary","caucus","midterm","ballot","polling","swing state","electoral"],
+                   "primary","caucus","midterm","ballot","polling","swing state","electoral",
+                   "democratic presidential","republican presidential","win the 2028","win the 2026",
+                   "nomination","nominee","running mate"],
 
     # Commodities & markets
     "oil":        ["oil","opec","crude","brent","wti","petroleum","natural gas","lng"],
@@ -54,7 +56,8 @@ THEME_KEYWORDS = {
 
     # Economy & macro
     "fed":        ["federal reserve","powell","rate cut","rate hike","inflation","cpi","pce",
-                   "interest rate","fomc","quantitative","monetary policy","tapering"],
+                   "interest rate","fomc","quantitative","monetary policy","tapering",
+                   "fed chair","bessent","shelton"],
     "economy":    ["gdp","unemployment","jobs","recession","nonfarm","payroll","consumer spending",
                    "retail sales","housing","mortgage","debt","deficit","trade balance"],
 
@@ -86,7 +89,8 @@ THEME_KEYWORDS = {
 
     # Other categories
     "sports_off": ["world cup","olympics","fifa","ioc"],  # non-betting sports events
-    "culture":    ["pope","vatican","royal family","king charles","queen","celebrity","scandal"],
+    "culture":    ["pope","vatican","royal family","king charles","queen","celebrity","scandal",
+                   "eurovision","music","album","concert","grammy"],
     "education":  ["university","college","student","tuition","scholarship"],
     "transport":  ["boeing","airbus","airline","aviation","faa","shipping","port","suez"],
 }
@@ -103,6 +107,8 @@ SPORTS_KEYWORDS = [
     "champions league", "europa league", "conference league",
     "ufc", "mma", "boxing", "tennis", "golf", "cricket", "rugby", "f1 ",
     "formula 1", "nascar", "indycar", "tour de france", "grand prix",
+    "f1 drivers", "fifa world cup", "world cup 2026",
+    "win on 2026-", "win on 2025-",  # "Will X FC win on 2026-03-22?"
     "masters tournament", "the open", "pga championship", "ryder cup",
     "miami open", "french open", "wimbledon", "us open", "australian open",
     "roland garros", "indian wells",
