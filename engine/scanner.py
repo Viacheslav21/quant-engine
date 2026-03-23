@@ -35,15 +35,26 @@ THEME_KEYWORDS = {
 }
 
 SPORTS_KEYWORDS = [
+    # Match patterns
     "vs.", "vs ", "spread:", "o/u ", "over/under", "moneyline",
-    "winner", "win on 2026", "win on 2025", "nba", "nfl", "mlb", "nhl",
-    "ncaa", "premier league", "la liga", "serie a", "bundesliga",
-    "champions league", "ufc", "mma", "boxing", "tennis",
-    "miami open", "round of", "semifinal", "final",
-    "counter-strike", "dota", "league of legends", "valorant",
-    "panthers", "razorbacks", "hawkeyes", "gators", "wildcats",
+    "win on 2026", "win on 2025", "win the 2026", "win the 2025",
+    # Leagues
+    "nba", "nfl", "mlb", "nhl", "ncaa", "mls", "pga", "atp", "wta",
+    "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+    "champions league", "europa league",
+    "ufc", "mma", "boxing", "tennis", "golf", "masters tournament",
+    "miami open", "french open", "wimbledon", "us open",
+    "round of", "semifinal", "quarterfinal",
+    # Esports
+    "counter-strike", "dota", "league of legends", "valorant", "blast open",
+    # Teams / athletes
+    "panthers", "razorbacks", "hawkeyes", "gators", "wildcats", "wolverines",
     "bulldogs", "tigers", "eagles", "bears", "lakers", "celtics",
     "warriors", "nets", "yankees", "dodgers", "chiefs", "49ers",
+    "timberwolves", "raptors", "blue jackets", "islanders",
+    "feyenoord", "manchester city", "real madrid", "atletico",
+    "san diego fc", "lazio",
+    "scheffler", "berrettini", "djokovic", "nadal", "sinner",
 ]
 
 
