@@ -745,10 +745,12 @@ async def main():
                         p_ml = ml_result.get("p_yes")
                         sig["p_ml"] = p_ml
                         sig["p_mispriced"] = ml_result.get("p_mispriced", 0)
-                        # Blend ML into p_final: 80% math + 20% ML
+                        # Blend ML into p_final: 90% math + 10% ML, cap ±5% shift
                         if p_ml is not None:
                             old_final = sig["p_final"]
-                            sig["p_final"] = round(old_final * 0.8 + p_ml * 0.2, 4)
+                            blended = round(old_final * 0.9 + p_ml * 0.1, 4)
+                            max_ml_shift = 0.05
+                            sig["p_final"] = max(old_final - max_ml_shift, min(old_final + max_ml_shift, blended))
                             # Recalculate EV and Kelly with updated p_final
                             from agents.math_engine import expected_value, kelly_fraction
                             sig["ev"] = expected_value(
