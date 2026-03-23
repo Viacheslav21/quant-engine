@@ -213,14 +213,14 @@ class MathEngine:
             p_final = self.calibrator.adjust(p_final)
 
         # Adaptive drift cap: more evidence = wider cap
-        # 0-1 sources: ±8%, 2-3: ±12%, 4+: ±18%
+        # 0-1 sources: ±12%, 2-3: ±18%, 4+: ±25%
         n_evidence = len(active_evidence)
         if n_evidence <= 1:
-            max_drift = 0.08
-        elif n_evidence <= 3:
             max_drift = 0.12
-        else:
+        elif n_evidence <= 3:
             max_drift = 0.18
+        else:
+            max_drift = 0.25
         if p_final > p_market + max_drift:
             p_final = p_market + max_drift
         elif p_final < p_market - max_drift:
@@ -395,15 +395,15 @@ class MathEngine:
         Returns (p_contrarian, confidence) or (None, 0) if no signal."""
         # Use long price cache for detection (30 min of data)
         long_hist = self._long_price_cache.get(market_id, [])
-        if len(long_hist) < 18:  # need ~3 min minimum history
+        if len(long_hist) < 10:  # need ~2 min minimum history
             return None, 0
 
         # Price 30 min ago (or oldest available)
         old_price = long_hist[0]
         move = current_price - old_price
 
-        # Need >8% absolute move
-        if abs(move) < 0.08:
+        # Need >5% absolute move
+        if abs(move) < 0.05:
             return None, 0
 
         # Check volume ratio from _vol_history
@@ -440,7 +440,7 @@ class MathEngine:
 
         # Shift probability toward EWMA (reversion target)
         # Blend: current price shifted toward EWMA, weighted by confidence
-        p_contrarian = current_price + (ewma - current_price) * confidence * 0.5
+        p_contrarian = current_price + (ewma - current_price) * confidence * 0.7
         p_contrarian = round(max(0.02, min(0.98, p_contrarian)), 4)
 
         return p_contrarian, confidence

@@ -18,7 +18,6 @@ from utils.db             import Database
 from utils.telegram       import TelegramBot
 from engine.scanner       import PolymarketScanner
 from engine.ws_client     import PolymarketWS
-from agents.news_monitor  import NewsMonitor
 from agents.math_engine   import MathEngine
 from agents.history_agent import HistoryAgent
 from ml.calibrator        import Calibrator
@@ -40,19 +39,17 @@ CONFIG = {
     "BANKROLL":         float(os.getenv("BANKROLL", "1000")),
     "SIMULATION":       os.getenv("SIMULATION", "true").lower() == "true",
     "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "300")),
-    "NEWS_INTERVAL":    int(os.getenv("NEWS_INTERVAL", "30")),
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
-    "MIN_EV":           float(os.getenv("MIN_EV", "0.12")),
-    "MIN_KL":           float(os.getenv("MIN_KL", "0.10")),
+    "MIN_EV":           float(os.getenv("MIN_EV", "0.08")),
+    "MIN_KL":           float(os.getenv("MIN_KL", "0.05")),
     "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.01")),
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
-    "CLAUDE_EV_THR":    float(os.getenv("CLAUDE_EV_THR", "0.20")),
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.20")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.30")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
-    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.08")),
+    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.05")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v3"),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
@@ -74,8 +71,9 @@ async def claude_confirm(signal: dict, config: dict, db=None) -> dict:
     import re, json
     client = _get_claude_client(config)
     use_web = config.get("CLAUDE_WEB_SEARCH", False)
-    SYSTEM = f"""Prediction market analyst. Confirm or reject signal{' — search web for latest news first' if use_web else ' based on your knowledge'}.
-If theme has losing record, be more skeptical. Return ONLY:
+    SYSTEM = f"""Prediction market analyst. Evaluate if our probability estimate is more accurate than market price{' — search web for latest news first' if use_web else ''}.
+Confirm unless you have SPECIFIC evidence the market price is correct and our estimate is wrong. Math model has already filtered for edge.
+If theme has losing record, slightly reduce p_claude but still confirm if logic is sound. Return ONLY:
 <json>{{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}}</json>"""
 
     # Build compact track record
@@ -125,7 +123,7 @@ If theme has losing record, be more skeptical. Return ONLY:
             return json.loads(match.group(1).strip())
     except Exception as e:
         log.warning(f"[CLAUDE] {e}")
-    return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0, "reasoning": "api_error"}
+    return {"confirm": True, "p_claude": signal["p_final"], "confidence": 0.3, "reasoning": "api_error_passthrough"}
 
 async def bootstrap_history(db: Database, scanner: PolymarketScanner):
     """Load historical closed markets from Polymarket for training. Skips if already done."""
@@ -538,7 +536,6 @@ async def main():
     await db.init()
     telegram   = TelegramBot(CONFIG["TELEGRAM_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
     scanner    = PolymarketScanner(CONFIG)
-    news_mon   = NewsMonitor(db)
     calibrator = Calibrator(db)
     math_eng   = MathEngine(CONFIG, db, calibrator)
     history    = HistoryAgent(db, calibrator)
@@ -584,8 +581,8 @@ async def main():
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
         f"💼 ${CONFIG['BANKROLL']} | {'Симуляция 🧪' if CONFIG['SIMULATION'] else 'Реальный 💰'}\n"
-        f"🔢 Math-first | Claude только EV>{CONFIG['CLAUDE_EV_THR']*100:.0f}%\n"
-        f"📰 News Monitor | 🧠 Self-learning | ⚡ PostgreSQL\n"
+        f"🔢 Math-first | No Claude confirmation\n"
+        f"🧠 Self-learning | ⚡ PostgreSQL\n"
         f"🔌 WebSocket position monitoring enabled"
     )
 
@@ -628,7 +625,7 @@ async def main():
     # Start WS in background
     ws_task = asyncio.create_task(ws.connect())
 
-    last_news = last_history = last_metrics_save = 0
+    last_history = last_metrics_save = 0
     METRICS_SAVE_INTERVAL = 300
     scan_count = 0
     _market_price_cache = {}
@@ -643,10 +640,6 @@ async def main():
         log.info(f"[MAIN] Restored {len(saved_metrics)} market caches, {len(_signal_cooldown)} cooldowns from DB")
     except Exception as e:
         log.warning(f"[MAIN] Could not restore metrics: {e}")
-    claude_cache = {}
-    CLAUDE_CACHE_TTL = 3600       # cache 1 hour (was 30 min)
-    last_claude_call = 0
-    CLAUDE_MIN_INTERVAL = 300     # max 1 call per 5 min (was 1/min)
     daily_report_sent = None
     peak_equity = CONFIG["BANKROLL"]  # track peak equity for drawdown
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.25"))  # 25% from peak → stop
@@ -725,31 +718,13 @@ async def main():
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
                 continue
 
-            news_signals = []
-            if now - last_news >= CONFIG["NEWS_INTERVAL"]:
-                last_news = now
-                new_news = await news_mon.scan()
-                for item in new_news:
-                    relevant = await news_mon.find_relevant_markets(item, markets)
-                    for m in relevant:
-                        sig = math_eng.analyze(m)
-                        if sig:
-                            sig["source"] = "news"
-                            sig["news_trigger"] = item["title"][:200]
-                            news_signals.append(sig)
-
-            news_market_ids = {s["market_id"] for s in news_signals}
             math_signals = []
             for m in markets:
-                if m["id"] in news_market_ids:
-                    continue
                 sig = math_eng.analyze(m)
                 if sig:
                     math_signals.append(sig)
 
             all_signals = {s["market_id"]: s for s in math_signals}
-            for s in news_signals:
-                all_signals[s["market_id"]] = s
 
             SIGNAL_COOLDOWN = 300
             _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
@@ -784,51 +759,11 @@ async def main():
                                 sig["side_price"])
                             log.info(f"[ML] {sig['market_id'][:8]} p_ml={p_ml:.2f} p_final:{old_final:.2f}→{sig['p_final']:.2f} EV:{sig['ev']*100:+.1f}%")
 
-            claude_cache = {k: v for k, v in claude_cache.items() if now - v[0] < CLAUDE_CACHE_TTL}
-
-            confirmed = []
-            CLAUDE_SKIP_THR = 0.20  # EV > 20% = strong enough, skip Claude
-            can_call_claude = (now - last_claude_call) >= CLAUDE_MIN_INTERVAL
-            for sig in signals[:3]:
-                if sig["ev"] >= CLAUDE_SKIP_THR:
-                    # Strong signal — pass without Claude
-                    confirmed.append(sig)
-                    log.info(f"[MATH] Auto-confirmed EV:{sig['ev']*100:.0f}% >= {CLAUDE_SKIP_THR*100:.0f}%: {sig['question'][:50]}")
-                    continue
-                if sig["ev"] >= CONFIG["CLAUDE_EV_THR"]:
-                    cached = claude_cache.get(sig["market_id"])
-                    if cached:
-                        cache_time, result, cache_price = cached[0], cached[1], cached[2] if len(cached) > 2 else sig["p_market"]
-                        # Invalidate if price moved >5% since cache
-                        if abs(sig["p_market"] - cache_price) > 0.05:
-                            cached = None
-                            log.info(f"[CLAUDE] Cache invalidated for {sig['market_id'][:8]}: price moved {cache_price:.2f}→{sig['p_market']:.2f}")
-                    if cached:
-                        result = cached[1]
-                        log.debug(f"[CLAUDE] Cache hit for {sig['market_id'][:8]}")
-                    elif can_call_claude:
-                        result = await claude_confirm(sig, CONFIG, db)
-                        claude_cache[sig["market_id"]] = (now, result, sig["p_market"])
-                        last_claude_call = now
-                        can_call_claude = False
-                    else:
-                        confirmed.append(sig)
-                        continue
-                    if result.get("confirm"):
-                        sig["p_claude"] = result.get("p_claude", sig["p_final"])
-                        blended = sig["p_final"] * 0.6 + sig["p_claude"] * 0.4
-                        max_drift = 0.15
-                        sig["p_final"] = max(sig["p_market"] - max_drift, min(sig["p_market"] + max_drift, blended))
-                        sig["source"] = "claude"
-                        confirmed.append(sig)
-                        log.info(f"[CLAUDE] ✅ {sig['question'][:50]}")
-                    else:
-                        log.info(f"[CLAUDE] ❌ {sig['question'][:50]}")
-                else:
-                    confirmed.append(sig)
+            # All signals that pass math filters are confirmed directly
+            confirmed = signals[:5]
 
             mmap = {m["id"]: m for m in markets}
-            for sig in confirmed[:3]:
+            for sig in confirmed[:5]:
                 sig_id = f"sig_{sig['market_id'][:8]}_{int(now)}"
                 await db.save_signal({
                     "id":          sig_id,

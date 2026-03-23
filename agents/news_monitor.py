@@ -124,18 +124,27 @@ class NewsMonitor:
             })
         return items
 
-    async def find_relevant_markets(self, news_item: dict, markets: list) -> list:
+    async def find_relevant_markets(self, news_item: dict, markets: list, max_matches: int = 5) -> list:
         theme    = news_item["theme"]
         keywords = news_item.get("keywords", [])
-        relevant = []
+        # Filter to specific keywords (3+ chars) to avoid generic matches like "war"
+        specific_kw = [kw for kw in keywords if len(kw) >= 4]
+        scored = []
         for market in markets:
             m_text       = market["question"].lower()
             theme_match  = market.get("theme") == theme
-            kw_match     = any(kw in m_text for kw in keywords)
-            if not (theme_match or kw_match): continue
+            # Require BOTH theme match AND at least one keyword in market question
+            kw_hits      = sum(1 for kw in specific_kw if kw in m_text)
+            if not (theme_match and kw_hits >= 1):
+                continue
+            scored.append((kw_hits, market))
+        # Sort by relevance (more keyword hits = better match), take top N
+        scored.sort(key=lambda x: x[0], reverse=True)
+        relevant = []
+        for kw_hits, market in scored[:max_matches]:
             price_unchanged = await self._price_unchanged(market["id"])
             if price_unchanged:
-                log.info(f"[NEWS] Match: '{news_item['title'][:60]}' → '{market['question'][:60]}'")
+                log.info(f"[NEWS] Match ({kw_hits}kw): '{news_item['title'][:60]}' → '{market['question'][:60]}'")
                 relevant.append({
                     **market,
                     "news_sentiment": news_item["sentiment"],
