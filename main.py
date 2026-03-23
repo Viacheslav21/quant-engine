@@ -730,10 +730,14 @@ async def main():
             _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
             all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
 
-            signals = sorted(all_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
+            # Filter out markets where we already have an open position
+            open_market_ids = {p["market_id"] for p in await db.get_open_positions()}
+            new_signals = {k: v for k, v in all_signals.items() if k not in open_market_ids}
+
+            signals = sorted(new_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
 
             if signals:
-                log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(signals)} сигналов")
+                log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(all_signals)} сигналов | {len(signals)} новых")
 
             # ML enrichment: blend p_ml into p_final for top signals
             mmap_for_ml = {m["id"]: m for m in markets}
