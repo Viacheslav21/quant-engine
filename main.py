@@ -259,7 +259,8 @@ Reply in English, max 500 words. Use plain text (no markdown).""",
         log.warning(f"[ANALYSIS] Sonnet call failed: {e}")
         return ""
 
-MAX_PER_THEME = 5  # no more than 5 positions in the same theme
+MAX_PER_THEME = 10  # no more than 10 positions in the same theme
+MAX_PER_OTHER = 10  # "other" theme gets same limit
 
 DISPLACE_MIN_EV = 0.25  # new signal must have EV > 25% to displace
 
@@ -316,9 +317,11 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                          scanner: PolymarketScanner = None, math_eng: MathEngine = None):
     open_pos = await db.get_open_positions()
     if any(p["market_id"] == signal["market_id"] for p in open_pos): return False
-    theme_count = sum(1 for p in open_pos if p.get("theme") == signal.get("theme"))
-    if theme_count >= MAX_PER_THEME:
-        log.info(f"[EXEC] Skipped: theme '{signal.get('theme')}' already has {theme_count} positions")
+    theme = signal.get("theme", "other")
+    theme_count = sum(1 for p in open_pos if p.get("theme") == theme)
+    theme_limit = MAX_PER_OTHER if theme == "other" else MAX_PER_THEME
+    if theme_count >= theme_limit:
+        log.info(f"[EXEC] Skipped: theme '{theme}' already has {theme_count}/{theme_limit} positions")
         return False
 
     # If full, try to displace worst position

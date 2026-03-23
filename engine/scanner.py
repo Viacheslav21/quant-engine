@@ -19,42 +19,125 @@ def _parse_token_ids(m: dict) -> tuple:
     return yes_token, no_token
 
 THEME_KEYWORDS = {
-    "iran":     ["iran","iranian","tehran","nuclear iran","iaea"],
-    "oil":      ["oil","opec","crude","brent","wti","petroleum"],
-    "war":      ["war","attack","strike","invasion","missile","nuclear"],
-    "peace":    ["ceasefire","peace","deal","agreement","surrender"],
-    "ukraine":  ["ukraine","zelensky","donbas","crimea"],
-    "russia":   ["russia","putin","kremlin","moscow"],
-    "crypto":   ["bitcoin","btc","crypto","ethereum","blockchain"],
-    "fed":      ["federal reserve","powell","rate","inflation","cpi"],
-    "china":    ["china","taiwan","beijing","xi jinping"],
-    "trump":    ["trump","executive order","tariff","maga"],
-    "gold":     ["gold","xau","precious metal"],
-    "election": ["election","vote","president","congress","senate"],
-    "israel":   ["israel","hamas","gaza","hezbollah","netanyahu"],
+    # Geopolitics & conflicts
+    "iran":       ["iran","iranian","tehran","nuclear iran","iaea","persian gulf","strait of hormuz"],
+    "israel":     ["israel","hamas","gaza","hezbollah","netanyahu","idf","west bank","golan"],
+    "ukraine":    ["ukraine","zelensky","donbas","crimea","kherson","zaporizhzhia"],
+    "russia":     ["russia","putin","kremlin","moscow","wagner","navalny"],
+    "china":      ["china","taiwan","beijing","xi jinping","south china sea","ccp","uyghur"],
+    "war":        ["war","attack","strike","invasion","missile","nuclear","military","troops","bomb","drone"],
+    "peace":      ["ceasefire","peace","deal","agreement","surrender","truce","negotiations","treaty"],
+    "nkorea":     ["north korea","pyongyang","kim jong"],
+    "india":      ["india","modi","kashmir","delhi","mumbai"],
+    "pakistan":    ["pakistan","islamabad","afghanistan","taliban"],
+    "yemen":      ["yemen","houthi","aden","sanaa"],
+    "syria":      ["syria","assad","damascus"],
+
+    # US Politics
+    "trump":      ["trump","executive order","tariff","maga","mar-a-lago","trump approval","trumps"],
+    "biden":      ["biden","white house","kamala","harris"],
+    "congress":   ["congress","senate","house of representatives","speaker","filibuster","debt ceiling"],
+    "scotus":     ["supreme court","scotus","justice","roe","constitutional"],
+    "usgov":      ["doge","government shutdown","federal budget","pentagon","cia","fbi","doj","attorney general",
+                   "secretary of state","cabinet","impeach","pardon","classified"],
+    "election":   ["election","vote","president","referendum","governor","mayor","minister","parliament",
+                   "primary","caucus","midterm","ballot","polling","swing state","electoral"],
+
+    # Commodities & markets
+    "oil":        ["oil","opec","crude","brent","wti","petroleum","natural gas","lng"],
+    "gold":       ["gold","xau","precious metal","silver","platinum","palladium"],
+    "crypto":     ["bitcoin","btc","crypto","ethereum","eth","solana","sol","dogecoin","doge","xrp",
+                   "ripple","cardano","polkadot","avalanche","chainlink","defi","nft","stablecoin",
+                   "binance","coinbase","memecoin","altcoin","halving"],
+    "stocks":     ["s&p","sp500","spx","nasdaq","dow jones","russell","stock market","ipo","earnings",
+                   "market cap","fdv","bull market","bear market"],
+
+    # Economy & macro
+    "fed":        ["federal reserve","powell","rate cut","rate hike","inflation","cpi","pce",
+                   "interest rate","fomc","quantitative","monetary policy","tapering"],
+    "economy":    ["gdp","unemployment","jobs","recession","nonfarm","payroll","consumer spending",
+                   "retail sales","housing","mortgage","debt","deficit","trade balance"],
+
+    # Tech & science
+    "tech":       ["ai ","artificial intelligence","openai","anthropic","google","apple","nvidia",
+                   "tesla","microsoft","meta","amazon","semiconductor","chip","quantum","robotics"],
+    "space":      ["nasa","spacex","rocket","satellite","mars","moon","orbit","launch","starship",
+                   "blue origin","artemis","iss"],
+    "social":     ["elon musk","musk","tweet","twitter","x.com","post","followers","tiktok",
+                   "instagram","youtube","subscribers","views","downloads"],
+
+    # Society
+    "health":     ["covid","pandemic","vaccine","fda","who ","health","disease","outbreak",
+                   "bird flu","h5n1","monkeypox","drug","pharma","approval"],
+    "climate":    ["climate","hurricane","earthquake","wildfire","flood","weather","tornado",
+                   "drought","emissions","carbon","paris agreement","cop2"],
+    "legal":      ["court","ruling","lawsuit","indictment","trial","verdict","conviction",
+                   "acquittal","sentence","extradition","arrest","charged"],
+    "film":       ["box office","movie","film","oscar","academy award","opening weekend",
+                   "grammy","emmy","golden globe","netflix","disney","streaming"],
+
+    # Regions
+    "europe":     ["eu ","european","macron","scholz","starmer","brexit","nato","ecb",
+                   "germany","france","uk ","britain","italy","spain","poland","european council"],
+    "latam":      ["brazil","lula","mexico","amlo","argentina","milei","venezuela","maduro",
+                   "colombia","peru","chile","bolivia","ecuador","cuba"],
+    "africa":     ["africa","nigeria","south africa","kenya","ethiopia","egypt","morocco","sahel"],
+    "mideast":    ["saudi","mbs","qatar","uae","emirates","bahrain","oman","iraq","baghdad","kurdish"],
+
+    # Other categories
+    "sports_off": ["world cup","olympics","fifa","ioc"],  # non-betting sports events
+    "culture":    ["pope","vatican","royal family","king charles","queen","celebrity","scandal"],
+    "education":  ["university","college","student","tuition","scholarship"],
+    "transport":  ["boeing","airbus","airline","aviation","faa","shipping","port","suez"],
 }
 
 SPORTS_KEYWORDS = [
     # Match patterns
     "vs.", "vs ", "spread:", "o/u ", "over/under", "moneyline",
     "win on 2026", "win on 2025", "win the 2026", "win the 2025",
-    # Leagues
-    "nba", "nfl", "mlb", "nhl", "ncaa", "mls", "pga", "atp", "wta",
-    "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
-    "champions league", "europa league",
-    "ufc", "mma", "boxing", "tennis", "golf", "masters tournament",
-    "miami open", "french open", "wimbledon", "us open",
-    "round of", "semifinal", "quarterfinal",
+    "points scored", "map handicap", "map winner", "game winner",
+    "total goals", "total points", "total runs", "total sets",
+    # Leagues & sports
+    "nba", "nfl", "mlb", "nhl", "ncaa", "mls", "pga", "atp", "wta", "lpga",
+    "premier league", "la liga", "serie a", "bundesliga", "ligue 1", "eredivisie",
+    "champions league", "europa league", "conference league",
+    "ufc", "mma", "boxing", "tennis", "golf", "cricket", "rugby", "f1 ",
+    "formula 1", "nascar", "indycar", "tour de france", "grand prix",
+    "masters tournament", "the open", "pga championship", "ryder cup",
+    "miami open", "french open", "wimbledon", "us open", "australian open",
+    "roland garros", "indian wells",
+    "round of 16", "round of 32", "round of 64", "semifinal", "quarterfinal",
+    "sweet 16", "elite eight", "final four",
+    "world series", "super bowl", "stanley cup", "nba finals",
     # Esports
     "counter-strike", "dota", "league of legends", "valorant", "blast open",
-    # Teams / athletes
+    "esl ", "iem ", "major ", "bo1", "bo3", "bo5",
+    "faze", "navi", "g2 esports", "team liquid", "fnatic", "vitality",
+    "t1 ", "gen.g", "cloud9",
+    # Football (soccer) teams
+    "feyenoord", "manchester city", "manchester united", "real madrid",
+    "barcelona", "atletico", "bayern", "psg", "juventus", "inter milan",
+    "ac milan", "napoli", "liverpool", "arsenal", "chelsea", "tottenham",
+    "borussia", "roma", "lazio", "benfica", "porto", "ajax",
+    "olympique", "nottingham", "midtjylland", "san diego fc",
+    # US college / pro teams
     "panthers", "razorbacks", "hawkeyes", "gators", "wildcats", "wolverines",
     "bulldogs", "tigers", "eagles", "bears", "lakers", "celtics",
     "warriors", "nets", "yankees", "dodgers", "chiefs", "49ers",
-    "timberwolves", "raptors", "blue jackets", "islanders",
-    "feyenoord", "manchester city", "real madrid", "atletico",
-    "san diego fc", "lazio",
-    "scheffler", "berrettini", "djokovic", "nadal", "sinner",
+    "timberwolves", "raptors", "blue jackets", "islanders", "bruins",
+    "canadiens", "penguins", "capitals", "rangers", "red wings",
+    "packers", "cowboys", "patriots", "steelers", "ravens",
+    "red sox", "mets", "cubs", "astros", "braves",
+    "duke", "gonzaga", "kentucky", "villanova", "baylor",
+    "michigan", "arizona", "houston", "marquette", "purdue",
+    "st. john", "northern iowa", "high point",
+    # Athletes
+    "scheffler", "berrettini", "djokovic", "nadal", "sinner", "alcaraz",
+    "swiatek", "gauff", "medvedev", "zverev", "rublev", "tsitsipas",
+    "lebron", "curry", "durant", "giannis", "jokic", "luka",
+    "mahomes", "allen", "lamar", "ohtani", "judge",
+    "verstappen", "hamilton", "leclerc", "norris",
+    "mcilroy", "koepka", "rahm", "hovland", "morikawa",
 ]
 
 
