@@ -283,7 +283,7 @@ class MathEngine:
             "theme":      theme,
             "url":        market.get("url",""),
             "side":       side,
-            "side_price": price_side,
+            "side_price": real_price,  # bestAsk for YES, mid-price for NO
             "p_market":   p_market,
             "p_prospect": p_prospect,
             "p_history":  p_history,
@@ -322,7 +322,8 @@ class MathEngine:
     def _apply_history(self, p_market: float, theme: str) -> Optional[float]:
         pat = self._patterns.get(theme)
         if not pat or pat.get("sample_size",0) < MIN_BETS_HISTORY: return None
-        p_hist = 0.7 * pat["base_rate"] * pat.get("prospect_factor",1.0) + 0.3 * p_market
+        adjusted_rate = min(0.95, max(0.05, pat["base_rate"] * pat.get("prospect_factor", 1.0)))
+        p_hist = 0.7 * adjusted_rate + 0.3 * p_market
         return round(max(0.02, min(0.98, p_hist)), 4)
 
     def _volume_signal(self, market_id: str, volume_24h: float) -> tuple:
@@ -336,7 +337,12 @@ class MathEngine:
         if avg <= 0: return 1.0, "neutral"
         ratio = volume_24h / avg
         if ratio > VOLUME_SPIKE_THR:
-            direction = "up" if volume_24h > avg * 1.2 else "down"
+            # Use price momentum to determine spike direction (volume alone is always "up" here)
+            price_hist = self._price_cache.get(market_id, [])
+            if len(price_hist) >= 3:
+                direction = "up" if price_hist[-1] > price_hist[-3] else "down"
+            else:
+                direction = "up"  # default to bullish if no price history
             log.info(f"[MATH] Volume spike {market_id[:8]}: {ratio:.1f}x avg → {direction}")
             return ratio, direction
         return ratio, "neutral"
@@ -359,9 +365,11 @@ class MathEngine:
         # Smooth decay: blend market → prospect as time increases
         # Near expiry: trust market price more (it's converging to truth)
         # Far from expiry: prospect theory has more room to add value
+        # Near expiry (decay→0): trust market price. Far (decay→1): slightly away from market.
+        # Don't re-apply prospect here — it's already the Bayesian prior.
         decay = min(1.0, max(0.0, (days_left - 3) / 30))
-        prospect = prospect_true_price(p_market) if self.config.get("USE_PROSPECT", True) else p_market
-        p_time = p_market * (1 - decay) + prospect * decay
+        # Use 0.5 as neutral anchor: far from expiry → market price is less reliable
+        p_time = p_market * (1 - decay * 0.3) + 0.5 * (decay * 0.3)
         # Only return if meaningfully different from market price
         if abs(p_time - p_market) < 0.005:
             return None
@@ -573,6 +581,8 @@ class MathEngine:
     def compute_stake(self, bankroll: float, kelly: float, theme: str = None,
                        open_positions: list = None, liquidity: float = 0) -> float:
         """Compute stake with portfolio concentration and liquidity penalties."""
+        if bankroll <= 0:
+            return 0.0
         stake = bankroll * kelly
         stake = min(stake, bankroll * self.config["MAX_KELLY_FRAC"])
 

@@ -59,6 +59,7 @@ CONFIG = {
 }
 
 _claude_client = None
+_shutdown_flag = False
 
 def _get_claude_client(config: dict):
     global _claude_client
@@ -194,69 +195,6 @@ async def bootstrap_history(db: Database, scanner: PolymarketScanner):
 
     log.info(f"[BOOTSTRAP] Loaded {total} historical markets for training")
 
-async def daily_ai_analysis(db: Database, config: dict) -> str:
-    """Once-daily Sonnet analysis of trading performance with recommendations."""
-    client = _get_claude_client(config)
-    data = await db.get_analytics()
-    stats = await db.get_stats()
-    open_pos = await db.get_open_positions()
-    start = float(os.getenv("BANKROLL", "1000"))
-
-    summary = (
-        f"=== QUANT ENGINE DAILY STATS ===\n"
-        f"Bankroll: ${stats['bankroll']:.2f} (start: ${start:.0f}, ROI: {(stats['bankroll']-start)/start*100:+.1f}%)\n"
-        f"P&L: ${stats['total_pnl']:+.2f} | WR: {stats['wins']}W/{stats['losses']}L\n"
-        f"Open positions: {len(open_pos)} | Avg EV: {stats['avg_ev']*100:.1f}% | Avg Kelly: {stats['avg_kelly']*100:.1f}%\n\n"
-        f"=== WIN RATE BY THEME ===\n"
-    )
-    for r in data["by_theme"]:
-        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
-        summary += f"  {r['theme']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
-
-    summary += f"\n=== WIN RATE BY SOURCE ===\n"
-    for r in data["by_source"]:
-        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
-        summary += f"  {r['source']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
-
-    summary += f"\n=== WIN RATE BY SIDE ===\n"
-    for r in data["by_side"]:
-        wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
-        summary += f"  {r['side']}: {r['wins']}/{r['total']} ({wr}%) avg_pnl={float(r['avg_pnl']):+.2f}\n"
-
-    summary += f"\n=== CALIBRATION ===\n"
-    for r in data["calibration"]:
-        summary += f"  {r['bucket']}: {r['total']} trades, predicted={float(r['avg_predicted'])*100:.1f}%, actual={float(r['actual_wr'])*100:.1f}%\n"
-
-    summary += (
-        f"\n=== EV ACCURACY ===\n"
-        f"  Predicted EV: +{data['ev_predicted']*100:.1f}% | Actual return: {data['ev_actual']*100:+.1f}%\n"
-        f"  Avg position lifetime: {data['avg_lifetime_hours']:.1f}h\n"
-        f"\n=== CLOSE REASONS ===\n"
-    )
-    for r in data["by_reason"]:
-        summary += f"  {r['reason']}: {r['total']} trades, avg_pnl={float(r['avg_pnl']):+.2f}\n"
-
-    summary += (
-        f"\n=== CONFIG ===\n"
-        f"  MIN_EV={config['MIN_EV']} MIN_KL={config['MIN_KL']} MAX_KELLY_FRAC={config['MAX_KELLY_FRAC']}\n"
-        f"  TAKE_PROFIT={config['TAKE_PROFIT_PCT']} STOP_LOSS={config['STOP_LOSS_PCT']}\n"
-        f"  MAX_DRIFT=0.15 Kelly_fraction=0.15\n"
-    )
-
-    try:
-        r = await client.messages.create(
-            model="claude-sonnet-4-5", max_tokens=800,
-            system="""You are a quantitative trading analyst reviewing a prediction market bot's performance.
-Give specific, actionable recommendations. Be direct and concise.
-Focus on: what's working, what's not, config changes to suggest (with specific numbers), and risks.
-Reply in English, max 500 words. Use plain text (no markdown).""",
-            messages=[{"role": "user", "content": summary}],
-        )
-        return "".join(b.text for b in r.content if hasattr(b, "text"))
-    except Exception as e:
-        log.warning(f"[ANALYSIS] Sonnet call failed: {e}")
-        return ""
-
 MAX_PER_THEME = 10  # no more than 10 positions in the same theme
 MAX_PER_OTHER = 10  # "other" theme gets same limit
 
@@ -295,15 +233,19 @@ async def _find_displaceable(open_pos: list, signal: dict, scanner: PolymarketSc
 
     return None
 
-async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot):
-    """Close a position to make room for a better signal."""
+async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot) -> bool:
+    """Close a position to make room for a better signal. Returns False if already closed."""
+    # current_price in DB is already side price (written by update_position_price)
     price = pos.get("current_price", pos["side_price"])
     pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
     payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
     pnl = round(payout - pos["stake_amt"], 2)
     outcome = f"{pos['side']}@{price*100:.0f}¢"
 
-    await db.close_position(pos["id"], outcome, payout, pnl)
+    actually_closed = await db.close_position(pos["id"], outcome, payout, pnl)
+    if not actually_closed:
+        log.warning(f"[DISPLACE] Position {pos['id']} already closed, skipping")
+        return False
     log.info(f"[DISPLACE] Closed {pos['id']} PnL:{pnl:+.2f} to make room")
     await db.log_event("DISPLACEMENT",
         market_id=pos["market_id"], position_id=pos["id"],
@@ -318,6 +260,7 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
         f"❓ {pos['question'][:120]}\n"
         f"💰 P&L:<b>{pnl:+.2f}$</b> → Freed slot for better signal"
     )
+    return True
 
 async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict,
                          scanner: PolymarketScanner = None, math_eng: MathEngine = None):
@@ -349,7 +292,11 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
             await db.log_event("SIGNAL_REJECTED", **_rej_base, open_positions=len(open_pos),
                                details={"reason": "no_displaceable_position"})
             return False
-        await _close_for_displacement(displace, db, telegram)
+        displaced = await _close_for_displacement(displace, db, telegram)
+        if not displaced:
+            await db.log_event("SIGNAL_REJECTED", **_rej_base, open_positions=len(open_pos),
+                               details={"reason": "displacement_failed_race"})
+            return False
     stats    = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
     if math_eng is None:
@@ -450,12 +397,18 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
     tp_pct = pos.get("tp_pct") or config["TAKE_PROFIT_PCT"]
     sl_pct = pos.get("sl_pct") or config["STOP_LOSS_PCT"]
 
-    # 1. Market resolved
-    is_resolved = is_closed or yes_price >= 0.95 or yes_price <= 0.05
+    # 1. Market resolved — only trust API is_closed flag, or extreme prices (99/1)
+    # Using 95/5 caused false resolutions on price spikes with inflated binary payout
+    is_resolved = is_closed or yes_price >= 0.99 or yes_price <= 0.01
     if is_resolved:
         outcome = "YES" if yes_price >= 0.50 else "NO"
         won = outcome == pos["side"]
-        payout = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
+        if is_closed:
+            # API confirmed resolution — use binary payout
+            payout = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
+        else:
+            # Price-based detection (99/1) — use linear payout as safety
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
         pnl = round(payout - pos["stake_amt"], 2)
         close_reason = "RESOLVED"
 
@@ -490,8 +443,10 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         outcome = f"{pos['side']}@{price*100:.0f}¢"
     # Write final price to DB before closing
     await db.update_position_price(pos["id"], price, upnl)
-    await db.close_position(pos["id"], outcome, payout, pnl)
-    trailing_highs.pop(pos["id"], None)
+    actually_closed = await db.close_position(pos["id"], outcome, payout, pnl)
+    if not actually_closed:
+        return False  # already closed by concurrent WS/REST race
+    _peak_pnl = trailing_highs.pop(pos["id"], None)
     _last_db_price_update.pop(pos["id"], None)
 
     # Unsubscribe from WS after closing
@@ -514,7 +469,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         tp_pct=tp_pct, sl_pct=sl_pct, bankroll=stats["bankroll"],
         is_simulation=config["SIMULATION"], config_tag=pos.get("config_tag"),
         details={"outcome": outcome, "close_reason": close_reason, "current_price": price,
-                 "trailing_high": trailing_highs.get(pos["id"]),
+                 "trailing_high": _peak_pnl,
                  "win_rate": wr, "total_closed": total})
 
     reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
@@ -709,12 +664,16 @@ async def main():
     except Exception as e:
         log.warning(f"[MAIN] Could not restore metrics: {e}")
     daily_report_sent = None
-    peak_equity = CONFIG["BANKROLL"]  # track peak equity for drawdown
+    # Compute real equity at startup for accurate drawdown protection
+    _startup_stats = await db.get_stats()
+    _startup_pos = await db.get_open_positions()
+    _startup_pos_value = sum((p.get("stake_amt", 0) + (p.get("unrealized_pnl", 0) or 0)) for p in _startup_pos)
+    _startup_equity = _startup_stats["bankroll"] + _startup_pos_value
+    peak_equity = max(CONFIG["BANKROLL"], _startup_equity)  # track peak equity for drawdown
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.25"))  # 25% from peak → stop
     trading_halted = False
     halt_time = 0  # timestamp when halted
     HALT_COOLDOWN = 1800  # 30 min cooldown before resume
-
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
         try:
@@ -726,7 +685,7 @@ async def main():
         except (NotImplementedError, AttributeError):
             pass
 
-    while True:
+    while not _shutdown_flag:
         try:
             now = time.time()
             scan_count += 1
@@ -870,7 +829,6 @@ async def main():
                     "kelly":       sig["kelly"],
                     "confidence":  sig.get("edge", 0),
                     "volume_ratio":sig.get("vol_signal", 1.0),
-                    "news_trigger":sig.get("news_trigger"),
                     "source":      sig.get("source","math"),
                 })
                 _signal_cooldown[sig["market_id"]] = now
@@ -904,6 +862,8 @@ async def main():
                         log.info(f"[WS] +subscribe (new position) {sig['market_id'][:8]} {sig['side']} | {sig['question'][:60]}")
                     else:
                         log.warning(f"[WS] No tokens for new position {sig['market_id'][:8]}, REST fallback only")
+                    # Immediately add to WS position map for instant monitoring
+                    await _refresh_ws_positions()
 
             # Refresh WS position map and run REST fallback check
             await _refresh_ws_positions()
@@ -935,7 +895,14 @@ async def main():
             utc = datetime.now(timezone.utc)
             if utc.hour >= 8 and daily_report_sent != utc.date():
                 daily_report_sent = utc.date()
-                await telegram.send(await db.build_report())
+                report = await db.build_report()
+                await telegram.send(report)
+                await db.log_event("DAILY_REPORT",
+                    bankroll=stats["bankroll"], equity=equity, peak_equity=peak_equity,
+                    drawdown_pct=round(drawdown, 4), open_positions=len(open_pos),
+                    is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
+                    details={"wins": stats["wins"], "losses": stats["losses"],
+                             "total_pnl": stats["total_pnl"], "total_bets": stats["total_bets"]})
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
@@ -943,6 +910,8 @@ async def main():
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
 async def shutdown(db, telegram, scanner, ws=None):
+    global _shutdown_flag
+    _shutdown_flag = True
     log.info("🛑 Shutting down...")
     try:
         await db.log_event("SHUTDOWN", is_simulation=CONFIG.get("SIMULATION", True),

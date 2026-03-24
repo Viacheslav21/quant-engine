@@ -20,13 +20,10 @@ class Calibrator:
         preds_list, actuals_list = [], []
         for p in closed:
             outcome = p.get("outcome", "")
+            # Only use truly RESOLVED markets (exact "YES"/"NO"), not TP/SL ("YES@65c")
             if outcome == "YES":
                 actuals_list.append(1.0)
             elif outcome == "NO":
-                actuals_list.append(0.0)
-            elif outcome.startswith("YES"):
-                actuals_list.append(1.0)
-            elif outcome.startswith("NO"):
                 actuals_list.append(0.0)
             else:
                 continue
@@ -74,7 +71,7 @@ class Calibrator:
             return p_raw
         try:
             logit     = math.log(max(p_raw,0.001) / (1-min(p_raw,0.999)+1e-9))
-            logit_adj = logit * self.factor - self.bias
+            logit_adj = logit * self.factor  # factor already encodes bias correction
             return max(0.02, min(0.98, 1/(1+math.exp(-logit_adj))))
         except Exception as e:
             log.warning(f"[CALIBRATOR] adjust() failed for p_raw={p_raw}: {e}")

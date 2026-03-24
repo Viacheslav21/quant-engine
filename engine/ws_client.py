@@ -66,13 +66,16 @@ class PolymarketWS:
     async def subscribe_market(self, market_id: str, yes_token: str = None, no_token: str = None,
                                yes_price: float = 0.5, question: str = ""):
         """Register and immediately subscribe to a market's tokens."""
-        tokens = self.register_market(market_id, yes_token, no_token, yes_price, question)
-        new_tokens = [t for t in tokens if t not in self._subscribed_tokens]
-        if new_tokens:
-            self._subscribed_tokens.update(new_tokens)
-            if self.ws:
-                await self._send_subscribe(new_tokens)
-                log.info(f"[WS] Subscribed to {market_id[:8]} ({len(new_tokens)} tokens)")
+        # Check which tokens are new BEFORE register_market adds them to the set
+        new_tokens = []
+        if yes_token and yes_token not in self._subscribed_tokens:
+            new_tokens.append(yes_token)
+        if no_token and no_token not in self._subscribed_tokens:
+            new_tokens.append(no_token)
+        self.register_market(market_id, yes_token, no_token, yes_price, question)
+        if new_tokens and self.ws:
+            await self._send_subscribe(new_tokens)
+            log.info(f"[WS] Subscribed to {market_id[:8]} ({len(new_tokens)} tokens)")
 
     async def unsubscribe_market(self, market_id: str):
         """Unsubscribe from a market's tokens (e.g. when closing a position)."""
@@ -176,7 +179,7 @@ class PolymarketWS:
         elif event_type == "last_trade_price":
             await self._handle_trade(data)
         elif event_type == "book":
-            self._handle_book(data)
+            await self._handle_book(data)
 
     async def _handle_price_change(self, data: dict):
         for change in data.get("price_changes", []):
@@ -226,7 +229,7 @@ class PolymarketWS:
         if self._on_trade and size > 0:
             await self._on_trade(market_id, yes_price, size, side)
 
-    def _handle_book(self, data: dict):
+    async def _handle_book(self, data: dict):
         asset_id = data.get("asset_id")
         market_id = self._token_to_market.get(asset_id)
         if not market_id or market_id not in self.prices:
@@ -242,12 +245,16 @@ class PolymarketWS:
                 return
             mid = (best_bid + best_ask) / 2
             is_yes = self.prices[market_id].get("yes_token") == asset_id
+            old_price = self.prices[market_id].get("yes_price", 0)
             yes_price = round(mid, 4) if is_yes else round(1 - mid, 4)
             self.prices[market_id]["yes_price"] = yes_price
             self.prices[market_id]["best_bid"] = best_bid if is_yes else round(1 - best_ask, 4)
             self.prices[market_id]["best_ask"] = best_ask if is_yes else round(1 - best_bid, 4)
             self.prices[market_id]["spread"] = spread
             self.prices[market_id]["last_update"] = time.time()
+            # Trigger SL/TP check on meaningful book price changes
+            if self._on_price_change and abs(yes_price - old_price) > 0.0001:
+                await self._on_price_change(market_id, old_price, yes_price)
 
     def get_price(self, market_id: str) -> float:
         return self.prices.get(market_id, {}).get("yes_price", 0)

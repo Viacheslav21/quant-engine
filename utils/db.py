@@ -474,20 +474,27 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE positions SET current_price=$1, unrealized_pnl=$2 WHERE id=$3", price, upnl, pos_id)
 
-    async def close_position(self, pos_id: str, outcome: str, payout: float, pnl: float):
+    async def close_position(self, pos_id: str, outcome: str, payout: float, pnl: float) -> bool:
+        """Close a position. Returns False if already closed (race protection)."""
         result = "WIN" if pnl > 0 else "LOSS"
         won = result == "WIN"
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.execute("""
-                        UPDATE positions SET outcome=$1,payout=$2,pnl=$3,result=$4,status='closed',closed_at=NOW() WHERE id=$5
+                    # Only close if still open — prevents double-close from WS + REST race
+                    row = await conn.fetchrow("""
+                        UPDATE positions SET outcome=$1,payout=$2,pnl=$3,result=$4,status='closed',closed_at=NOW()
+                        WHERE id=$5 AND status='open' RETURNING id
                     """, outcome, payout, pnl, result, pos_id)
+                    if not row:
+                        log.warning(f"[DB] close_position skipped (already closed): {pos_id}")
+                        return False
                     await conn.execute("UPDATE stats SET bankroll=bankroll+$1, updated_at=NOW() WHERE id=1", payout)
                     await conn.execute("""
                         UPDATE stats SET total_pnl=total_pnl+$1, wins=wins+$2, losses=losses+$3, updated_at=NOW() WHERE id=1
                     """, pnl, 1 if won else 0, 0 if won else 1)
             log.info(f"[DB] Position closed: {pos_id} {result} pnl={pnl:+.2f} payout={payout:.2f}")
+            return True
         except Exception as e:
             log.error(f"[DB] close_position failed: {e}")
             raise
@@ -565,19 +572,82 @@ class Database:
     async def build_report(self) -> str:
         stats = await self.get_stats()
         open_ = await self.get_open_positions()
+        data = await self.get_analytics()
         start = float(os.getenv("BANKROLL","1000"))
         roi   = (stats["bankroll"] - start) / start * 100
         total = stats["wins"] + stats["losses"]
         wr    = round(stats["wins"]/total*100) if total > 0 else 0
-        return (
+
+        # Portfolio value
+        pos_value = sum((p.get("stake_amt",0) + (p.get("unrealized_pnl",0) or 0)) for p in open_)
+        equity = stats["bankroll"] + pos_value
+        upnl_total = sum((p.get("unrealized_pnl",0) or 0) for p in open_)
+
+        report = (
             f"📊 <b>ЕЖЕДНЕВНЫЙ ОТЧЁТ</b>\n\n"
             f"💼 Банкролл: <b>${stats['bankroll']:.2f}</b>\n"
+            f"💎 Equity: <b>${equity:.2f}</b>\n"
             f"📈 ROI: <b>{roi:+.2f}%</b>\n"
-            f"💰 P&L: <b>{stats['total_pnl']:+.2f}$</b>\n\n"
+            f"💰 P&L: <b>{stats['total_pnl']:+.2f}$</b>\n"
+            f"📊 Unrealized: <b>{upnl_total:+.2f}$</b>\n\n"
             f"🎯 WR:{wr}% | ✅{stats['wins']} / ❌{stats['losses']}\n"
             f"📋 Ставок:{stats['total_bets']} | Открытых:{len(open_)}\n"
-            f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}%"
+            f"⚡ Avg EV:+{stats['avg_ev']*100:.1f}% | Avg Kelly:{stats['avg_kelly']*100:.1f}%\n"
         )
+
+        # Win rate by theme
+        if data["by_theme"]:
+            report += "\n<b>📂 По темам:</b>\n"
+            for r in data["by_theme"][:8]:
+                t_wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+                report += f"  {r['theme']}: {r['wins']}/{r['total']} ({t_wr}%) pnl:{float(r['avg_pnl']):+.2f}\n"
+
+        # Win rate by side
+        if data["by_side"]:
+            report += "\n<b>📐 По сторонам:</b>\n"
+            for r in data["by_side"]:
+                s_wr = round(r['wins']/r['total']*100) if r['total'] > 0 else 0
+                report += f"  {r['side']}: {r['wins']}/{r['total']} ({s_wr}%) pnl:{float(r['avg_pnl']):+.2f}\n"
+
+        # Close reasons
+        if data["by_reason"]:
+            report += "\n<b>🔒 Причины закрытия:</b>\n"
+            for r in data["by_reason"]:
+                report += f"  {r['reason']}: {r['total']} | pnl:{float(r['avg_pnl']):+.2f}\n"
+
+        # Calibration
+        if data["calibration"]:
+            report += "\n<b>🎯 Калибровка:</b>\n"
+            for r in data["calibration"]:
+                report += f"  {r['bucket']}: {r['total']}шт pred:{float(r['avg_predicted'])*100:.0f}% act:{float(r['actual_wr'])*100:.0f}%\n"
+
+        # EV accuracy
+        report += (
+            f"\n<b>📈 Точность:</b>\n"
+            f"  EV pred:+{data['ev_predicted']*100:.1f}% | actual:{data['ev_actual']*100:+.1f}%\n"
+            f"  Avg lifetime: {data['avg_lifetime_hours']:.1f}h\n"
+        )
+
+        # Daily PnL (last 5 days)
+        if data["daily_pnl"]:
+            report += "\n<b>📅 По дням:</b>\n"
+            for r in data["daily_pnl"][:5]:
+                d_wr = round(r['wins']/r['trades']*100) if r['trades'] > 0 else 0
+                report += f"  {r['day']}: {float(r['pnl']):+.2f}$ ({r['trades']}шт, {d_wr}%WR)\n"
+
+        # Top open positions by unrealized PnL
+        if open_:
+            sorted_pos = sorted(open_, key=lambda p: p.get("unrealized_pnl",0) or 0)
+            best = sorted_pos[-1] if sorted_pos else None
+            worst = sorted_pos[0] if sorted_pos else None
+            if best and best.get("unrealized_pnl",0):
+                upnl_b = best["unrealized_pnl"]
+                report += f"\n🟢 Best: {best['question'][:60]} <b>{upnl_b:+.2f}$</b>\n"
+            if worst and worst.get("unrealized_pnl",0) and worst != best:
+                upnl_w = worst["unrealized_pnl"]
+                report += f"🔴 Worst: {worst['question'][:60]} <b>{upnl_w:+.2f}$</b>\n"
+
+        return report
 
     async def save_config_snapshot(self, tag: str, config: dict):
         """Save config params for A/B tracking. Skips if tag already exists."""
