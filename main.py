@@ -255,10 +255,13 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
         ev=pos.get("ev"), kelly=pos.get("kelly"),
         tp_pct=pos.get("tp_pct"), sl_pct=pos.get("sl_pct"),
         details={"outcome": outcome})
+    side_label = "YES" if pos.get("side") == "YES" else "NO"
     await telegram.send(
         f"🔄 <b>DISPLACEMENT</b> {'✅' if pnl > 0 else '❌'}\n\n"
         f"❓ {pos['question'][:120]}\n"
-        f"💰 P&L:<b>{pnl:+.2f}$</b> → Freed slot for better signal"
+        f"🎲 {side_label} | Вход:{pos['side_price']*100:.1f}¢ → Выход:{price*100:.1f}¢\n"
+        f"💰 P&L:<b>{pnl:+.2f}$</b> ({pnl_pct*100:+.1f}%) → слот для лучшего сигнала\n"
+        f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>"
     )
     return True
 
@@ -361,15 +364,15 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         details={"volatility": signal.get("volatility"), "spread": signal.get("spread"),
                  "liquidity": signal.get("liquidity"), "original_kelly": signal["kelly"],
                  "source": signal.get("source", "math")})
-    src_emoji = {"math":"🔢","news":"📰","claude":"🧠"}.get(signal.get("source","math"),"🎯")
+    side_label = "✅ YES (случится)" if signal["side"] == "YES" else "❌ NO (не случится)"
     await telegram.send(
-        f"🎯 <b>СИГНАЛ [{mode}]</b> {src_emoji}\n\n"
-        f"❓ {signal['question'][:150]}\n\n"
-        f"{'✅ YES' if signal['side']=='YES' else '❌ NO'} по <b>{signal['side_price']*100:.1f}¢</b>\n\n"
-        f"📊 EV:<b>+{signal['ev']*100:.1f}%</b> | KL:<b>{signal['kl']:.3f}</b> | Kelly:<b>{signal['kelly']*100:.1f}%</b>\n"
-        f"p_true:<b>{signal['p_final']*100:.1f}%</b> vs рынок:<b>{signal['p_market']*100:.1f}%</b>\n"
-        f"Edge:<b>{signal.get('edge',0)*100:.1f}%</b>\n\n"
-        f"💵 Ставка:<b>${stake}</b>\n"
+        f"🎯 <b>СИГНАЛ [{mode}]</b>{' 🔄' if is_contrarian else ''}\n\n"
+        f"❓ {signal['question'][:150]}\n"
+        f"🎲 Ставка: <b>{side_label}</b> по <b>{signal['side_price']*100:.1f}¢</b>\n\n"
+        f"📊 EV:<b>+{signal['ev']*100:.1f}%</b> | Kelly:<b>{kelly*100:.1f}%</b> | Edge:<b>{signal.get('edge',0)*100:.1f}%</b>\n"
+        f"🧮 p_true:<b>{signal['p_final']*100:.1f}%</b> vs рынок:<b>{signal['p_market']*100:.1f}%</b>\n"
+        f"🎯 TP:{tp_pct*100:.0f}% | SL:{sl_pct*100:.0f}%\n\n"
+        f"💵 Ставка: <b>${stake}</b> | Банк: ${bankroll:.2f}\n"
         f"🔗 <a href='{signal.get('url','')}'>Polymarket</a>"
     )
     return True
@@ -475,13 +478,31 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
     reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
     won = pnl > 0
     log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
+    side_label = "✅ YES (случится)" if pos["side"] == "YES" else "❌ NO (не случится)"
+    # Position lifetime
+    _lifetime = ""
+    if pos.get("opened_at"):
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            _opened = pos["opened_at"] if hasattr(pos["opened_at"], 'timestamp') else _dt.fromisoformat(str(pos["opened_at"]))
+            _hours = (_dt.now(_tz.utc) - _opened.replace(tzinfo=_tz.utc) if _opened.tzinfo is None else _dt.now(_tz.utc) - _opened).total_seconds() / 3600
+            if _hours < 1:
+                _lifetime = f"⏱ {_hours*60:.0f}мин"
+            else:
+                _lifetime = f"⏱ {_hours:.1f}ч"
+        except Exception:
+            pass
     await telegram.send(
         f"{reason_emoji} <b>{close_reason}</b> {'✅' if won else '❌'}\n\n"
-        f"❓ {pos['question'][:120]}\n\n"
-        f"{pos['side']} @ {pos['side_price']*100:.1f}¢ → <b>{price*100:.1f}¢</b>\n"
-        f"📈 Движение:<b>{pnl_pct*100:+.1f}%</b>\n"
-        f"💰 P&L:<b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
-        f"📊 WR:{wr}% | Банкролл:${stats['bankroll']:.2f}"
+        f"❓ {pos['question'][:120]}\n"
+        f"🎲 Ставка: <b>{side_label}</b>\n\n"
+        f"📊 Вход: {pos['side_price']*100:.1f}¢ → Выход: <b>{price*100:.1f}¢</b>\n"
+        f"📈 Движение: <b>{pnl_pct*100:+.1f}%</b>\n"
+        f"💰 P&L: <b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
+        f"🎯 EV:{pos.get('ev',0)*100:+.1f}% | TP:{tp_pct*100:.0f}% | SL:{sl_pct*100:.0f}%\n"
+        f"📊 WR:{wr}% ({stats['wins']}W/{stats['losses']}L) | Банк:${stats['bankroll']:.2f}\n"
+        f"{_lifetime}\n"
+        f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>"
     )
     return True
 
