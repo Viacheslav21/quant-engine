@@ -251,18 +251,25 @@ class MathEngine:
         if spread_mult < 1.0:
             kelly = round(kelly * spread_mult, 4)
 
-        if ev < self.config["MIN_EV"]:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {self.config['MIN_EV']}")
+        # Per-theme EV threshold: bad themes need higher EV to enter
+        theme = market.get("theme", "other")
+        theme_pat = self._patterns.get(theme, {})
+        ev_mult = theme_pat.get("ev_mult", 1.0) or 1.0
+        min_ev = self.config["MIN_EV"] * ev_mult
+        min_kl = self.config["MIN_KL"] * ev_mult
+        min_edge = self.config.get("MIN_EDGE", 0.08) * ev_mult
+
+        if ev < min_ev:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {min_ev:.4f} (×{ev_mult:.2f} {theme})")
             return None
-        if kl < self.config["MIN_KL"]:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: KL {kl:.4f} < {self.config['MIN_KL']}")
+        if kl < min_kl:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: KL {kl:.4f} < {min_kl:.4f} (×{ev_mult:.2f} {theme})")
             return None
         if kelly < self.config["MIN_KELLY_FRAC"]:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: Kelly {kelly:.4f} < {self.config['MIN_KELLY_FRAC']}")
             return None
-        min_edge = self.config.get("MIN_EDGE", 0.08)
         if edge < min_edge:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < {min_edge}")
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < {min_edge:.4f} (×{ev_mult:.2f} {theme})")
             return None
 
         # Determine if contrarian is the dominant evidence
@@ -580,9 +587,18 @@ class MathEngine:
 
     def compute_stake(self, bankroll: float, kelly: float, theme: str = None,
                        open_positions: list = None, liquidity: float = 0) -> float:
-        """Compute stake with portfolio concentration and liquidity penalties."""
+        """Compute stake with theme performance, concentration and liquidity penalties."""
         if bankroll <= 0:
             return 0.0
+
+        # Per-theme Kelly multiplier from Bayesian performance calibration
+        if theme:
+            theme_pat = self._patterns.get(theme, {})
+            kelly_mult = theme_pat.get("kelly_mult", 1.0) or 1.0
+            if kelly_mult != 1.0:
+                kelly = kelly * kelly_mult
+                log.info(f"[MATH] Theme Kelly: '{theme}' ×{kelly_mult:.2f} → Kelly {kelly*100:.2f}%")
+
         stake = bankroll * kelly
         stake = min(stake, bankroll * self.config["MAX_KELLY_FRAC"])
 

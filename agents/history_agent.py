@@ -20,6 +20,7 @@ class HistoryAgent:
 
         await self._compute_base_rates(closed_markets)
         await self._compute_volume_patterns(closed_markets)
+        await self._compute_theme_performance(closed_positions)
 
         if len(closed_positions) >= 10:
             await self._calibrate_system(closed_positions)
@@ -78,6 +79,73 @@ class HistoryAgent:
                 "base_rate": round(high_rate,4), "sample_size": len(high_vol_out),
                 "volume_signal": round(vol_signal,4), "win_rate": round(high_rate,4),
             })
+
+    async def _compute_theme_performance(self, positions: list):
+        """Bayesian shrinkage per-theme: compute kelly_mult and ev_mult from trade history."""
+        if len(positions) < 10:
+            return
+
+        SHRINKAGE_K = 20  # strength of pull toward global mean
+
+        # Global stats
+        global_wins = sum(1 for p in positions if p.get("result") == "WIN")
+        global_wr = global_wins / len(positions) if positions else 0.5
+        global_staked = sum(float(p.get("stake_amt", 0)) for p in positions)
+        global_pnl = sum(float(p.get("pnl", 0)) for p in positions)
+        global_roi = global_pnl / global_staked if global_staked > 0 else 0
+
+        # Per-theme stats
+        by_theme = defaultdict(list)
+        for p in positions:
+            theme = p.get("theme", "other")
+            by_theme[theme].append(p)
+
+        for theme, trades in by_theme.items():
+            n = len(trades)
+            wins = sum(1 for t in trades if t.get("result") == "WIN")
+            raw_wr = wins / n if n > 0 else 0.5
+            staked = sum(float(t.get("stake_amt", 0)) for t in trades)
+            pnl = sum(float(t.get("pnl", 0)) for t in trades)
+            roi = pnl / staked if staked > 0 else 0
+
+            # Bayesian shrinkage: w_adj = (n * w_theme + k * w_global) / (n + k)
+            # Few trades → trust global. Many trades → trust theme.
+            wr_adj = (n * raw_wr + SHRINKAGE_K * global_wr) / (n + SHRINKAGE_K)
+            roi_adj = (n * roi + SHRINKAGE_K * global_roi) / (n + SHRINKAGE_K)
+
+            # Kelly multiplier: theme outperforms → bigger bets
+            # Based on adjusted WR relative to global
+            kelly_mult = wr_adj / global_wr if global_wr > 0 else 1.0
+            kelly_mult = round(max(0.3, min(2.0, kelly_mult)), 3)
+
+            # EV threshold multiplier: bad themes need higher EV to enter
+            # Based on combined WR and ROI signal
+            roi_factor = 1.0
+            if roi_adj < -0.02:  # theme is losing money
+                roi_factor = 1.0 + abs(roi_adj) * 3  # e.g. -5% ROI → 1.15x EV required
+            elif roi_adj > 0.02:  # theme is making money
+                roi_factor = max(0.7, 1.0 - roi_adj * 2)  # e.g. +10% ROI → 0.8x EV required
+
+            ev_mult = round(max(0.7, min(2.0, (global_wr / wr_adj) * roi_factor)) if wr_adj > 0 else 1.5, 3)
+
+            # Update pattern with trade performance
+            existing = await self.db.get_patterns()
+            pat = existing.get(theme, {})
+            await self.db.upsert_pattern(theme, {
+                "base_rate":       pat.get("base_rate", 0.5),
+                "sample_size":     pat.get("sample_size", 0),
+                "prospect_factor": pat.get("prospect_factor", 1.0),
+                "win_rate":        pat.get("win_rate", 0.5),
+                "trade_n":         n,
+                "trade_wr":        round(wr_adj, 4),
+                "trade_roi":       round(roi_adj, 4),
+                "kelly_mult":      kelly_mult,
+                "ev_mult":         ev_mult,
+            })
+            log.info(
+                f"[HISTORY] Theme perf: {theme} | {n} trades WR:{raw_wr*100:.0f}%→{wr_adj*100:.0f}%(adj) "
+                f"ROI:{roi*100:+.1f}% | kelly_mult:{kelly_mult:.2f} ev_mult:{ev_mult:.2f}"
+            )
 
     async def _calibrate_system(self, positions: list):
         # Use actual market outcome (YES/NO), not bet result (WIN/LOSS)

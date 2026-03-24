@@ -15,6 +15,7 @@ class Database:
         self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10, command_timeout=30)
         await self._create_schema()
         await self._migrate_positions_tp_sl()
+        await self._migrate_patterns_theme_perf()
         await self._backfill_executed_signals()
         await self._init_stats()
         log.info("[DB] PostgreSQL подключён")
@@ -237,6 +238,25 @@ class Database:
             if "config_tag" not in col_names:
                 await conn.execute("ALTER TABLE positions ADD COLUMN config_tag TEXT DEFAULT 'v0'")
                 log.info("[DB] Added config_tag column to positions")
+
+    async def _migrate_patterns_theme_perf(self):
+        """Add per-theme performance columns to patterns for Bayesian theme calibration."""
+        async with self.pool.acquire() as conn:
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='patterns'"
+            )
+            col_names = {r["column_name"] for r in cols}
+            new_cols = {
+                "trade_n":    "INTEGER DEFAULT 0",
+                "trade_wr":   "REAL DEFAULT 0.5",
+                "trade_roi":  "REAL DEFAULT 0",
+                "kelly_mult": "REAL DEFAULT 1.0",
+                "ev_mult":    "REAL DEFAULT 1.0",
+            }
+            for col, typedef in new_cols.items():
+                if col not in col_names:
+                    await conn.execute(f"ALTER TABLE patterns ADD COLUMN {col} {typedef}")
+                    log.info(f"[DB] Added {col} column to patterns")
 
     async def _backfill_executed_signals(self):
         """One-time: mark signals as executed if they have a matching position."""
@@ -553,17 +573,25 @@ class Database:
     async def upsert_pattern(self, category: str, data: dict):
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO patterns (category,base_rate,sample_size,avg_volume,volume_signal,time_decay_coef,prospect_factor,win_rate,avg_ev,updated_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                INSERT INTO patterns (category,base_rate,sample_size,avg_volume,volume_signal,
+                    time_decay_coef,prospect_factor,win_rate,avg_ev,
+                    trade_n,trade_wr,trade_roi,kelly_mult,ev_mult,updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
                 ON CONFLICT (category) DO UPDATE SET
                     base_rate=EXCLUDED.base_rate, sample_size=EXCLUDED.sample_size,
                     avg_volume=EXCLUDED.avg_volume, volume_signal=EXCLUDED.volume_signal,
                     time_decay_coef=EXCLUDED.time_decay_coef, prospect_factor=EXCLUDED.prospect_factor,
-                    win_rate=EXCLUDED.win_rate, avg_ev=EXCLUDED.avg_ev, updated_at=NOW()
+                    win_rate=EXCLUDED.win_rate, avg_ev=EXCLUDED.avg_ev,
+                    trade_n=EXCLUDED.trade_n, trade_wr=EXCLUDED.trade_wr,
+                    trade_roi=EXCLUDED.trade_roi, kelly_mult=EXCLUDED.kelly_mult,
+                    ev_mult=EXCLUDED.ev_mult, updated_at=NOW()
             """, category, data["base_rate"], data["sample_size"],
                 data.get("avg_volume",0), data.get("volume_signal",1.0),
                 data.get("time_decay_coef",0.05), data.get("prospect_factor",1.0),
-                data.get("win_rate",0.5), data.get("avg_ev",0))
+                data.get("win_rate",0.5), data.get("avg_ev",0),
+                data.get("trade_n",0), data.get("trade_wr",0.5),
+                data.get("trade_roi",0), data.get("kelly_mult",1.0),
+                data.get("ev_mult",1.0))
         log.debug(f"[DB] Pattern upserted: {category} base_rate={data['base_rate']:.4f} n={data['sample_size']}")
 
     async def get_patterns(self) -> dict:
