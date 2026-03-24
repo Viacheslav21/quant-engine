@@ -143,9 +143,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_news_processed ON news(processed, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(is_active, volume DESC);
+                CREATE TABLE IF NOT EXISTS trader_commands (
+                    id BIGSERIAL PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    position_id TEXT,
+                    params JSONB DEFAULT '{}',
+                    status TEXT DEFAULT 'pending',
+                    result JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    executed_at TIMESTAMPTZ
+                );
                 CREATE INDEX IF NOT EXISTS idx_trade_log_event ON trade_log(event_type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trade_log_market ON trade_log(market_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trader_commands_status ON trader_commands(status) WHERE status='pending';
             """)
             log.info("[DB] Schema created")
         except Exception as e:
@@ -498,6 +509,36 @@ class Database:
         except Exception as e:
             log.error(f"[DB] close_position failed: {e}")
             raise
+
+    # ── Trader Commands ──
+
+    async def fetch_pending_commands(self) -> list:
+        """Fetch all pending commands, atomically marking them as 'processing'."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                UPDATE trader_commands SET status='processing'
+                WHERE status='pending'
+                RETURNING id, command, position_id, params, created_at
+            """)
+            return [dict(r) for r in rows]
+
+    async def complete_command(self, cmd_id: int, result: dict):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE trader_commands SET status='done', result=$1::jsonb, executed_at=NOW()
+                WHERE id=$2
+            """, __import__('json').dumps(result), cmd_id)
+
+    async def fail_command(self, cmd_id: int, error: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE trader_commands SET status='error', result=$1::jsonb, executed_at=NOW()
+                WHERE id=$2
+            """, __import__('json').dumps({"error": error}), cmd_id)
+
+    async def setup_listen(self, conn):
+        """Start LISTEN on trader_commands channel."""
+        await conn.execute("LISTEN trader_commands")
 
     async def get_open_positions(self) -> list:
         async with self.pool.acquire() as conn:

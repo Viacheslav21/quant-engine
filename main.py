@@ -6,6 +6,7 @@ Math-first: Claude только для сильных сигналов (EV > 15%
 """
 
 import asyncio
+import asyncpg
 import logging
 import os
 import time
@@ -380,6 +381,102 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
 _last_db_price_update: dict = {}  # pos_id -> timestamp of last DB write
 DB_PRICE_UPDATE_INTERVAL = 30  # update DB every 30 seconds, not every tick
 
+async def process_trader_commands(db: Database, telegram: TelegramBot,
+                                  scanner, config: dict, trailing_highs: dict,
+                                  ws: PolymarketWS = None):
+    """Poll trader_commands table and execute pending commands."""
+    try:
+        commands = await db.fetch_pending_commands()
+    except Exception as e:
+        log.error(f"[CMD] Ошибка получения команд: {e}")
+        return
+    if commands:
+        log.info(f"[CMD] Получено {len(commands)} команд(а)")
+    for cmd in commands:
+        cmd_id = cmd["id"]
+        command = cmd["command"]
+        pos_id = cmd.get("position_id")
+        log.info(f"[CMD] Обработка #{cmd_id}: {command} position={pos_id}")
+        try:
+            if command == "close_position":
+                if not pos_id:
+                    log.warning(f"[CMD] #{cmd_id}: отклонено — нет position_id")
+                    await db.fail_command(cmd_id, "missing position_id")
+                    continue
+                # Fetch current position
+                open_pos = await db.get_open_positions()
+                pos = next((p for p in open_pos if p["id"] == pos_id), None)
+                if not pos:
+                    log.warning(f"[CMD] #{cmd_id}: позиция {pos_id} не найдена или уже закрыта")
+                    await db.fail_command(cmd_id, f"position {pos_id} not found or already closed")
+                    continue
+                # Calculate current PnL using last known price
+                price = pos.get("current_price") or pos["side_price"]
+                pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
+                payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+                pnl = round(payout - pos["stake_amt"], 2)
+                log.info(f"[CMD] #{cmd_id}: закрываю {pos['side']} '{pos['question'][:50]}' | вход:{pos['side_price']*100:.1f}¢ сейчас:{price*100:.1f}¢ PnL:{pnl:+.2f}")
+                closed = await db.close_position(pos_id, "MANUAL_CLOSE", payout, pnl)
+                if not closed:
+                    log.warning(f"[CMD] #{cmd_id}: позиция уже закрыта (race)")
+                    await db.fail_command(cmd_id, "position already closed (race)")
+                    continue
+                # Cleanup WS subscription
+                if ws:
+                    try:
+                        await ws.unsubscribe_market(pos["market_id"])
+                        log.info(f"[CMD] WS отписка {pos['market_id'][:8]}")
+                    except Exception:
+                        pass
+                trailing_highs.pop(pos_id, None)
+                _last_db_price_update.pop(pos_id, None)
+                result_str = "WIN" if pnl > 0 else "LOSS"
+                stats = await db.get_stats()
+                total = stats["wins"] + stats["losses"]
+                wr = round(stats["wins"] / total * 100) if total > 0 else 0
+                await db.log_event("CLOSE_MANUAL",
+                    market_id=pos["market_id"], position_id=pos_id,
+                    question=pos.get("question"), theme=pos.get("theme"), side=pos.get("side"),
+                    side_price=pos.get("side_price"), yes_price=price,
+                    p_final=pos.get("p_final"), ev=pos.get("ev"), kelly=pos.get("kelly"),
+                    stake_amt=pos["stake_amt"], pnl=pnl, pnl_pct=round(pnl_pct, 4), payout=payout,
+                    tp_pct=pos.get("tp_pct"), sl_pct=pos.get("sl_pct"),
+                    bankroll=stats["bankroll"],
+                    is_simulation=config["SIMULATION"], config_tag=config.get("CONFIG_TAG"),
+                    details={"close_reason": "manual_dashboard", "win_rate": wr, "total_closed": total})
+                side_label = "✅ YES" if pos["side"] == "YES" else "❌ NO"
+                # Position lifetime
+                _lifetime = ""
+                if pos.get("opened_at"):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        _opened = pos["opened_at"] if hasattr(pos["opened_at"], 'timestamp') else _dt.fromisoformat(str(pos["opened_at"]))
+                        _hours = (_dt.now(_tz.utc) - _opened.replace(tzinfo=_tz.utc) if _opened.tzinfo is None else _dt.now(_tz.utc) - _opened).total_seconds() / 3600
+                        _lifetime = f"\n⏱ {_hours*60:.0f}мин" if _hours < 1 else f"\n⏱ {_hours:.1f}ч"
+                    except Exception:
+                        pass
+                await telegram.send(
+                    f"🔧 <b>Ручное закрытие</b> {'✅' if pnl >= 0 else '❌'}\n\n"
+                    f"❓ {pos['question'][:120]}\n"
+                    f"🎲 Ставка: <b>{side_label}</b>\n\n"
+                    f"📊 Вход: {pos['side_price']*100:.1f}¢ → Выход: <b>{price*100:.1f}¢</b>\n"
+                    f"📈 Движение: <b>{pnl_pct*100:+.1f}%</b>\n"
+                    f"💰 P&L: <b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
+                    f"📊 WR:{wr}% ({stats['wins']}W/{stats['losses']}L) | Банк:${stats['bankroll']:.2f}"
+                    f"{_lifetime}\n"
+                    f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>")
+                await db.complete_command(cmd_id, {"pnl": pnl, "payout": payout, "result": result_str})
+                log.info(f"[CMD] ✅ #{cmd_id}: позиция {pos_id} закрыта | {result_str} PnL:{pnl:+.2f}$")
+            else:
+                log.warning(f"[CMD] #{cmd_id}: неизвестная команда '{command}'")
+                await db.fail_command(cmd_id, f"unknown command: {command}")
+        except Exception as e:
+            log.error(f"[CMD] #{cmd_id}: ошибка — {e}", exc_info=True)
+            try:
+                await db.fail_command(cmd_id, str(e))
+            except Exception:
+                pass
+
 async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: float,
                           config: dict, trailing_highs: dict,
                           db: Database, telegram: TelegramBot, ws: PolymarketWS = None) -> bool:
@@ -475,9 +572,14 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
                  "trailing_high": _peak_pnl,
                  "win_rate": wr, "total_closed": total})
 
-    reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
+    _reason_label = {
+        "RESOLVED":   "🏁 Рынок закрылся",
+        "TAKE_PROFIT":"💰 Тейк-профит",
+        "STOP_LOSS":  "🛑 Стоп-лосс",
+        "TRAILING_TP":"📈 Трейлинг-стоп",
+    }[close_reason]
     won = pnl > 0
-    log.info(f"[MONITOR] {reason_emoji} {close_reason} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
+    log.info(f"[MONITOR] {_reason_label} {'WIN' if won else 'LOSS'} P&L:{pnl:+.2f}")
     side_label = "✅ YES (случится)" if pos["side"] == "YES" else "❌ NO (не случится)"
     # Position lifetime
     _lifetime = ""
@@ -493,7 +595,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         except Exception:
             pass
     await telegram.send(
-        f"{reason_emoji} <b>{close_reason}</b> {'✅' if won else '❌'}\n\n"
+        f"{_reason_label} {'✅' if won else '❌'}\n\n"
         f"❓ {pos['question'][:120]}\n"
         f"🎲 Ставка: <b>{side_label}</b>\n\n"
         f"📊 Вход: {pos['side_price']*100:.1f}¢ → Выход: <b>{price*100:.1f}¢</b>\n"
@@ -669,6 +771,22 @@ async def main():
     # Start WS in background
     ws_task = asyncio.create_task(ws.connect())
 
+    # LISTEN for trader_commands NOTIFY — instant reaction to dashboard commands
+    async def _listen_commands():
+        try:
+            listen_conn = await asyncpg.connect(db.url)
+            await listen_conn.add_listener("trader_commands",
+                lambda conn, pid, channel, payload:
+                    asyncio.create_task(process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)))
+            await db.setup_listen(listen_conn)
+            log.info("[CMD] LISTEN trader_commands active")
+            while not _shutdown_flag:
+                await asyncio.sleep(60)
+            await listen_conn.close()
+        except Exception as e:
+            log.warning(f"[CMD] LISTEN setup failed, polling only: {e}")
+    cmd_task = asyncio.create_task(_listen_commands())
+
     last_history = last_metrics_save = 0
     METRICS_SAVE_INTERVAL = 300
     scan_count = 0
@@ -749,10 +867,14 @@ async def main():
                         f"Drawdown: {drawdown*100:.1f}% < {MAX_DRAWDOWN*50:.0f}% recovery threshold"
                     )
                 else:
-                    # Still halted — monitor positions only
+                    # Still halted — process commands + monitor positions only
+                    await process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)
                     await monitor_positions(db, telegram, scanner, CONFIG, await scanner.fetch(), trailing_highs, ws)
                     await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
                     continue
+
+            # Process any pending trader commands (manual close, etc.)
+            await process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)
 
             markets = await scanner.fetch()
             for m in markets:
