@@ -625,11 +625,17 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         is_closed = False
 
         # Try WS price first (fresher), fall back to REST
-        ws_price = ws.get_price(pos["market_id"]) if ws else 0
+        ws_data = ws.get_market_data(pos["market_id"]) if ws else {}
+        ws_price = ws_data.get("yes_price", 0) if ws_data else 0
         if ws_price > 0:
             yes_price = ws_price
             no_price = 1 - ws_price
             m = m or {"id": pos["market_id"], "yes_price": yes_price, "no_price": no_price}
+            # Use bid price for realistic exit price
+            if pos["side"] == "YES" and ws_data.get("best_bid"):
+                m["yes_bid"] = ws_data["best_bid"]
+            elif pos["side"] == "NO" and ws_data.get("best_ask"):
+                m["no_bid"] = 1 - ws_data["best_ask"]
         elif not m:
             raw = await scanner.get_market(pos["market_id"])
             if not raw:
@@ -651,7 +657,11 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
                 log.info(f"[WS] +subscribe (REST fallback recovery) {raw['id'][:8]} | {pos.get('question', '')[:60]}")
 
         yes_price = m["yes_price"]
-        price = yes_price if pos["side"] == "YES" else m.get("no_price", 1 - yes_price)
+        # Use bid price (realistic exit) when available, otherwise mid
+        if pos["side"] == "YES":
+            price = m.get("yes_bid", yes_price)
+        else:
+            price = m.get("no_bid", m.get("no_price", 1 - yes_price))
         await _check_position(pos, price, is_closed, yes_price, config, trailing_highs, db, telegram, ws)
 
 async def main():
@@ -685,7 +695,14 @@ async def main():
         if not pos:
             return
         yes_price = new_price
-        price = yes_price if pos["side"] == "YES" else 1 - yes_price
+        # Use bid price (realistic exit price) instead of mid for SL/TP checks
+        ws_data = ws.get_market_data(market_id)
+        if pos["side"] == "YES":
+            # Selling YES = YES bid
+            price = ws_data.get("best_bid", yes_price)
+        else:
+            # Selling NO = 1 - YES ask (NO bid = 1 - YES ask)
+            price = 1 - ws_data.get("best_ask", 1 - yes_price) if ws_data.get("best_ask") else 1 - yes_price
         pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
         sl_pct = pos.get("sl_pct") or CONFIG["STOP_LOSS_PCT"]
         tp_pct = pos.get("tp_pct") or CONFIG["TAKE_PROFIT_PCT"]
