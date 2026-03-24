@@ -305,6 +305,14 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
 
     await db.close_position(pos["id"], outcome, payout, pnl)
     log.info(f"[DISPLACE] Closed {pos['id']} PnL:{pnl:+.2f} to make room")
+    await db.log_event("DISPLACEMENT",
+        market_id=pos["market_id"], position_id=pos["id"],
+        question=pos.get("question"), theme=pos.get("theme"), side=pos.get("side"),
+        side_price=pos.get("side_price"), yes_price=price,
+        pnl=pnl, pnl_pct=round(pnl_pct, 4), payout=payout, stake_amt=pos["stake_amt"],
+        ev=pos.get("ev"), kelly=pos.get("kelly"),
+        tp_pct=pos.get("tp_pct"), sl_pct=pos.get("sl_pct"),
+        details={"outcome": outcome})
     await telegram.send(
         f"🔄 <b>DISPLACEMENT</b> {'✅' if pnl > 0 else '❌'}\n\n"
         f"❓ {pos['question'][:120]}\n"
@@ -314,20 +322,32 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
 async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict,
                          scanner: PolymarketScanner = None, math_eng: MathEngine = None):
     open_pos = await db.get_open_positions()
-    if any(p["market_id"] == signal["market_id"] for p in open_pos): return False
+    _rej_base = dict(market_id=signal["market_id"], question=signal["question"],
+                      theme=signal.get("theme"), side=signal["side"], ev=signal["ev"],
+                      kelly=signal["kelly"], is_simulation=config["SIMULATION"],
+                      config_tag=config.get("CONFIG_TAG"))
+    if any(p["market_id"] == signal["market_id"] for p in open_pos):
+        await db.log_event("SIGNAL_REJECTED", **_rej_base, details={"reason": "duplicate_market"})
+        return False
     theme = signal.get("theme", "other")
     theme_count = sum(1 for p in open_pos if p.get("theme") == theme)
     theme_limit = MAX_PER_OTHER if theme == "other" else MAX_PER_THEME
     if theme_count >= theme_limit:
         log.info(f"[EXEC] Skipped: theme '{theme}' already has {theme_count}/{theme_limit} positions")
+        await db.log_event("SIGNAL_REJECTED", **_rej_base,
+                           details={"reason": "theme_limit", "theme_count": theme_count, "theme_limit": theme_limit})
         return False
 
     # If full, try to displace worst position
     if len(open_pos) >= config["MAX_OPEN"]:
         if signal["ev"] < DISPLACE_MIN_EV or scanner is None:
+            await db.log_event("SIGNAL_REJECTED", **_rej_base, open_positions=len(open_pos),
+                               details={"reason": "slots_full_low_ev", "displace_min_ev": DISPLACE_MIN_EV})
             return False
         displace = await _find_displaceable(open_pos, signal, scanner)
         if not displace:
+            await db.log_event("SIGNAL_REJECTED", **_rej_base, open_positions=len(open_pos),
+                               details={"reason": "no_displaceable_position"})
             return False
         await _close_for_displacement(displace, db, telegram)
     stats    = await db.get_stats()
@@ -358,7 +378,10 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
 
     stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos,
                                    signal.get("liquidity", 0))
-    if stake < 1.0: return False
+    if stake < 1.0:
+        await db.log_event("SIGNAL_REJECTED", **_rej_base, bankroll=bankroll,
+                           details={"reason": "stake_too_small", "computed_stake": stake})
+        return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
     log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
     pos = {
@@ -380,6 +403,17 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         "config_tag": config.get("CONFIG_TAG", "v1"),
     }
     await db.save_position(pos)
+    await db.log_event("OPEN",
+        market_id=signal["market_id"], position_id=pos["id"], signal_id=signal.get("id"),
+        question=signal["question"], theme=signal.get("theme"), side=signal["side"],
+        side_price=signal["side_price"], p_market=signal["p_market"], p_final=signal["p_final"],
+        ev=signal["ev"], kl=signal["kl"], kelly=kelly, edge=signal.get("edge"),
+        stake_amt=stake, tp_pct=tp_pct, sl_pct=sl_pct, bankroll=bankroll,
+        is_contrarian=is_contrarian, is_simulation=config["SIMULATION"],
+        config_tag=config.get("CONFIG_TAG"),
+        details={"volatility": signal.get("volatility"), "spread": signal.get("spread"),
+                 "liquidity": signal.get("liquidity"), "original_kelly": signal["kelly"],
+                 "source": signal.get("source", "math")})
     src_emoji = {"math":"🔢","news":"📰","claude":"🧠"}.get(signal.get("source","math"),"🎯")
     await telegram.send(
         f"🎯 <b>СИГНАЛ [{mode}]</b> {src_emoji}\n\n"
@@ -468,6 +502,20 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
     stats = await db.get_stats()
     total = stats["wins"] + stats["losses"]
     wr = round(stats["wins"] / total * 100) if total > 0 else 0
+
+    _close_event = {"RESOLVED": "CLOSE_RESOLVED", "TAKE_PROFIT": "CLOSE_TP",
+                    "STOP_LOSS": "CLOSE_SL", "TRAILING_TP": "CLOSE_TRAILING_TP"}[close_reason]
+    await db.log_event(_close_event,
+        market_id=pos["market_id"], position_id=pos["id"], signal_id=pos.get("signal_id"),
+        question=pos.get("question"), theme=pos.get("theme"), side=pos.get("side"),
+        side_price=pos.get("side_price"), yes_price=yes_price,
+        p_final=pos.get("p_final"), ev=pos.get("ev"), kelly=pos.get("kelly"),
+        stake_amt=pos["stake_amt"], pnl=pnl, pnl_pct=round(pnl_pct, 4), payout=payout,
+        tp_pct=tp_pct, sl_pct=sl_pct, bankroll=stats["bankroll"],
+        is_simulation=config["SIMULATION"], config_tag=pos.get("config_tag"),
+        details={"outcome": outcome, "close_reason": close_reason, "current_price": price,
+                 "trailing_high": trailing_highs.get(pos["id"]),
+                 "win_rate": wr, "total_closed": total})
 
     reason_emoji = {"RESOLVED": "🏁", "TAKE_PROFIT": "💰", "STOP_LOSS": "🛑", "TRAILING_TP": "📈"}[close_reason]
     won = pnl > 0
@@ -575,8 +623,22 @@ async def main():
         if market_id in _ws_positions and size >= 500:
             pos = _ws_positions[market_id]
             log.info(f"[WHALE] ${size:.0f} {side} on {pos['question'][:50]}")
+            await db.log_event("WHALE",
+                market_id=market_id, position_id=pos.get("id"),
+                question=pos.get("question"), side=pos.get("side"), yes_price=price,
+                is_simulation=CONFIG["SIMULATION"],
+                details={"trade_size": size, "trade_side": side})
 
-    ws.set_callbacks(on_price_change=on_ws_price_change, on_trade=on_ws_trade)
+    async def on_ws_disconnect():
+        await db.log_event("WS_DISCONNECT", is_simulation=CONFIG["SIMULATION"],
+                           details={"tracked_markets": len(ws.prices)})
+
+    async def on_ws_reconnect():
+        await db.log_event("WS_RECONNECT", is_simulation=CONFIG["SIMULATION"],
+                           details={"tracked_markets": len(ws.prices), "tokens": len(ws._subscribed_tokens)})
+
+    ws.set_callbacks(on_price_change=on_ws_price_change, on_trade=on_ws_trade,
+                     on_disconnect=on_ws_disconnect, on_reconnect=on_ws_reconnect)
 
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
@@ -621,6 +683,12 @@ async def main():
                 ws_failed += 1
     await _refresh_ws_positions()
     log.info(f"[WS] Startup: {ws_registered} positions subscribed, {ws_failed} failed, {len(ws.prices)} total markets")
+    await db.log_event("STARTUP",
+        bankroll=CONFIG["BANKROLL"], open_positions=len(open_pos),
+        is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
+        details={"ws_registered": ws_registered, "ws_failed": ws_failed,
+                 "config": {k: v for k, v in CONFIG.items()
+                            if k not in ("ANTHROPIC_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")}})
 
     # Start WS in background
     ws_task = asyncio.create_task(ws.connect())
@@ -675,6 +743,10 @@ async def main():
                 trading_halted = True
                 halt_time = now
                 log.warning(f"[RISK] DRAWDOWN HALT: equity=${equity:.2f} peak=${peak_equity:.2f} dd={drawdown*100:.1f}% >= {MAX_DRAWDOWN*100:.0f}%")
+                await db.log_event("DRAWDOWN_HALT",
+                    bankroll=stats["bankroll"], equity=equity, peak_equity=peak_equity,
+                    drawdown_pct=round(drawdown, 4), open_positions=len(open_pos),
+                    is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"])
                 await telegram.send(
                     f"🚨 <b>TRADING HALTED — DRAWDOWN</b>\n\n"
                     f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
@@ -687,6 +759,10 @@ async def main():
                 if drawdown < MAX_DRAWDOWN * 0.5 and (now - halt_time) >= HALT_COOLDOWN:
                     trading_halted = False
                     log.info(f"[RISK] TRADING RESUMED: equity=${equity:.2f} dd={drawdown*100:.1f}% recovered")
+                    await db.log_event("DRAWDOWN_RESUME",
+                        bankroll=stats["bankroll"], equity=equity, peak_equity=peak_equity,
+                        drawdown_pct=round(drawdown, 4), open_positions=len(open_pos),
+                        is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"])
                     await telegram.send(
                         f"✅ <b>TRADING RESUMED</b>\n\n"
                         f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
@@ -738,6 +814,13 @@ async def main():
 
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(all_signals)} сигналов | {len(signals)} новых")
+                await db.log_event("SCAN",
+                    bankroll=stats["bankroll"], equity=equity, peak_equity=peak_equity,
+                    drawdown_pct=round(drawdown, 4), open_positions=len(open_pos),
+                    is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
+                    details={"scan_count": scan_count, "markets": len(markets),
+                             "signals_total": len(all_signals), "signals_new": len(signals),
+                             "trading_halted": trading_halted})
 
             # ML enrichment: blend p_ml into p_final for top signals
             mmap_for_ml = {m["id"]: m for m in markets}
@@ -792,6 +875,24 @@ async def main():
                 })
                 _signal_cooldown[sig["market_id"]] = now
                 await db.mark_signal_cooldown(sig["market_id"])
+                await db.log_event("SIGNAL_GENERATED",
+                    market_id=sig["market_id"], signal_id=sig_id,
+                    question=sig["question"], theme=sig.get("theme"), side=sig["side"],
+                    side_price=sig["side_price"], yes_price=sig.get("p_market"),
+                    p_market=sig["p_market"], p_final=sig["p_final"],
+                    p_prospect=sig.get("p_prospect"), p_history=sig.get("p_history"),
+                    p_claude=sig.get("p_claude"), p_ml=sig.get("p_ml"),
+                    ev=sig["ev"], kl=sig["kl"], kelly=sig["kelly"],
+                    edge=sig.get("edge"), entropy=sig.get("entropy"),
+                    is_contrarian=sig.get("contrarian", False),
+                    is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
+                    details={"spread": sig.get("spread"), "volatility": sig.get("volatility"),
+                             "liquidity": sig.get("liquidity"), "vol_signal": sig.get("vol_signal"),
+                             "vol_dir": sig.get("vol_dir"), "source": sig.get("source", "math"),
+                             "p_momentum": sig.get("p_momentum"), "p_long_mom": sig.get("p_long_mom"),
+                             "p_contrarian": sig.get("p_contrarian"), "p_vol_trend": sig.get("p_vol_trend"),
+                             "p_arb": sig.get("p_arb"), "contrarian_conf": sig.get("contrarian_conf"),
+                             "p_mispriced": sig.get("p_mispriced")})
                 executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
                 if executed:
                     await db.mark_signal_executed(sig_id)
@@ -827,6 +928,9 @@ async def main():
                 await history.analyze()
                 await math_eng.load_patterns()
                 await db.cleanup()
+                await db.log_event("HISTORY_RECALC",
+                    is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
+                    details={"scan_count": scan_count})
 
             utc = datetime.now(timezone.utc)
             if utc.hour >= 8 and daily_report_sent != utc.date():
@@ -840,6 +944,11 @@ async def main():
 
 async def shutdown(db, telegram, scanner, ws=None):
     log.info("🛑 Shutting down...")
+    try:
+        await db.log_event("SHUTDOWN", is_simulation=CONFIG.get("SIMULATION", True),
+                           config_tag=CONFIG.get("CONFIG_TAG"), details={"reason": "signal"})
+    except Exception:
+        pass
     if ws:
         ws.stop()
     await scanner.close()

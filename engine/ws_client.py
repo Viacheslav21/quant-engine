@@ -26,10 +26,15 @@ class PolymarketWS:
         # callbacks
         self._on_price_change: Optional[Callable] = None
         self._on_trade: Optional[Callable] = None
+        self._on_disconnect: Optional[Callable] = None
+        self._on_reconnect: Optional[Callable] = None
 
-    def set_callbacks(self, on_price_change=None, on_trade=None):
+    def set_callbacks(self, on_price_change=None, on_trade=None,
+                      on_disconnect=None, on_reconnect=None):
         self._on_price_change = on_price_change
         self._on_trade = on_trade
+        self._on_disconnect = on_disconnect
+        self._on_reconnect = on_reconnect
 
     def register_market(self, market_id: str, yes_token: str = None, no_token: str = None,
                         yes_price: float = 0.5, question: str = ""):
@@ -97,6 +102,9 @@ class PolymarketWS:
                 async with websockets.connect(WS_URL, ping_interval=None) as ws:
                     self.ws = ws
                     log.info(f"[WS] Connected, subscribing to {len(self._subscribed_tokens)} tokens")
+                    if self._on_reconnect:
+                        try: await self._on_reconnect()
+                        except Exception: pass
                     await self._subscribe_all(ws)
                     heartbeat_task = asyncio.create_task(self._heartbeat(ws))
                     try:
@@ -113,10 +121,16 @@ class PolymarketWS:
             except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
                 log.warning(f"[WS] Disconnected: {e}, reconnecting in {RECONNECT_DELAY}s")
                 self.ws = None
+                if self._on_disconnect:
+                    try: await self._on_disconnect()
+                    except Exception: pass
                 await asyncio.sleep(RECONNECT_DELAY)
             except Exception as e:
                 log.error(f"[WS] Error: {e}", exc_info=True)
                 self.ws = None
+                if self._on_disconnect:
+                    try: await self._on_disconnect()
+                    except Exception: pass
                 await asyncio.sleep(RECONNECT_DELAY)
 
     @property

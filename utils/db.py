@@ -99,16 +99,108 @@ class Database:
                     last_signal_at TIMESTAMPTZ,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS trade_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    market_id TEXT,
+                    position_id TEXT,
+                    signal_id TEXT,
+                    question TEXT,
+                    theme TEXT,
+                    side TEXT,
+                    side_price REAL,
+                    yes_price REAL,
+                    p_market REAL,
+                    p_final REAL,
+                    p_prospect REAL,
+                    p_history REAL,
+                    p_claude REAL,
+                    p_ml REAL,
+                    ev REAL,
+                    kl REAL,
+                    kelly REAL,
+                    edge REAL,
+                    entropy REAL,
+                    stake_amt REAL,
+                    pnl REAL,
+                    pnl_pct REAL,
+                    payout REAL,
+                    tp_pct REAL,
+                    sl_pct REAL,
+                    bankroll REAL,
+                    equity REAL,
+                    open_positions INTEGER,
+                    drawdown_pct REAL,
+                    peak_equity REAL,
+                    is_contrarian BOOLEAN DEFAULT FALSE,
+                    is_simulation BOOLEAN DEFAULT TRUE,
+                    config_tag TEXT,
+                    details JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON price_snapshots(market_id, snapshot_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_news_processed ON news(processed, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(is_active, volume DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_log_event ON trade_log(event_type, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_log_market ON trade_log(market_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at DESC);
             """)
             log.info("[DB] Schema created")
         except Exception as e:
             log.error(f"[DB] Schema creation failed: {e}")
             raise
+
+    async def log_event(self, event_type: str, **kw):
+        """Append a row to trade_log. Fire-and-forget — never raises."""
+        try:
+            import json as _json
+            details = kw.pop("details", None)
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO trade_log (
+                        event_type, market_id, position_id, signal_id, question, theme, side,
+                        side_price, yes_price, p_market, p_final, p_prospect, p_history, p_claude, p_ml,
+                        ev, kl, kelly, edge, entropy, stake_amt, pnl, pnl_pct, payout, tp_pct, sl_pct,
+                        bankroll, equity, open_positions, drawdown_pct, peak_equity,
+                        is_contrarian, is_simulation, config_tag, details
+                    ) VALUES (
+                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35
+                    )
+                """,
+                    event_type,
+                    kw.get("market_id"), kw.get("position_id"), kw.get("signal_id"),
+                    kw.get("question"), kw.get("theme"), kw.get("side"),
+                    kw.get("side_price"), kw.get("yes_price"),
+                    kw.get("p_market"), kw.get("p_final"), kw.get("p_prospect"),
+                    kw.get("p_history"), kw.get("p_claude"), kw.get("p_ml"),
+                    kw.get("ev"), kw.get("kl"), kw.get("kelly"), kw.get("edge"), kw.get("entropy"),
+                    kw.get("stake_amt"), kw.get("pnl"), kw.get("pnl_pct"), kw.get("payout"),
+                    kw.get("tp_pct"), kw.get("sl_pct"),
+                    kw.get("bankroll"), kw.get("equity"), kw.get("open_positions"),
+                    kw.get("drawdown_pct"), kw.get("peak_equity"),
+                    kw.get("is_contrarian", False), kw.get("is_simulation", True),
+                    kw.get("config_tag"),
+                    _json.dumps(details) if details else None,
+                )
+        except Exception as e:
+            log.warning(f"[DB] log_event({event_type}) failed: {e}")
+
+    async def get_trade_log(self, limit=200, event_type=None, market_id=None) -> list:
+        """Read trade_log entries for dashboard."""
+        async with self.pool.acquire() as conn:
+            q = "SELECT * FROM trade_log WHERE 1=1"
+            args = []
+            i = 1
+            if event_type:
+                q += f" AND event_type = ${i}"; args.append(event_type); i += 1
+            if market_id:
+                q += f" AND market_id = ${i}"; args.append(market_id); i += 1
+            q += f" ORDER BY created_at DESC LIMIT ${i}"; args.append(limit)
+            rows = await conn.fetch(q, *args)
+            return [dict(r) for r in rows]
 
     async def _init_stats(self):
         bankroll = float(os.getenv("BANKROLL", "1000"))
