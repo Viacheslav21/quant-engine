@@ -328,7 +328,8 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         sl_pct = vol_sl
 
     stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos,
-                                   signal.get("liquidity", 0))
+                                   signal.get("liquidity", 0),
+                                   signal.get("neg_risk_market_id", ""), sl_pct)
     if stake < 1.0:
         await db.log_event("SIGNAL_REJECTED", **_rej_base, bankroll=bankroll,
                            details={"reason": "stake_too_small", "computed_stake": stake})
@@ -912,6 +913,12 @@ async def main():
                 await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs, ws)
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
                 continue
+
+            # Enrich markets with WS order book imbalance
+            for m in markets:
+                ws_data = ws.get_market_data(m["id"])
+                if ws_data and "imbalance" in ws_data:
+                    m["book_imbalance"] = ws_data["imbalance"]
 
             math_signals = []
             for m in markets:

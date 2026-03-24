@@ -245,6 +245,18 @@ class PolymarketWS:
                 return
             mid = (best_bid + best_ask) / 2
             is_yes = self.prices[market_id].get("yes_token") == asset_id
+
+            # Order book imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)
+            # Positive = buy pressure (price likely up), negative = sell pressure
+            bid_vol = sum(float(b.get("size", 0)) for b in bids[:5])
+            ask_vol = sum(float(a.get("size", 0)) for a in asks[:5])
+            total_vol = bid_vol + ask_vol
+            if total_vol > 0:
+                raw_imbalance = (bid_vol - ask_vol) / total_vol
+                # Flip sign for NO token: buy pressure on NO = sell pressure on YES
+                imbalance = round(raw_imbalance if is_yes else -raw_imbalance, 4)
+                self.prices[market_id]["imbalance"] = imbalance
+
             old_price = self.prices[market_id].get("yes_price", 0)
             yes_price = round(mid, 4) if is_yes else round(1 - mid, 4)
             self.prices[market_id]["yes_price"] = yes_price

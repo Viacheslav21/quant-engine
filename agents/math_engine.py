@@ -177,6 +177,9 @@ class MathEngine:
         # 9. NegRisk arbitrage (multi-outcome events)
         p_arb = self._neg_risk_arb(market)
 
+        # 10. Order book imbalance — buy/sell pressure from WS book events
+        p_book = self._book_imbalance(market)
+
         # --- Bayesian fusion in log-odds space ---
         # Merge correlated pairs BEFORE fusion (one source each, not two at 0.5)
         # Momentum: pick stronger of short-term vs long-term
@@ -191,8 +194,8 @@ class MathEngine:
         else:
             p_vol_combined = p_volume or p_vol_trend
 
-        # 6 independent sources, each at weight 1.0
-        # time_decay at 0.5 (partially priced into market)
+        # 7 independent sources after de-duplication
+        # time_decay at 0.5 (partially priced into market), book at 0.5 (short-term signal)
         evidence = [
             (p_history, 1.0),
             (p_vol_combined, 1.0),
@@ -200,6 +203,7 @@ class MathEngine:
             (p_mom_combined, 1.0),
             (p_contrarian, 1.0),
             (p_arb, 1.0),
+            (p_book, 0.5),
         ]
         active_evidence = [(p, w) for p, w in evidence if p is not None]
 
@@ -245,6 +249,13 @@ class MathEngine:
         kl    = kl_divergence(p_final, p_market)
         kelly = kelly_fraction(p_side, real_price)
         edge  = abs(p_final - p_market)
+
+        # Kelly uncertainty: fewer evidence sources = less confident sizing
+        # fraction = 0.5 + 0.5 × (n_sources / 7) → range [0.57, 1.0]
+        # 1 source → Kelly × 0.57, all 7 → Kelly × 1.0
+        MAX_SOURCES = 7
+        confidence_mult = 0.5 + 0.5 * (n_evidence / MAX_SOURCES)
+        kelly = round(kelly * confidence_mult, 4)
 
         # Spread penalty: wide spread = less confident sizing
         spread_mult = self._spread_penalty(market)
@@ -314,6 +325,9 @@ class MathEngine:
             "contrarian": is_contrarian,
             "contrarian_conf": round(contrarian_conf, 3) if p_contrarian is not None else 0,
             "volatility": self._market_volatility(market["id"]),
+            "neg_risk_market_id": market.get("neg_risk_market_id", ""),
+            "n_evidence": n_evidence,
+            "p_book":     p_book,
             "source":     "math",
         }
 
@@ -510,6 +524,24 @@ class MathEngine:
             p_vol_trend = p_market + (0.5 - p_market) * strength
         return round(max(0.02, min(0.98, p_vol_trend)), 4)
 
+    def _book_imbalance(self, market: dict) -> Optional[float]:
+        """Order book imbalance signal from WS book events.
+        imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol), range [-1, 1].
+        Positive = buy pressure → YES price likely up.
+        Only fires when |imbalance| > 0.3 (strong directional pressure).
+        Returns adjusted p as evidence source, weight 0.5 in fusion."""
+        imbalance = market.get("book_imbalance")
+        if imbalance is None or abs(imbalance) < 0.3:
+            return None
+        p_market = market["yes_price"]
+        # Scale: |imbalance| 0.3→0.01 shift, 1.0→0.04 shift
+        strength = min(0.04, (abs(imbalance) - 0.3) * 0.043 + 0.01)
+        if imbalance > 0:
+            p_book = p_market + strength   # buy pressure → YES up
+        else:
+            p_book = p_market - strength   # sell pressure → YES down
+        return round(max(0.02, min(0.98, p_book)), 4)
+
     def build_neg_risk_groups(self, markets: list):
         """Group neg-risk markets by their shared event ID for arbitrage detection."""
         self._neg_risk_groups.clear()
@@ -585,9 +617,16 @@ class MathEngine:
         if short_p:
             self._price_cache[market_id] = list(short_p)
 
+    # ── Portfolio correlation constants ──
+    THEME_CORRELATION = 0.5      # assumed correlation between positions in same theme
+    NEGRISK_CORRELATION = 1.0    # positions sharing negRiskMarketID are ~identical risk
+    MAX_EFFECTIVE_STAKE_PCT = 0.05   # max 5% of bankroll per effective independent bet
+    MAX_WORST_CASE_PCT = 0.15        # max 15% equity loss if entire cluster hits SL
+
     def compute_stake(self, bankroll: float, kelly: float, theme: str = None,
-                       open_positions: list = None, liquidity: float = 0) -> float:
-        """Compute stake with theme performance, concentration and liquidity penalties."""
+                       open_positions: list = None, liquidity: float = 0,
+                       neg_risk_market_id: str = None, sl_pct: float = 0.25) -> float:
+        """Compute stake with Bayesian theme calibration, correlation penalty, and liquidity."""
         if bankroll <= 0:
             return 0.0
 
@@ -602,18 +641,16 @@ class MathEngine:
         stake = bankroll * kelly
         stake = min(stake, bankroll * self.config["MAX_KELLY_FRAC"])
 
-        # Portfolio correlation penalty: reduce stake if theme is concentrated
-        if theme and open_positions:
-            theme_stake = sum(p.get("stake_amt", 0) for p in open_positions if p.get("theme") == theme)
-            if bankroll > 0:
-                theme_pct = theme_stake / bankroll
-                if theme_pct > 0.20:
-                    penalty = max(0.25, 1.0 - (theme_pct - 0.20) / 0.20)
-                    stake *= penalty
-                    log.info(f"[MATH] Theme concentration: '{theme}' {theme_pct*100:.0f}% of bankroll → Kelly ×{penalty:.2f}")
+        # ── Portfolio correlation penalty ──
+        # Accounts for correlated risk: positions in same negRisk group (~100% correlated)
+        # and same theme (~50% correlated) are effectively fewer independent bets.
+        if open_positions and bankroll > 0:
+            penalty = self._correlation_penalty(
+                theme, neg_risk_market_id, open_positions, bankroll, sl_pct)
+            if penalty < 1.0:
+                stake *= penalty
 
         # Liquidity penalty: thin markets → smaller stake to avoid slippage
-        # $5k liq → 0.10x, $25k → 0.50x, $50k+ → 1.0x
         if liquidity > 0:
             liq_mult = min(1.0, liquidity / 50_000)
             if liq_mult < 1.0:
@@ -623,3 +660,64 @@ class MathEngine:
         stake = round(max(1.0, stake), 2)
         log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")
         return stake
+
+    def _correlation_penalty(self, theme: str, neg_risk_market_id: str,
+                              open_positions: list, bankroll: float, sl_pct: float) -> float:
+        """Compute correlation-aware penalty for portfolio risk concentration.
+
+        Groups positions by negRiskMarketID (ρ≈1.0) and theme (ρ≈0.5).
+        Calculates effective number of independent bets:
+          effective_n = n / (1 + (n-1) × ρ)
+        Then limits stake_per_effective_bet to MAX_EFFECTIVE_STAKE_PCT of bankroll.
+        Also checks worst-case scenario (entire cluster hits SL).
+        """
+        penalty = 1.0
+
+        # 1. NegRisk group check (correlation ≈ 1.0) — most dangerous
+        #    Look up which market_ids share the same negRiskMarketID
+        if neg_risk_market_id:
+            nrg_market_ids = {m["id"] for m in self._neg_risk_groups.get(neg_risk_market_id, [])}
+            nrg_positions = [p for p in open_positions
+                             if p.get("market_id") in nrg_market_ids]
+            if nrg_positions:
+                n = len(nrg_positions)
+                nrg_stake = sum(p.get("stake_amt", 0) for p in nrg_positions)
+                # With ρ=1.0, effective_n = 1 regardless of n
+                effective_n = n / (1 + (n - 1) * self.NEGRISK_CORRELATION)
+                stake_per_eff = nrg_stake / effective_n if effective_n > 0 else nrg_stake
+                max_allowed = bankroll * self.MAX_EFFECTIVE_STAKE_PCT
+                if stake_per_eff > max_allowed:
+                    nrg_penalty = max_allowed / stake_per_eff
+                    penalty = min(penalty, nrg_penalty)
+                    log.info(f"[CORR] negRisk group: {n} pos, ${nrg_stake:.0f} staked, "
+                             f"eff={effective_n:.1f} → penalty ×{nrg_penalty:.2f}")
+
+        # 2. Theme cluster check (correlation ≈ 0.5)
+        if theme:
+            theme_positions = [p for p in open_positions if p.get("theme") == theme]
+            if theme_positions:
+                n = len(theme_positions)
+                theme_stake = sum(p.get("stake_amt", 0) for p in theme_positions)
+                effective_n = n / (1 + (n - 1) * self.THEME_CORRELATION)
+                stake_per_eff = theme_stake / effective_n if effective_n > 0 else theme_stake
+                max_allowed = bankroll * self.MAX_EFFECTIVE_STAKE_PCT
+                if stake_per_eff > max_allowed:
+                    theme_penalty = max_allowed / stake_per_eff
+                    penalty = min(penalty, theme_penalty)
+                    log.info(f"[CORR] Theme '{theme}': {n} pos, ${theme_stake:.0f} staked, "
+                             f"eff={effective_n:.1f} → penalty ×{theme_penalty:.2f}")
+
+                # 3. Worst-case check: if all theme positions hit SL simultaneously
+                worst_case_loss = theme_stake * sl_pct
+                max_loss = bankroll * self.MAX_WORST_CASE_PCT
+                if worst_case_loss > max_loss:
+                    wc_penalty = max_loss / worst_case_loss
+                    if wc_penalty < penalty:
+                        log.info(f"[CORR] Worst-case '{theme}': SL on all {n} = -${worst_case_loss:.0f} "
+                                 f"> {self.MAX_WORST_CASE_PCT*100:.0f}% bankroll → penalty ×{wc_penalty:.2f}")
+                    penalty = min(penalty, wc_penalty)
+
+        if penalty < 0.15:
+            log.info(f"[CORR] Penalty ×{penalty:.2f} too low, will likely reject (stake < $1)")
+
+        return round(max(0.05, penalty), 3)
