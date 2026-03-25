@@ -180,6 +180,15 @@ class MathEngine:
         # 10. Order book imbalance — buy/sell pressure from WS book events
         p_book = self._book_imbalance(market)
 
+        # 11. Favorite-Longshot Bias — crowds overprice longshots, underprice favorites
+        p_flb = self._favorite_longshot_bias(market)
+
+        # 12. Certainty gradient — irrationality near 0% and 100%
+        p_certainty = self._certainty_gradient(market)
+
+        # 13. Overreaction decay — rapid price moves tend to partially revert
+        p_overreact = self._overreaction_decay(market["id"], p_market)
+
         # --- Bayesian fusion in log-odds space ---
         # Merge correlated pairs BEFORE fusion (one source each, not two at 0.5)
         # Momentum: pick stronger of short-term vs long-term
@@ -194,16 +203,29 @@ class MathEngine:
         else:
             p_vol_combined = p_volume or p_vol_trend
 
-        # 7 independent sources after de-duplication
-        # time_decay at 0.5 (partially priced into market), book at 0.5 (short-term signal)
+        # FLB and certainty are correlated (both exploit tail mispricing) — take stronger
+        if p_flb is not None and p_certainty is not None:
+            p_crowd_combined = p_flb if abs(p_flb - p_market) >= abs(p_certainty - p_market) else p_certainty
+        else:
+            p_crowd_combined = p_flb or p_certainty
+
+        # Overreaction and short-term contrarian are correlated — take stronger
+        if p_overreact is not None and p_contrarian is not None:
+            p_revert_combined = p_overreact if abs(p_overreact - p_market) >= abs(p_contrarian - p_market) else p_contrarian
+        else:
+            p_revert_combined = p_overreact or p_contrarian
+
+        # 8 independent sources after de-duplication (13 raw → 4 correlated pairs merged → 8)
+        # time_decay at 0.5, book at 0.5, crowd_bias at 0.8 (well-researched)
         evidence = [
             (p_history, 1.0),
             (p_vol_combined, 1.0),
             (p_time, 0.5),
             (p_mom_combined, 1.0),
-            (p_contrarian, 1.0),
+            (p_revert_combined, 1.0),
             (p_arb, 1.0),
             (p_book, 0.5),
+            (p_crowd_combined, 0.8),
         ]
         active_evidence = [(p, w) for p, w in evidence if p is not None]
 
@@ -251,9 +273,9 @@ class MathEngine:
         edge  = abs(p_final - p_market)
 
         # Kelly uncertainty: fewer evidence sources = less confident sizing
-        # fraction = 0.5 + 0.5 × (n_sources / 7) → range [0.57, 1.0]
-        # 1 source → Kelly × 0.57, all 7 → Kelly × 1.0
-        MAX_SOURCES = 7
+        # fraction = 0.5 + 0.5 × (n_sources / 8) → range [0.56, 1.0]
+        # 1 source → Kelly × 0.56, all 8 → Kelly × 1.0
+        MAX_SOURCES = 8
         confidence_mult = 0.5 + 0.5 * (n_evidence / MAX_SOURCES)
         kelly = round(kelly * confidence_mult, 4)
 
@@ -286,12 +308,12 @@ class MathEngine:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: Edge {edge:.4f} < {min_edge:.4f} (×{ev_mult:.2f} {theme})")
             return None
 
-        # Determine if contrarian is the dominant evidence
+        # Determine if contrarian/overreaction is the dominant evidence
         is_contrarian = False
-        if p_contrarian is not None and contrarian_conf > 0.3:
-            # Contrarian is dominant if its contribution exceeds other evidence
-            contrarian_shift = abs(p_contrarian - p_market)
-            other_shifts = [abs(e - p_market) for e in [p_history, p_volume, p_time, p_momentum] if e is not None]
+        if p_revert_combined is not None and (contrarian_conf > 0.3 or p_overreact is not None):
+            # Contrarian/overreaction is dominant if its contribution exceeds other evidence
+            contrarian_shift = abs(p_revert_combined - p_market)
+            other_shifts = [abs(e - p_market) for e in [p_history, p_volume, p_time, p_momentum, p_crowd_combined] if e is not None]
             max_other = max(other_shifts) if other_shifts else 0
             if contrarian_shift > max_other:
                 is_contrarian = True
@@ -331,6 +353,9 @@ class MathEngine:
             "neg_risk_market_id": market.get("neg_risk_market_id", ""),
             "n_evidence": n_evidence,
             "p_book":     p_book,
+            "p_flb":      p_flb,
+            "p_certainty": p_certainty,
+            "p_overreact": p_overreact,
             "source":     "math",
         }
 
@@ -544,6 +569,93 @@ class MathEngine:
         else:
             p_book = p_market - strength   # sell pressure → YES down
         return round(max(0.02, min(0.98, p_book)), 4)
+
+    def _favorite_longshot_bias(self, market: dict) -> Optional[float]:
+        """Favorite-Longshot Bias: crowds overprice longshots, underprice favorites.
+        Well-documented in prediction markets (Snowberg & Wolfers 2010, Ottaviani & Sørensen 2015).
+        Calibration curve: p_true = p_market^α / (p_market^α + (1-p_market)^α), α≈1.2
+        At 10¢: true prob ~7.5% (overpriced longshot → sell/NO)
+        At 90¢: true prob ~92.5% (underpriced favorite → buy/YES)
+        Only fires in tails (<20¢ or >80¢) where bias is strongest."""
+        p = market["yes_price"]
+        # Only apply in the tails where FLB is strongest
+        if 0.20 <= p <= 0.80:
+            return None
+        # Power calibration with α=1.2 (conservative, well-supported by literature)
+        alpha = 1.2
+        p_a = p ** alpha
+        q_a = (1 - p) ** alpha
+        p_flb = p_a / (p_a + q_a)
+        # Minimum shift threshold — don't signal for tiny corrections
+        if abs(p_flb - p) < 0.01:
+            return None
+        log.debug(f"[MATH] FLB {market['id'][:8]}: market={p:.2f} → fair={p_flb:.4f} (shift {(p_flb-p)*100:+.1f}%)")
+        return round(max(0.02, min(0.98, p_flb)), 4)
+
+    def _certainty_gradient(self, market: dict) -> Optional[float]:
+        """Certainty effect: people are irrational near 0% and 100%.
+        Near 95-99%: fear of 'what if' → sell too early → price is underpriced → buy YES
+        Near 1-5%: lottery ticket buying → price is overpriced → buy NO
+        Uses exponential scaling: stronger effect closer to the extremes.
+        Only fires in deep tails (<8¢ or >92¢) to avoid overlap with FLB."""
+        p = market["yes_price"]
+        if 0.08 <= p <= 0.92:
+            return None
+        if p > 0.92:
+            # Near certainty: crowd discounts too much
+            # At 95¢ → shift +1.5%, at 99¢ → shift +3%
+            distance = p - 0.92  # 0 to 0.08
+            shift = distance * 0.375  # 0.08 * 0.375 = 3% max
+            p_cert = p + shift
+        else:
+            # Near impossibility: crowd overprices lottery tickets
+            # At 5¢ → shift -1.5%, at 1¢ → shift -3%
+            distance = 0.08 - p  # 0 to 0.08
+            shift = distance * 0.375
+            p_cert = p - shift
+        if abs(p_cert - p) < 0.005:
+            return None
+        log.debug(f"[MATH] Certainty {market['id'][:8]}: market={p:.2f} → fair={p_cert:.4f} (shift {(p_cert-p)*100:+.1f}%)")
+        return round(max(0.02, min(0.98, p_cert)), 4)
+
+    def _overreaction_decay(self, market_id: str, current_price: float) -> Optional[float]:
+        """Detect rapid price moves (overreaction) and predict exponential decay back.
+        If price moved >10% in last 10 ticks (~2 min), expect partial reversion.
+        Different from mean_reversion: this fires on SPEED of move, not magnitude.
+        Uses dp/dt (rate of change) rather than absolute deviation.
+        Reversion = overshoot × e^(-λ) where λ scales with move speed."""
+        hist = self._price_cache.get(market_id, [])
+        if len(hist) < 10:
+            return None
+        # Rate of change over last 10 ticks
+        recent = hist[-10:]
+        move = recent[-1] - recent[0]
+        abs_move = abs(move)
+        # Need rapid move: >8% in ~10 ticks
+        if abs_move < 0.08:
+            return None
+        # Speed: move per tick (higher = more likely overreaction)
+        speed = abs_move / len(recent)
+        # Check if move is decelerating (sign of exhaustion)
+        last_half = recent[-5:]
+        first_half = recent[:5]
+        accel = abs(last_half[-1] - last_half[0]) - abs(first_half[-1] - first_half[0])
+        # If still accelerating, it may be informed — skip
+        if accel > 0.01:
+            return None
+        # Predict reversion: faster move = more reversion expected
+        # λ = speed × 15 (tuned: speed 0.01/tick → λ=0.15 → revert 14%)
+        lam = min(0.4, speed * 15)
+        import math as _math
+        reversion_pct = 1 - _math.exp(-lam)  # fraction of move that reverts
+        # Cap reversion at 50% of move (never predict full reversal)
+        reversion_pct = min(0.5, reversion_pct)
+        p_revert = current_price - move * reversion_pct
+        p_revert = round(max(0.02, min(0.98, p_revert)), 4)
+        if abs(p_revert - current_price) < 0.01:
+            return None
+        log.info(f"[MATH] Overreaction {market_id[:8]}: move={move:+.3f} speed={speed:.4f}/tick → revert {reversion_pct*100:.0f}% (λ={lam:.2f})")
+        return p_revert
 
     def build_neg_risk_groups(self, markets: list):
         """Group neg-risk markets by their shared event ID for arbitrage detection."""
