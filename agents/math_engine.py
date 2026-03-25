@@ -273,6 +273,9 @@ class MathEngine:
         if ev < min_ev:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {min_ev:.4f} (×{ev_mult:.2f} {theme})")
             return None
+        if ev > 0.30:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} > 0.30 (likely overestimated edge)")
+            return None
         if kl < min_kl:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: KL {kl:.4f} < {min_kl:.4f} (×{ev_mult:.2f} {theme})")
             return None

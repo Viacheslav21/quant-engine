@@ -43,16 +43,16 @@ CONFIG = {
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
     "MIN_EV":           float(os.getenv("MIN_EV", "0.12")),
     "MIN_KL":           float(os.getenv("MIN_KL", "0.08")),
-    "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.01")),
-    "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.15")),
+    "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.03")),
+    "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.20")),
     "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.15")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.25")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
-    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.08")),
+    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.10")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
-    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v5"),
+    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v6"),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
     "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
@@ -318,12 +318,12 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         tp_pct = config["TAKE_PROFIT_PCT"]
         sl_pct = config["STOP_LOSS_PCT"]
 
-    # Volatility-based SL: SL = max(MIN_SL, 2.5 × ATR / entry_price)
-    # Low volatility → tight SL, high volatility → wider SL
+    # Volatility-based SL: SL = max(MIN_SL, 4.0 × ATR / entry_price)
+    # Floor 15% — 8% was too tight, caused 24% WR on <1h positions (stopped on noise)
     volatility = signal.get("volatility", 0)
     if volatility > 0 and signal["side_price"] > 0.10:  # skip vol SL for very cheap positions
-        vol_sl = 2.5 * volatility / signal["side_price"]
-        vol_sl = max(0.08, min(sl_pct, round(vol_sl, 3)))  # floor 8%, cap at default SL
+        vol_sl = 4.0 * volatility / signal["side_price"]
+        vol_sl = max(0.15, min(sl_pct, round(vol_sl, 3)))  # floor 15%, cap at default SL
         log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
         sl_pct = vol_sl
 

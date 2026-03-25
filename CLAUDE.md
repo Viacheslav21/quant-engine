@@ -84,7 +84,7 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
 - **Order book imbalance**: 10th evidence source from WS book events. `imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)` over top-5 price levels. Threshold |imbalance| > 0.3. Shift: 0.3→±1%, 1.0→±4%. Weight 0.5 in Bayesian fusion (short-term, noisy). Flipped for NO tokens.
 - **Bid-price SL/TP**: Position monitoring uses bid price (realistic exit price) instead of mid-price. YES positions: YES best_bid. NO positions: 1 − YES best_ask (= NO bid). Prevents premature closes from spread inflation and matches real execution price.
 - **Signal ranking**: `kelly × (1 - entropy × 0.3)` — penalizes 50/50 markets.
-- **Position management**: Per-position TP/SL with volatility-based SL. SL = 2.5 × ATR / entry_price (floor 8%, cap at default). Default SL: normal 30%, contrarian 25%. TP: normal 20%, contrarian 10%. Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: API `is_closed` flag or extreme price (≥99¢/≤1¢); price-based uses linear payout (not binary) as safety.
+- **Position management**: Per-position TP/SL with volatility-based SL. SL = 4.0 × ATR / entry_price (floor 15%, cap at default). Default SL: normal 30%, contrarian 25%. TP: normal 20%, contrarian 10%. Trailing TP: tracks peak PnL, closes on 5% pullback from peak when peak ≥ 50% of TP target. Resolution detection: API `is_closed` flag or extreme price (≥99¢/≤1¢); price-based uses linear payout (not binary) as safety.
 - **Displacement**: When slots full, new signal (EV > 25%) can close worst position. Profitable positions displaced easily; losing positions only if new EV > 2× old EV. Returns bool, caller aborts if displacement failed (race protection).
 - **Drawdown protection**: Tracks peak equity (free cash + position values). Peak restored from real equity on restart (not just BANKROLL env). Halts all new trades when drawdown ≥ 25%. Continues monitoring and closing existing positions. Resume after recovery + 30 min cooldown.
 - **Double-close protection**: `close_position` uses `WHERE status='open' RETURNING id` — concurrent WS + REST close attempts are safe.
@@ -135,7 +135,7 @@ PostgreSQL required. Schema auto-created on startup by `db.init()`. 12 tables: m
 - **Double-close protection**: `close_position` atomic with `WHERE status='open' RETURNING id`. WS + REST can't double-count.
 - **Portfolio correlation**: Three-layer protection against correlated risk. (1) NegRisk groups (ρ=1.0): positions sharing negRiskMarketID = 1 effective bet, max 5% bankroll. (2) Theme clusters (ρ=0.5): 14 iran positions = ~2 effective bets, stake limited per effective bet. (3) Worst-case: all theme positions hit SL simultaneously must be < 15% bankroll. Only restricts new entries, never closes existing.
 - **Position limits**: Max open (configurable, default 75), max 10 per theme.
-- **Volatility-based SL**: ATR-scaled stop loss (2.5 × ATR / entry_price), floor 8%, cap at default SL.
+- **Volatility-based SL**: ATR-scaled stop loss (4.0 × ATR / entry_price), floor 15%, cap at default SL. (Previously floor 8% — caused 24% WR on positions closed <1h due to noise stops.)
 - **Trailing TP**: Tracks peak profit, closes on 5% pullback once peak ≥ 50% of TP target.
 - **Displacement**: Only when EV > 25%; losing positions protected unless new signal is 2× better. Race-safe (returns bool).
 - **Conservative Kelly**: 0.15 fraction of full Kelly. Contrarian trades halved again. Zero stake on negative bankroll.
