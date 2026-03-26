@@ -1079,9 +1079,13 @@ async def main():
                     details={"spread": sig.get("spread"), "volatility": sig.get("volatility"),
                              "liquidity": sig.get("liquidity"), "vol_signal": sig.get("vol_signal"),
                              "vol_dir": sig.get("vol_dir"), "source": sig.get("source", "math"),
+                             "p_history": sig.get("p_history"),
                              "p_momentum": sig.get("p_momentum"), "p_long_mom": sig.get("p_long_mom"),
                              "p_contrarian": sig.get("p_contrarian"), "p_vol_trend": sig.get("p_vol_trend"),
-                             "p_arb": sig.get("p_arb"), "contrarian_conf": sig.get("contrarian_conf"),
+                             "p_arb": sig.get("p_arb"), "p_book": sig.get("p_book"),
+                             "p_flb": sig.get("p_flb"), "p_certainty": sig.get("p_certainty"),
+                             "p_overreact": sig.get("p_overreact"),
+                             "contrarian_conf": sig.get("contrarian_conf"),
                              "p_mispriced": sig.get("p_mispriced")})
                 executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
                 if executed:

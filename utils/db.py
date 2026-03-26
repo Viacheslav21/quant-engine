@@ -159,6 +159,14 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_trade_log_market ON trade_log(market_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trader_commands_status ON trader_commands(status) WHERE status='pending';
+                CREATE TABLE IF NOT EXISTS dma_weights (
+                    source TEXT PRIMARY KEY,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    hits INTEGER DEFAULT 0,
+                    misses INTEGER DEFAULT 0,
+                    avg_likelihood REAL DEFAULT 0.5,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
             """)
             log.info("[DB] Schema created")
         except Exception as e:
@@ -548,6 +556,40 @@ class Database:
         except Exception as e:
             log.error(f"[DB] close_position failed: {e}")
             raise
+
+    # ── DMA (Dynamic Model Averaging) ──
+
+    async def get_dma_weights(self) -> dict:
+        """Get current DMA weights for all sources. Returns {source: weight}."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT source, weight FROM dma_weights")
+            return {r["source"]: float(r["weight"]) for r in rows}
+
+    async def save_dma_weights(self, weights: dict):
+        """Upsert all DMA weights."""
+        async with self.pool.acquire() as conn:
+            for source, data in weights.items():
+                await conn.execute("""
+                    INSERT INTO dma_weights (source, weight, hits, misses, avg_likelihood, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, NOW())
+                    ON CONFLICT (source) DO UPDATE SET
+                        weight = $2, hits = $3, misses = $4, avg_likelihood = $5, updated_at = NOW()
+                """, source, data["weight"], data["hits"], data["misses"], data["avg_likelihood"])
+
+    async def get_closed_positions_with_signals(self, limit: int = 100) -> list:
+        """Get recently closed positions with their signal source probabilities from trade_log."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT p.id, p.market_id, p.side, p.side_price, p.result, p.pnl,
+                       p.p_final, p.theme, p.closed_at,
+                       tl.details
+                FROM positions p
+                LEFT JOIN trade_log tl ON tl.position_id = p.id AND tl.event_type = 'SIGNAL_GENERATED'
+                WHERE p.status = 'closed' AND p.result IS NOT NULL
+                ORDER BY p.closed_at DESC
+                LIMIT $1
+            """, limit)
+            return [dict(r) for r in rows]
 
     # ── CLV (Closing Line Value) ──
 

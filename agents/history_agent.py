@@ -25,6 +25,8 @@ class HistoryAgent:
         if len(closed_positions) >= 10:
             await self._calibrate_system(closed_positions)
 
+        await self._update_dma_weights()
+
         log.info("[HISTORY] ✅ Анализ завершён")
 
     async def _compute_base_rates(self, markets: list):
@@ -178,3 +180,123 @@ class HistoryAgent:
         await self.db.save_calibration("final", brier, bias, factor, len(preds))
         self.calibrator.update_from_history("final", brier, bias, factor)
         log.info(f"[HISTORY] Calibration: Brier={brier:.4f} bias={bias:+.4f} factor={factor:.4f}")
+
+    # ── DMA: Dynamic Model Averaging ──
+
+    # Sources tracked: map from trade_log details key → DMA source name
+    DMA_SOURCES = {
+        "p_history":    "history",
+        "p_momentum":   "momentum",
+        "p_long_mom":   "long_momentum",
+        "p_contrarian": "contrarian",
+        "p_vol_trend":  "volume",
+        "p_arb":        "arb",
+        "p_book":       "book",     # stored in details as p_book (from SIGNAL_GENERATED)
+        "p_flb":        "crowd",    # FLB is part of crowd_combined
+    }
+    FORGETTING_FACTOR = 0.97
+
+    async def _update_dma_weights(self):
+        """Recalculate DMA weights from closed positions + their signal source probabilities."""
+        try:
+            positions = await self.db.get_closed_positions_with_signals(limit=200)
+        except Exception as e:
+            log.warning(f"[DMA] Failed to fetch positions: {e}")
+            return
+
+        if len(positions) < 20:
+            log.info(f"[DMA] Not enough closed positions ({len(positions)}), need 20+")
+            return
+
+        # Load current weights or init
+        current = await self.db.get_dma_weights()
+        weights = {}
+        for src in self.DMA_SOURCES.values():
+            weights[src] = {
+                "weight": current.get(src, 1.0),
+                "hits": 0,
+                "misses": 0,
+                "likelihoods": [],
+            }
+
+        # Process each closed position
+        processed = 0
+        for pos in positions:
+            details = pos.get("details") or {}
+            if isinstance(details, str):
+                import json
+                try:
+                    details = json.loads(details)
+                except Exception:
+                    continue
+
+            side = pos.get("side", "YES")
+            result = pos.get("result")
+            if result not in ("WIN", "LOSS"):
+                continue
+
+            won = result == "WIN"
+
+            for detail_key, src_name in self.DMA_SOURCES.items():
+                p_val = details.get(detail_key)
+                if p_val is None:
+                    continue
+                p_val = float(p_val)
+                if p_val <= 0 or p_val >= 1:
+                    continue
+
+                # Did this source predict the correct direction?
+                # For YES side: p > 0.5 means source predicted YES → correct if won
+                # For NO side: p < 0.5 means source predicted NO → correct if won
+                if side == "YES":
+                    source_said_yes = p_val > 0.5
+                else:
+                    source_said_yes = p_val < 0.5  # low p_yes = predicted NO
+
+                correct = (source_said_yes and won) or (not source_said_yes and not won)
+
+                # Likelihood: how confident was the source in the correct direction
+                if correct:
+                    likelihood = abs(p_val - 0.5) * 2  # 0.5→0, 1.0→1.0
+                    weights[src_name]["hits"] += 1
+                else:
+                    likelihood = 1.0 - abs(p_val - 0.5) * 2
+                    weights[src_name]["misses"] += 1
+
+                weights[src_name]["likelihoods"].append(max(0.01, likelihood))
+
+            processed += 1
+
+        if processed < 10:
+            return
+
+        # Apply forgetting factor + likelihood update
+        alpha = self.FORGETTING_FACTOR
+        for src_name, data in weights.items():
+            if not data["likelihoods"]:
+                continue
+            avg_l = sum(data["likelihoods"]) / len(data["likelihoods"])
+            # DMA update: w_new = w_old^α × avg_likelihood
+            old_w = data["weight"]
+            data["weight"] = (old_w ** alpha) * (avg_l + 0.5)  # +0.5 to keep weights centered around 1.0
+            data["avg_likelihood"] = round(avg_l, 4)
+
+        # Normalize: mean weight = 1.0
+        all_weights = [d["weight"] for d in weights.values() if d["weight"] > 0]
+        if all_weights:
+            mean_w = sum(all_weights) / len(all_weights)
+            if mean_w > 0:
+                for data in weights.values():
+                    data["weight"] = round(max(0.3, min(2.0, data["weight"] / mean_w)), 4)
+
+        # Save to DB
+        await self.db.save_dma_weights(weights)
+
+        # Log
+        for src_name, data in sorted(weights.items(), key=lambda x: -x[1]["weight"]):
+            total = data["hits"] + data["misses"]
+            wr = data["hits"] / total * 100 if total > 0 else 0
+            log.info(
+                f"[DMA] {src_name:12s} w={data['weight']:.2f} | "
+                f"{data['hits']}H/{data['misses']}M ({wr:.0f}%) | L={data.get('avg_likelihood', 0):.3f}"
+            )

@@ -81,6 +81,7 @@ class MathEngine:
         self._price_cache: dict = {}  # market_id -> list of recent prices (30 points, ~5 min)
         self._long_price_cache: dict = {}  # market_id -> list of recent prices (180 points, ~30 min)
         self._neg_risk_groups: dict = {}  # neg_risk_market_id -> [market dicts] for arbitrage
+        self._dma_weights: dict = {}  # source_name -> weight (from DMA)
         self._ml_url = config.get("ML_API_URL")  # e.g. http://quant-ml.railway.internal:8080
         self._ml_client = None
 
@@ -123,6 +124,14 @@ class MathEngine:
     async def load_patterns(self):
         self._patterns = await self.db.get_patterns()
         log.info(f"[MATH] Загружено {len(self._patterns)} паттернов")
+        # Load DMA weights
+        try:
+            self._dma_weights = await self.db.get_dma_weights()
+            if self._dma_weights:
+                top = sorted(self._dma_weights.items(), key=lambda x: -x[1])[:3]
+                log.info(f"[MATH] DMA weights loaded: {', '.join(f'{k}={v:.2f}' for k,v in top)}...")
+        except Exception:
+            self._dma_weights = {}
 
     def analyze(self, market: dict) -> Optional[dict]:
         p_market = market["yes_price"]
@@ -231,17 +240,18 @@ class MathEngine:
             w_revert = 1.0
 
         # 8 independent sources after de-duplication (13 raw → 4 correlated pairs merged → 8)
-        # Weights: time_decay 0.5 (weak), book 0.8 (R²=0.65), crowd 0.8 (researched)
-        # Momentum & contrarian scaled by Hurst exponent
+        # Base weights: time_decay 0.5 (weak), book 0.8 (R²=0.65), crowd 0.8 (researched)
+        # Hurst scales momentum vs contrarian; DMA scales all sources by track record
+        dma = self._dma_weights  # {source: weight} from history agent
         evidence = [
-            (p_history, 1.0),
-            (p_vol_combined, 1.0),
-            (p_time, 0.5),
-            (p_mom_combined, w_mom),
-            (p_revert_combined, w_revert),
-            (p_arb, 1.0),
-            (p_book, 0.8),
-            (p_crowd_combined, 0.8),
+            (p_history,         1.0  * dma.get("history", 1.0)),
+            (p_vol_combined,    1.0  * dma.get("volume", 1.0)),
+            (p_time,            0.5),  # time decay: structural, not learned
+            (p_mom_combined,    w_mom * dma.get("momentum", 1.0)),
+            (p_revert_combined, w_revert * dma.get("contrarian", 1.0)),
+            (p_arb,             1.0  * dma.get("arb", 1.0)),
+            (p_book,            0.8  * dma.get("book", 1.0)),
+            (p_crowd_combined,  0.8  * dma.get("crowd", 1.0)),
         ]
         active_evidence = [(p, w) for p, w in evidence if p is not None]
 
