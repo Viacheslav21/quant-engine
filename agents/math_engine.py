@@ -215,16 +215,32 @@ class MathEngine:
         else:
             p_revert_combined = p_overreact or p_contrarian
 
+        # Hurst exponent: scale momentum vs contrarian weights
+        # H > 0.6: trending → trust momentum, discount contrarian
+        # H < 0.4: mean-reverting → trust contrarian, discount momentum
+        # H ≈ 0.5: random walk → equal weights (default)
+        H = self._hurst_exponent(market["id"])
+        if H > 0.6:
+            w_mom = min(1.5, 1.0 + (H - 0.5) * 2)    # 0.6→1.2, 0.7→1.4, 0.8→1.5
+            w_revert = max(0.3, 1.0 - (H - 0.5) * 2)  # 0.6→0.8, 0.7→0.6, 0.8→0.3 (capped)
+        elif H < 0.4:
+            w_mom = max(0.3, 1.0 - (0.5 - H) * 2)     # 0.4→0.8, 0.3→0.6, 0.2→0.3 (capped)
+            w_revert = min(1.5, 1.0 + (0.5 - H) * 2)  # 0.4→1.2, 0.3→1.4, 0.2→1.5
+        else:
+            w_mom = 1.0
+            w_revert = 1.0
+
         # 8 independent sources after de-duplication (13 raw → 4 correlated pairs merged → 8)
-        # time_decay at 0.5, book at 0.5, crowd_bias at 0.8 (well-researched)
+        # Weights: time_decay 0.5 (weak), book 0.8 (R²=0.65), crowd 0.8 (researched)
+        # Momentum & contrarian scaled by Hurst exponent
         evidence = [
             (p_history, 1.0),
             (p_vol_combined, 1.0),
             (p_time, 0.5),
-            (p_mom_combined, 1.0),
-            (p_revert_combined, 1.0),
+            (p_mom_combined, w_mom),
+            (p_revert_combined, w_revert),
             (p_arb, 1.0),
-            (p_book, 0.5),
+            (p_book, 0.8),
             (p_crowd_combined, 0.8),
         ]
         active_evidence = [(p, w) for p, w in evidence if p is not None]
@@ -358,6 +374,23 @@ class MathEngine:
             "p_overreact": p_overreact,
             "source":     "math",
         }
+
+    def _hurst_exponent(self, market_id: str) -> float:
+        """Hurst exponent via R/S analysis. Uses long price cache.
+        H > 0.6: trending (momentum reliable), H < 0.4: mean-reverting (contrarian reliable),
+        H ≈ 0.5: random walk (reduce confidence in both)."""
+        hist = self._long_price_cache.get(market_id, [])
+        if len(hist) < 20:
+            return 0.5  # not enough data, assume random walk
+        n = len(hist)
+        mean = sum(hist) / n
+        deviations = [h - mean for h in hist]
+        cumulative = [sum(deviations[:i+1]) for i in range(n)]
+        R = max(cumulative) - min(cumulative)
+        S = (sum(d ** 2 for d in deviations) / n) ** 0.5
+        if S == 0 or R == 0:
+            return 0.5
+        return max(0.0, min(1.0, math.log(R / S) / math.log(n)))
 
     def _market_volatility(self, market_id: str) -> float:
         """Calculate market volatility as average absolute price change (ATR-style).

@@ -15,6 +15,7 @@ class Database:
         self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10, command_timeout=30)
         await self._create_schema()
         await self._migrate_positions_tp_sl()
+        await self._migrate_clv()
         await self._migrate_patterns_theme_perf()
         await self._backfill_executed_signals()
         await self._init_stats()
@@ -238,6 +239,24 @@ class Database:
             if "config_tag" not in col_names:
                 await conn.execute("ALTER TABLE positions ADD COLUMN config_tag TEXT DEFAULT 'v0'")
                 log.info("[DB] Added config_tag column to positions")
+
+    async def _migrate_clv(self):
+        """Add CLV (Closing Line Value) columns to positions for entry quality tracking."""
+        async with self.pool.acquire() as conn:
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='positions'"
+            )
+            col_names = {r["column_name"] for r in cols}
+            new_cols = {
+                "clv_1h":         "REAL",   # market price 1h after entry
+                "clv_4h":         "REAL",   # market price 4h after entry
+                "clv_24h":        "REAL",   # market price 24h after entry
+                "clv_close":      "REAL",   # market price at resolution/close
+            }
+            for col, typ in new_cols.items():
+                if col not in col_names:
+                    await conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {typ}")
+                    log.info(f"[DB] Added {col} column to positions (CLV tracking)")
 
     async def _migrate_patterns_theme_perf(self):
         """Add per-theme performance columns to patterns for Bayesian theme calibration."""
@@ -529,6 +548,94 @@ class Database:
         except Exception as e:
             log.error(f"[DB] close_position failed: {e}")
             raise
+
+    # ── CLV (Closing Line Value) ──
+
+    async def update_clv(self, pos_id: str, column: str, price: float):
+        """Update a CLV column (clv_1h, clv_4h, clv_24h, clv_close) if not already set."""
+        if column not in ("clv_1h", "clv_4h", "clv_24h", "clv_close"):
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(f"""
+                UPDATE positions SET {column} = $1
+                WHERE id = $2 AND {column} IS NULL AND status = 'open'
+            """, price, pos_id)
+
+    async def update_clv_close(self, pos_id: str, price: float):
+        """Set CLV at close time (always overwrite)."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE positions SET clv_close = $1 WHERE id = $2",
+                price, pos_id,
+            )
+
+    async def get_clv_analytics(self) -> dict:
+        """Compute CLV stats: do we consistently enter at better prices than market moves to?"""
+        async with self.pool.acquire() as conn:
+            # CLV = (entry_price - clv_price) / entry_price for our side
+            # Positive CLV = we bought cheaper than later price (good entry)
+            # For YES: positive if price went UP after we bought
+            # For NO: positive if price went DOWN after we bought (= NO price went up)
+            rows = await conn.fetch("""
+                SELECT side, side_price, clv_1h, clv_4h, clv_24h, clv_close,
+                       result, theme, config_tag
+                FROM positions
+                WHERE status = 'closed' AND side_price > 0
+                ORDER BY closed_at DESC LIMIT 500
+            """)
+            if not rows:
+                return {"avg_clv_1h": 0, "avg_clv_4h": 0, "avg_clv_24h": 0, "avg_clv_close": 0,
+                        "total": 0, "positive_clv_pct": 0, "by_theme": [], "by_tag": []}
+
+            def clv_val(row, col):
+                v = row.get(col)
+                if v is None or v <= 0:
+                    return None
+                entry = row["side_price"]
+                if row["side"] == "YES":
+                    return (v - entry) / entry  # price went up = good entry
+                else:
+                    return (entry - v) / entry  # YES price went down = NO price up = good entry
+
+            clvs = {"1h": [], "4h": [], "24h": [], "close": []}
+            by_theme = {}
+            by_tag = {}
+
+            for r in rows:
+                for label, col in [("1h", "clv_1h"), ("4h", "clv_4h"), ("24h", "clv_24h"), ("close", "clv_close")]:
+                    v = clv_val(r, col)
+                    if v is not None:
+                        clvs[label].append(v)
+
+                # Per-theme CLV (use clv_close as primary)
+                cv = clv_val(r, "clv_close")
+                if cv is not None:
+                    theme = r.get("theme") or "other"
+                    by_theme.setdefault(theme, []).append(cv)
+                    tag = r.get("config_tag") or "?"
+                    by_tag.setdefault(tag, []).append(cv)
+
+            def avg(lst):
+                return round(sum(lst) / len(lst) * 100, 2) if lst else 0
+
+            def pos_pct(lst):
+                return round(sum(1 for v in lst if v > 0) / len(lst) * 100, 1) if lst else 0
+
+            theme_stats = [{"theme": t, "avg_clv": avg(vs), "positive_pct": pos_pct(vs), "n": len(vs)}
+                           for t, vs in sorted(by_theme.items(), key=lambda x: -len(x[1]))]
+            tag_stats = [{"tag": t, "avg_clv": avg(vs), "positive_pct": pos_pct(vs), "n": len(vs)}
+                         for t, vs in sorted(by_tag.items(), key=lambda x: -len(x[1]))]
+
+            return {
+                "avg_clv_1h": avg(clvs["1h"]),
+                "avg_clv_4h": avg(clvs["4h"]),
+                "avg_clv_24h": avg(clvs["24h"]),
+                "avg_clv_close": avg(clvs["close"]),
+                "positive_clv_pct": pos_pct(clvs["close"]),
+                "total": len(rows),
+                "by_theme": theme_stats,
+                "by_tag": tag_stats,
+            }
 
     # ── Trader Commands ──
 

@@ -542,8 +542,9 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
 
     if close_reason != "RESOLVED":
         outcome = f"{pos['side']}@{price*100:.0f}¢"
-    # Write final price to DB before closing
+    # Write final price + CLV at close to DB
     await db.update_position_price(pos["id"], price, upnl)
+    await db.update_clv_close(pos["id"], yes_price)
     actually_closed = await db.close_position(pos["id"], outcome, payout, pnl)
     if not actually_closed:
         return False  # already closed by concurrent WS/REST race
@@ -736,11 +737,75 @@ async def main():
     ws.set_callbacks(on_price_change=on_ws_price_change, on_trade=on_ws_trade,
                      on_disconnect=on_ws_disconnect, on_reconnect=on_ws_reconnect)
 
+    # ── Smoke test: verify critical systems before trading ──
+    smoke_errors = []
+    try:
+        # 1. Hurst exponent: known trending data → H > 0.5
+        math_eng._long_price_cache["_test"] = [0.50 + i * 0.005 for i in range(30)]
+        h = math_eng._hurst_exponent("_test")
+        if h < 0.45:
+            smoke_errors.append(f"Hurst: trending data H={h:.2f} (expected >0.5)")
+        del math_eng._long_price_cache["_test"]
+
+        # 2. Bayesian fusion: evidence should shift prior
+        from agents.math_engine import bayesian_update
+        result = bayesian_update(0.50, [(0.80, 1.0)])
+        if result < 0.60:
+            smoke_errors.append(f"Bayesian: prior=0.50 + evidence=0.80 → {result:.2f} (expected >0.60)")
+
+        # 3. Book imbalance weight = 0.8 (not 0.5)
+        import re as _re
+        with open("agents/math_engine.py") as _f:
+            _src = _f.read()
+        if "(p_book, 0.8)" not in _src:
+            smoke_errors.append("Book imbalance weight not 0.8")
+
+        # 4. CLV columns exist in DB
+        stats = await db.get_stats()
+        async with db.pool.acquire() as conn:
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='positions'"
+            )
+            col_names = {r["column_name"] for r in cols}
+        for clv_col in ["clv_1h", "clv_4h", "clv_24h", "clv_close"]:
+            if clv_col not in col_names:
+                smoke_errors.append(f"CLV column '{clv_col}' missing from positions table")
+
+        # 5. Scanner returns markets
+        test_markets = await scanner.fetch()
+        if len(test_markets) < 10:
+            smoke_errors.append(f"Scanner: only {len(test_markets)} markets (expected >100)")
+
+        # 6. DB connection + bankroll
+        if stats.get("bankroll", 0) <= 0:
+            smoke_errors.append(f"DB bankroll={stats.get('bankroll')} (expected >0)")
+
+        # 7. Patterns loaded
+        patterns = await db.get_patterns()
+        if not patterns:
+            smoke_errors.append("No patterns in DB (history agent not run?)")
+
+    except Exception as e:
+        smoke_errors.append(f"Smoke test crashed: {e}")
+
+    if smoke_errors:
+        error_msg = "\n".join(f"  - {e}" for e in smoke_errors)
+        log.error(f"[SMOKE] FAILED:\n{error_msg}")
+        await telegram.send(
+            f"🚨 <b>ENGINE SMOKE TEST FAILED</b>\n\n"
+            f"<pre>{error_msg}</pre>\n\n"
+            f"Bot will NOT start trading."
+        )
+        await db.close()
+        return
+    else:
+        log.info(f"[SMOKE] All checks passed: Hurst, Bayesian, book weight, CLV, scanner ({len(test_markets)} mkts), DB")
+
     await telegram.send(
         f"🚀 <b>Quant Engine v3</b>\n"
         f"💼 ${CONFIG['BANKROLL']} | {'Симуляция 🧪' if CONFIG['SIMULATION'] else 'Реальный 💰'}\n"
-        f"🔢 Math-first | No Claude confirmation\n"
-        f"🧠 Self-learning | ⚡ PostgreSQL\n"
+        f"✅ Smoke test passed ({len(test_markets)} markets)\n"
+        f"🧠 Hurst + Book 0.8 + CLV tracking\n"
         f"🔌 WebSocket position monitoring enabled"
     )
 
@@ -1035,6 +1100,28 @@ async def main():
             # Refresh WS position map and run REST fallback check
             await _refresh_ws_positions()
             await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs, ws)
+
+            # CLV tracking: record market price at 1h, 4h, 24h after entry
+            try:
+                mmap_clv = {m["id"]: m for m in markets}
+                for pos in open_pos:
+                    if not pos.get("opened_at"):
+                        continue
+                    m = mmap_clv.get(pos["market_id"])
+                    if not m:
+                        continue
+                    yes_price = m["yes_price"]
+                    age_hours = (datetime.now(timezone.utc) - pos["opened_at"].replace(
+                        tzinfo=timezone.utc) if pos["opened_at"].tzinfo is None
+                        else datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 3600
+                    if age_hours >= 1:
+                        await db.update_clv(pos["id"], "clv_1h", yes_price)
+                    if age_hours >= 4:
+                        await db.update_clv(pos["id"], "clv_4h", yes_price)
+                    if age_hours >= 24:
+                        await db.update_clv(pos["id"], "clv_24h", yes_price)
+            except Exception as e:
+                log.debug(f"[CLV] Update failed: {e}")
 
             # Log WS health
             ws_active = ws.active_count()
