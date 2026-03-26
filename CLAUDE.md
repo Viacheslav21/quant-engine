@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Quant Engine v3 — a prediction market trading bot for Polymarket. Uses Bayesian probability fusion (9 raw evidence sources → 6 de-duplicated), prospect theory, price momentum, mean reversion, negRisk arbitrage, ML calibration, and optional Claude AI confirmation to generate and execute trading signals with Kelly criterion position sizing. Includes drawdown protection, theme concentration limits, and comprehensive trade logging to PostgreSQL.
+Quant Engine v3 — a prediction market trading bot for Polymarket. Uses Bayesian probability fusion (13 raw evidence sources → 8 de-duplicated), Hurst exponent for signal selection, DMA (Dynamic Model Averaging) for adaptive evidence weights, prospect theory, price momentum, mean reversion, negRisk arbitrage, ML calibration, and optional Claude AI confirmation to generate and execute trading signals with Kelly criterion position sizing. Includes CLV tracking, drawdown protection, theme concentration limits, smoke tests at startup, and comprehensive trade logging to PostgreSQL.
 
 ## Commands
 

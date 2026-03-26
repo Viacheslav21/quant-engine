@@ -34,29 +34,43 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 CONFIG = {
+    # ── Credentials ──
     "ANTHROPIC_KEY":    os.getenv("ANTHROPIC_API_KEY"),
     "TELEGRAM_TOKEN":   os.getenv("TELEGRAM_BOT_TOKEN"),
     "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID"),
+    "ML_API_URL":       os.getenv("ML_API_URL", ""),
+
+    # ── Core ──
     "BANKROLL":         float(os.getenv("BANKROLL", "1000")),
     "SIMULATION":       os.getenv("SIMULATION", "true").lower() == "true",
+    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v7"),
+
+    # ── Timing ──
     "SCAN_INTERVAL":    int(os.getenv("SCAN_INTERVAL", "300")),
     "HISTORY_INTERVAL": int(os.getenv("HISTORY_INTERVAL", "14400")),
+
+    # ── Signal thresholds ──
     "MIN_EV":           float(os.getenv("MIN_EV", "0.12")),
     "MIN_KL":           float(os.getenv("MIN_KL", "0.08")),
+    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.10")),
     "MIN_KELLY_FRAC":   float(os.getenv("MIN_KELLY_FRAC", "0.03")),
     "MAX_KELLY_FRAC":   float(os.getenv("MAX_KELLY_FRAC", "0.20")),
-    "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
-    "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
+
+    # ── Position management ──
     "TAKE_PROFIT_PCT":  float(os.getenv("TAKE_PROFIT_PCT", "0.15")),
     "STOP_LOSS_PCT":    float(os.getenv("STOP_LOSS_PCT", "0.25")),
     "TRAILING_TP":      os.getenv("TRAILING_TP", "true").lower() == "true",
-    "MIN_EDGE":         float(os.getenv("MIN_EDGE", "0.10")),
+    "TRAILING_PULLBACK": float(os.getenv("TRAILING_PULLBACK", "0.05")),  # was hardcoded 5%
+
+    # ── Capacity ──
+    "MAX_OPEN":         int(os.getenv("MAX_OPEN", "50")),
+    "MAX_PER_THEME":    int(os.getenv("MAX_PER_THEME", "10")),  # was hardcoded
+    "MAX_SIGNALS":      int(os.getenv("MAX_SIGNALS", "5")),     # was hardcoded confirmed[:5]
+
+    # ── Market filters ──
+    "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
-    "CONFIG_TAG":       os.getenv("CONFIG_TAG", "v6"),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
-    "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
-    "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
-    "ML_API_URL":       os.getenv("ML_API_URL", ""),  # e.g. http://quant-ml.railway.internal:8080
 }
 
 _claude_client = None
@@ -196,8 +210,8 @@ async def bootstrap_history(db: Database, scanner: PolymarketScanner):
 
     log.info(f"[BOOTSTRAP] Loaded {total} historical markets for training")
 
-MAX_PER_THEME = 10  # no more than 10 positions in the same theme
-MAX_PER_OTHER = 10  # "other" theme gets same limit
+MAX_PER_THEME = CONFIG["MAX_PER_THEME"]
+MAX_PER_OTHER = CONFIG["MAX_PER_THEME"]
 
 DISPLACE_MIN_EV = 0.25  # new signal must have EV > 25% to displace
 
@@ -525,7 +539,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         current_high = max(prev_high, pnl_pct)
         trailing_highs[pos["id"]] = current_high
         pullback = current_high - pnl_pct
-        if pullback >= 0.05 and current_high >= tp_pct * 0.5:
+        if pullback >= config.get("TRAILING_PULLBACK", 0.05) and current_high >= tp_pct * 0.5:
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
             pnl = round(payout - pos["stake_amt"], 2)
             close_reason = "TRAILING_TP"
@@ -1042,10 +1056,10 @@ async def main():
                             log.info(f"[ML] {sig['market_id'][:8]} p_ml={p_ml:.2f} p_final:{old_final:.2f}→{sig['p_final']:.2f} EV:{sig['ev']*100:+.1f}%")
 
             # All signals that pass math filters are confirmed directly
-            confirmed = signals[:5]
+            confirmed = signals[:CONFIG["MAX_SIGNALS"]]
 
             mmap = {m["id"]: m for m in markets}
-            for sig in confirmed[:5]:
+            for sig in confirmed[:CONFIG["MAX_SIGNALS"]]:
                 sig_id = f"sig_{sig['market_id'][:8]}_{int(now)}"
                 await db.save_signal({
                     "id":          sig_id,
