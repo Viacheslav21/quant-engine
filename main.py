@@ -807,7 +807,7 @@ async def main():
         f"🚀 <b>Quant Engine v3</b>\n"
         f"💼 ${CONFIG['BANKROLL']} | {'Симуляция 🧪' if CONFIG['SIMULATION'] else 'Реальный 💰'}\n"
         f"✅ Smoke test passed ({len(test_markets)} markets)\n"
-        f"🧠 Hurst + Book 0.8 + CLV tracking\n"
+        f"🧠 Hurst + Book 0.8 + CLV + DMA\n"
         f"🔌 WebSocket position monitoring enabled"
     )
 

@@ -216,6 +216,7 @@ class HistoryAgent:
                 "weight": current.get(src, 1.0),
                 "hits": 0,
                 "misses": 0,
+                "avg_likelihood": 0.5,
                 "likelihoods": [],
             }
 
