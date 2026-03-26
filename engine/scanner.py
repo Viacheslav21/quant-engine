@@ -67,7 +67,8 @@ THEME_KEYWORDS = {
     "space":      ["nasa","spacex","rocket","satellite","mars","moon","orbit","launch","starship",
                    "blue origin","artemis","iss"],
     "social":     ["elon musk","musk","tweet","twitter","x.com","post","followers","tiktok",
-                   "instagram","youtube","subscribers","views","downloads"],
+                   "instagram","youtube","subscribers","views","downloads",
+                   "mrbeast","mr beast","pewdiepie","streamer","influencer","viral"],
 
     # Society
     "health":     ["covid","pandemic","vaccine","fda","who ","health","disease","outbreak",
