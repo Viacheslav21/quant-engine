@@ -1070,7 +1070,7 @@ async def main():
                     "p_market":    sig["p_market"],
                     "p_math":      sig.get("p_prospect"),
                     "p_history":   sig.get("p_history"),
-                    "p_claude":    sig.get("p_claude"),
+                    "p_claude":    sig.get("p_ml") or sig.get("p_claude"),  # p_ml stored in p_claude column
                     "p_final":     sig["p_final"],
                     "ev":          sig["ev"],
                     "kl":          sig["kl"],
