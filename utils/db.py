@@ -590,7 +590,7 @@ class Database:
                        p.p_final, p.theme, p.closed_at,
                        tl.details
                 FROM positions p
-                LEFT JOIN trade_log tl ON tl.position_id = p.id AND tl.event_type = 'SIGNAL_GENERATED'
+                LEFT JOIN trade_log tl ON tl.signal_id = p.signal_id AND tl.event_type = 'SIGNAL_GENERATED'
                 WHERE p.status = 'closed' AND p.result IS NOT NULL
                 ORDER BY p.closed_at DESC
                 LIMIT $1
@@ -1003,7 +1003,7 @@ class Database:
                         WHEN (side='YES' AND result='WIN') OR (side='NO' AND result='LOSS')
                         THEN 1.0 ELSE 0.0
                     END)::numeric, 3) as actual_wr
-                FROM positions WHERE status='closed'
+                FROM positions WHERE status='closed' AND outcome IN ('YES', 'NO')
                 GROUP BY bucket ORDER BY bucket
             """)
 
