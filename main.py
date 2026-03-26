@@ -276,6 +276,7 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
         f"❓ {pos['question'][:120]}\n"
         f"🎲 {side_label} | Вход:{pos['side_price']*100:.1f}¢ → Выход:{price*100:.1f}¢\n"
         f"💰 P&L:<b>{pnl:+.2f}$</b> ({pnl_pct*100:+.1f}%) → слот для лучшего сигнала\n"
+        f"🏷 Config: <b>{pos.get('config_tag', CONFIG.get('CONFIG_TAG', '?'))}</b>\n"
         f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>"
     )
     return True
@@ -368,7 +369,11 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         "sl_pct":     sl_pct,
         "config_tag": config.get("CONFIG_TAG", "v1"),
     }
-    await db.save_position(pos)
+    saved = await db.save_position(pos)
+    if not saved:
+        log.warning(f"[EXEC] Duplicate position blocked by DB: {signal['market_id'][:8]} {signal['question'][:50]}")
+        await db.log_event("SIGNAL_REJECTED", **_rej_base, details={"reason": "duplicate_market_db_guard"})
+        return False
     await db.log_event("OPEN",
         market_id=signal["market_id"], position_id=pos["id"], signal_id=signal.get("id"),
         question=signal["question"], theme=signal.get("theme"), side=signal["side"],
@@ -389,6 +394,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         f"🧮 p_true:<b>{signal['p_final']*100:.1f}%</b> vs рынок:<b>{signal['p_market']*100:.1f}%</b>\n"
         f"🎯 TP:{tp_pct*100:.0f}% | SL:{sl_pct*100:.0f}%\n\n"
         f"💵 Ставка: <b>${stake}</b> | Банк: ${bankroll:.2f}\n"
+        f"🏷 Config: <b>{config.get('CONFIG_TAG', '?')}</b>\n"
         f"🔗 <a href='{signal.get('url','')}'>Polymarket</a>"
     )
     return True
@@ -479,6 +485,7 @@ async def process_trader_commands(db: Database, telegram: TelegramBot,
                     f"💰 P&L: <b>{pnl:+.2f}$</b> (ставка ${pos['stake_amt']:.2f})\n"
                     f"📊 WR:{wr}% ({stats['wins']}W/{stats['losses']}L) | Банк:${stats['bankroll']:.2f}"
                     f"{_lifetime}\n"
+                    f"🏷 Config: <b>{pos.get('config_tag', config.get('CONFIG_TAG', '?'))}</b>\n"
                     f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>")
                 await db.complete_command(cmd_id, {"pnl": pnl, "payout": payout, "result": result_str})
                 log.info(f"[CMD] ✅ #{cmd_id}: позиция {pos_id} закрыта | {result_str} PnL:{pnl:+.2f}$")
@@ -620,6 +627,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         f"🎯 EV:{pos.get('ev',0)*100:+.1f}% | TP:{tp_pct*100:.0f}% | SL:{sl_pct*100:.0f}%\n"
         f"📊 WR:{wr}% ({stats['wins']}W/{stats['losses']}L) | Банк:${stats['bankroll']:.2f}\n"
         f"{_lifetime}\n"
+        f"🏷 Config: <b>{pos.get('config_tag', CONFIG.get('CONFIG_TAG', '?'))}</b>\n"
         f"🔗 <a href='{pos.get('url','')}'>Polymarket</a>"
     )
     return True
@@ -810,6 +818,7 @@ async def main():
         await telegram.send(
             f"🚨 <b>ENGINE SMOKE TEST FAILED</b>\n\n"
             f"<pre>{error_msg}</pre>\n\n"
+            f"🏷 Config: <b>{CONFIG['CONFIG_TAG']}</b>\n"
             f"Bot will NOT start trading."
         )
         await db.close()
@@ -822,6 +831,7 @@ async def main():
         f"💼 ${CONFIG['BANKROLL']} | {'Симуляция 🧪' if CONFIG['SIMULATION'] else 'Реальный 💰'}\n"
         f"✅ Smoke test passed ({len(test_markets)} markets)\n"
         f"🧠 Hurst + Book 0.8 + CLV + DMA\n"
+        f"🏷 Config: <b>{CONFIG['CONFIG_TAG']}</b>\n"
         f"🔌 WebSocket position monitoring enabled"
     )
 
@@ -949,6 +959,7 @@ async def main():
                     f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
                     f"Drawdown: <b>{drawdown*100:.1f}%</b> >= {MAX_DRAWDOWN*100:.0f}% limit\n"
                     f"Open positions: {len(open_pos)}\n\n"
+                    f"🏷 Config: <b>{CONFIG['CONFIG_TAG']}</b>\n"
                     f"No new trades until recovery + 30 min cooldown."
                 )
             if trading_halted:
@@ -963,7 +974,8 @@ async def main():
                     await telegram.send(
                         f"✅ <b>TRADING RESUMED</b>\n\n"
                         f"Equity: <b>${equity:.2f}</b> (peak: ${peak_equity:.2f})\n"
-                        f"Drawdown: {drawdown*100:.1f}% < {MAX_DRAWDOWN*50:.0f}% recovery threshold"
+                        f"Drawdown: {drawdown*100:.1f}% < {MAX_DRAWDOWN*50:.0f}% recovery threshold\n"
+                        f"🏷 Config: <b>{CONFIG['CONFIG_TAG']}</b>"
                     )
                 else:
                     # Still halted — process commands + monitor positions only

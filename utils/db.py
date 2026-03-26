@@ -159,6 +159,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_trade_log_market ON trade_log(market_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_trader_commands_status ON trader_commands(status) WHERE status='pending';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_market ON positions(market_id) WHERE status='open';
                 CREATE TABLE IF NOT EXISTS dma_weights (
                     source TEXT PRIMARY KEY,
                     weight REAL NOT NULL DEFAULT 1.0,
@@ -501,7 +502,8 @@ class Database:
             """, limit)
             return [dict(r) for r in rows]
 
-    async def save_position(self, pos: dict):
+    async def save_position(self, pos: dict) -> bool:
+        """Save position. Returns False if duplicate open position on same market (unique index guard)."""
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
@@ -524,6 +526,10 @@ class Database:
                         WHERE id=1
                     """, pos["ev"], pos["kelly"])
             log.info(f"[DB] Position opened: {pos['id']} {pos['side']} ${pos['stake_amt']:.2f} on {pos['question'][:50]}")
+            return True
+        except asyncpg.UniqueViolationError:
+            log.warning(f"[DB] Duplicate position blocked: market {pos['market_id']} already has open position")
+            return False
         except Exception as e:
             log.error(f"[DB] save_position failed: {e}")
             raise
