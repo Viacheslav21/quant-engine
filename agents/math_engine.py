@@ -105,7 +105,13 @@ class MathEngine:
                     end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                 days_to_expiry = max(0, (end_date - datetime.now(timezone.utc)).days)
 
-            r = await client.get(f"{self._ml_url}/predict", params={
+            # Compute engine-side features for ML
+            hurst = self._hurst_exponent(market["id"])
+            book_imb = market.get("book_imbalance")
+            vol_hist = self._vol_history.get(market["id"], [])
+            vol_ratio = vol_hist[-1] / (sum(vol_hist) / len(vol_hist)) if len(vol_hist) >= 3 and sum(vol_hist) > 0 else None
+
+            params = {
                 "yes_price": market["yes_price"],
                 "theme": market.get("theme", "other"),
                 "volume": market.get("volume", 0),
@@ -115,7 +121,14 @@ class MathEngine:
                 "question_length": len(market.get("question", "")),
                 "has_numbers": any(c.isdigit() for c in market.get("question", "")),
                 "spread": market.get("spread", 0),
-            })
+                "hurst": round(hurst, 3),
+            }
+            if book_imb is not None:
+                params["book_imbalance"] = round(book_imb, 3)
+            if vol_ratio is not None:
+                params["volume_ratio"] = round(vol_ratio, 2)
+
+            r = await client.get(f"{self._ml_url}/predict", params=params)
             return r.json()
         except Exception as e:
             log.debug(f"[ML] Predict failed: {e}")
