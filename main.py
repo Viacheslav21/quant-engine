@@ -757,7 +757,9 @@ async def main():
         import re as _re
         with open("agents/math_engine.py") as _f:
             _src = _f.read()
-        if "(p_book, 0.8)" not in _src:
+        # Check that book weight base is 0.8 (line like: p_book, 0.8 * dma...)
+        import re as _re
+        if not _re.search(r"p_book.*0\.8", _src):
             smoke_errors.append("Book imbalance weight not 0.8")
 
         # 4. CLV columns exist in DB
