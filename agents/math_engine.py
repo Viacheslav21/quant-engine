@@ -146,12 +146,39 @@ class MathEngine:
         except Exception:
             self._dma_weights = {}
 
+    @staticmethod
+    def _parse_question_date(question: str):
+        """Extract specific date from question text (e.g. 'on March 22, 2026?').
+        Returns datetime or None. Handles negRisk sub-markets where end_date is for the whole event."""
+        import re
+        from datetime import datetime as _dt, timezone as _tz
+        # Pattern: "on March 22, 2026" or "on March 22" or "March 20-26" (use first date)
+        m = re.search(r'(?:on|by|before)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:,?\s+(\d{4}))?', question, re.IGNORECASE)
+        if not m:
+            return None
+        month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
+        year = int(year_str) if year_str else _dt.now(_tz.utc).year
+        try:
+            return _dt.strptime(f"{month_str} {day_str} {year}", "%B %d %Y").replace(tzinfo=_tz.utc)
+        except ValueError:
+            return None
+
     def analyze(self, market: dict) -> Optional[dict]:
         p_market = market["yes_price"]
         theme    = market.get("theme","other")
 
-        # 0. Skip markets too far in the future (don't freeze capital)
+        # 0. Skip expired markets — check both end_date AND date parsed from question
+        # For negRisk events, end_date is for the whole event, but question has specific date
         max_days = int(self.config.get("MAX_MARKET_DAYS", 90))
+        question = market.get("question", "")
+        question_date = self._parse_question_date(question)
+        if question_date:
+            from datetime import datetime as _dt, timezone as _tz
+            q_days_left = (question_date - _dt.now(_tz.utc)).days
+            if q_days_left < -1:  # -1 to allow same-day markets (timezone grace)
+                log.debug(f"[MATH] Skipping expired question date: {question[:60]} ({-q_days_left}d ago)")
+                return None
+
         end_date = market.get("end_date")
         if end_date:
             try:
@@ -159,6 +186,9 @@ class MathEngine:
                     from datetime import datetime as _dt, timezone as _tz
                     end_date = _dt.fromisoformat(end_date.replace("Z", "+00:00"))
                 days_left = (end_date - datetime.now(timezone.utc)).days
+                if days_left < 0:
+                    log.debug(f"[MATH] Skipping expired market: {question[:60]} (expired {-days_left}d ago)")
+                    return None
                 if days_left > max_days:
                     return None
             except Exception:
