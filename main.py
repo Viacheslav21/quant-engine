@@ -401,7 +401,8 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
 
 _last_db_price_update: dict = {}  # pos_id -> timestamp of last DB write
 DB_PRICE_UPDATE_INTERVAL = 30  # update DB every 30 seconds, not every tick
-_loss_cooldown: dict = {}  # market_id -> timestamp, don't re-enter after SL for 2h
+_loss_cooldown: dict = {}  # market_id -> (timestamp, sl_count), escalating cooldown
+_loss_count: dict = {}  # market_id -> total SL count (persistent within session)
 
 async def process_trader_commands(db: Database, telegram: TelegramBot,
                                   scanner, config: dict, trailing_highs: dict,
@@ -578,10 +579,20 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         log.info(f"[WS] Unsubscribing {pos['market_id'][:8]} after {close_reason}: {pos['question'][:60]}")
         await ws.unsubscribe_market(pos["market_id"])
 
-    # Loss cooldown — don't re-enter same market after SL for 2 hours
+    # Escalating loss cooldown: 1st SL → 2h, 2nd → 8h, 3rd+ → 24h (blocked for session)
     if close_reason == "STOP_LOSS":
         import time as _t
-        _loss_cooldown[pos["market_id"]] = _t.time()
+        mid = pos["market_id"]
+        _loss_count[mid] = _loss_count.get(mid, 0) + 1
+        n = _loss_count[mid]
+        if n >= 3:
+            cooldown_s = 86400  # 24h — effectively blocked
+        elif n == 2:
+            cooldown_s = 28800  # 8h
+        else:
+            cooldown_s = 7200   # 2h
+        _loss_cooldown[mid] = _t.time() + cooldown_s  # store expiry time, not start time
+        log.info(f"[RISK] Loss cooldown: {mid[:8]} SL #{n} → blocked {cooldown_s//3600}h")
 
     stats = await db.get_stats()
     total = stats["wins"] + stats["losses"]
@@ -907,7 +918,6 @@ async def main():
     scan_count = 0
     _market_price_cache = {}
     _signal_cooldown = {}
-    LOSS_COOLDOWN = 7200  # 2 hours
     try:
         saved_metrics = await db.get_all_market_metrics()
         for m in saved_metrics:
@@ -1032,11 +1042,11 @@ async def main():
             _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
             all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
 
-            # Loss cooldown — don't re-enter market for 2h after SL
-            _loss_cooldown = {k: v for k, v in _loss_cooldown.items() if now - v < LOSS_COOLDOWN}
+            # Escalating loss cooldown — expiry time stored in _loss_cooldown
+            _loss_cooldown = {k: v for k, v in _loss_cooldown.items() if v > now}  # keep unexpired
             loss_blocked = {k for k in all_signals if k in _loss_cooldown}
             if loss_blocked:
-                log.info(f"[SCAN] Loss cooldown blocked {len(loss_blocked)} signals")
+                log.info(f"[SCAN] Loss cooldown blocked {len(loss_blocked)} signals (counts: {', '.join(f'{k[:8]}={_loss_count.get(k,0)}' for k in loss_blocked)})")
             all_signals = {k: v for k, v in all_signals.items() if k not in _loss_cooldown}
 
             # Filter out markets where we already have an open position
