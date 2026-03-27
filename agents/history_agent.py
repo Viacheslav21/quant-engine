@@ -102,6 +102,7 @@ class HistoryAgent:
             theme = p.get("theme", "other")
             by_theme[theme].append(p)
 
+        existing_patterns = await self.db.get_patterns()
         for theme, trades in by_theme.items():
             n = len(trades)
             wins = sum(1 for t in trades if t.get("result") == "WIN")
@@ -131,8 +132,7 @@ class HistoryAgent:
             ev_mult = round(max(0.7, min(2.0, (global_wr / wr_adj) * roi_factor)) if wr_adj > 0 else 1.5, 3)
 
             # Update pattern with trade performance
-            existing = await self.db.get_patterns()
-            pat = existing.get(theme, {})
+            pat = existing_patterns.get(theme, {})
             await self.db.upsert_pattern(theme, {
                 "base_rate":       pat.get("base_rate", 0.5),
                 "sample_size":     pat.get("sample_size", 0),

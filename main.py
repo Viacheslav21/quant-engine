@@ -928,6 +928,37 @@ async def main():
         log.info(f"[MAIN] Restored {len(saved_metrics)} market caches, {len(_signal_cooldown)} cooldowns from DB")
     except Exception as e:
         log.warning(f"[MAIN] Could not restore metrics: {e}")
+
+    # Restore loss cooldowns from DB — count SLs per market in last 24h
+    try:
+        async with db.pool.acquire() as conn:
+            sl_rows = await conn.fetch("""
+                SELECT market_id, COUNT(*) as sl_count, MAX(created_at) as last_sl
+                FROM trade_log
+                WHERE event_type = 'CLOSE_SL'
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY market_id HAVING COUNT(*) >= 1
+            """)
+            import time as _t
+            for r in sl_rows:
+                mid = r["market_id"]
+                n = r["sl_count"]
+                _loss_count[mid] = n
+                # Apply cooldown based on count
+                if n >= 3:
+                    cooldown_s = 86400
+                elif n == 2:
+                    cooldown_s = 28800
+                else:
+                    cooldown_s = 7200
+                last_sl_ts = r["last_sl"].timestamp() if r["last_sl"] else _t.time()
+                expiry = last_sl_ts + cooldown_s
+                if expiry > _t.time():
+                    _loss_cooldown[mid] = expiry
+            if _loss_cooldown:
+                log.info(f"[MAIN] Restored {len(_loss_cooldown)} loss cooldowns from DB ({sum(_loss_count.values())} total SLs)")
+    except Exception as e:
+        log.warning(f"[MAIN] Could not restore loss cooldowns: {e}")
     daily_report_sent = None
     # Compute real equity at startup for accurate drawdown protection
     _startup_stats = await db.get_stats()
@@ -1116,6 +1147,7 @@ async def main():
                     "volume_ratio":sig.get("vol_signal", 1.0),
                     "source":      sig.get("source","math"),
                 })
+                sig["id"] = sig_id  # attach signal_id so position gets linked
                 _signal_cooldown[sig["market_id"]] = now
                 await db.mark_signal_cooldown(sig["market_id"])
                 await db.log_event("SIGNAL_GENERATED",

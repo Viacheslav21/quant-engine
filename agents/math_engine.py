@@ -306,7 +306,7 @@ class MathEngine:
             (p_history,         1.0  * dma.get("history", 1.0)),
             (p_vol_combined,    1.0  * dma.get("volume", 1.0)),
             (p_time,            0.5),  # time decay: structural, not learned
-            (p_mom_combined,    w_mom * dma.get("momentum", 1.0)),
+            (p_mom_combined,    w_mom * max(dma.get("momentum", 1.0), dma.get("long_momentum", 1.0))),
             (p_revert_combined, w_revert * dma.get("contrarian", 1.0)),
             (p_arb,             1.0  * dma.get("arb", 1.0)),
             (p_book,            0.8  * dma.get("book", 1.0)),
@@ -380,8 +380,9 @@ class MathEngine:
         if ev < min_ev:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {min_ev:.4f} (×{ev_mult:.2f} {theme})")
             return None
-        if ev > 0.30:
-            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} > 0.30 (likely overestimated edge)")
+        max_ev = float(self.config.get("MAX_EV", 0.25))
+        if ev > max_ev:
+            log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} > {max_ev} (overconfident edge)")
             return None
         if kl < min_kl:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: KL {kl:.4f} < {min_kl:.4f} (×{ev_mult:.2f} {theme})")
