@@ -401,6 +401,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
 
 _last_db_price_update: dict = {}  # pos_id -> timestamp of last DB write
 DB_PRICE_UPDATE_INTERVAL = 30  # update DB every 30 seconds, not every tick
+_loss_cooldown: dict = {}  # market_id -> timestamp, don't re-enter after SL for 2h
 
 async def process_trader_commands(db: Database, telegram: TelegramBot,
                                   scanner, config: dict, trailing_highs: dict,
@@ -576,6 +577,11 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
     if ws:
         log.info(f"[WS] Unsubscribing {pos['market_id'][:8]} after {close_reason}: {pos['question'][:60]}")
         await ws.unsubscribe_market(pos["market_id"])
+
+    # Loss cooldown — don't re-enter same market after SL for 2 hours
+    if close_reason == "STOP_LOSS":
+        import time as _t
+        _loss_cooldown[pos["market_id"]] = _t.time()
 
     stats = await db.get_stats()
     total = stats["wins"] + stats["losses"]
@@ -901,6 +907,7 @@ async def main():
     scan_count = 0
     _market_price_cache = {}
     _signal_cooldown = {}
+    LOSS_COOLDOWN = 7200  # 2 hours
     try:
         saved_metrics = await db.get_all_market_metrics()
         for m in saved_metrics:
@@ -1024,6 +1031,13 @@ async def main():
             SIGNAL_COOLDOWN = 300
             _signal_cooldown = {k: v for k, v in _signal_cooldown.items() if now - v < SIGNAL_COOLDOWN}
             all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
+
+            # Loss cooldown — don't re-enter market for 2h after SL
+            _loss_cooldown = {k: v for k, v in _loss_cooldown.items() if now - v < LOSS_COOLDOWN}
+            loss_blocked = {k for k in all_signals if k in _loss_cooldown}
+            if loss_blocked:
+                log.info(f"[SCAN] Loss cooldown blocked {len(loss_blocked)} signals")
+            all_signals = {k: v for k, v in all_signals.items() if k not in _loss_cooldown}
 
             # Filter out markets where we already have an open position
             open_market_ids = {p["market_id"] for p in await db.get_open_positions()}

@@ -1,4 +1,5 @@
 import math
+import re
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -163,9 +164,24 @@ class MathEngine:
         except ValueError:
             return None
 
+    # Patterns for short-term direction bets (coin flips, not tradeable)
+    _SHORT_TERM_PATTERNS = [
+        re.compile(r'up or down', re.I),
+        re.compile(r'higher or lower', re.I),
+        re.compile(r'green or red', re.I),
+        re.compile(r'\d{1,2}:\d{2}\s*(AM|PM)\s*(ET|UTC|PT)', re.I),  # time-specific like "5:20AM ET"
+        re.compile(r'\d{1,2}(AM|PM)\s*-\s*\d{1,2}(AM|PM)', re.I),   # ranges like "9AM-10AM"
+    ]
+
     def analyze(self, market: dict) -> Optional[dict]:
         p_market = market["yes_price"]
         theme    = market.get("theme","other")
+
+        # 0a. Skip short-term direction bets (5-min, hourly crypto — pure coin flips)
+        question = market.get("question", "")
+        for pat in self._SHORT_TERM_PATTERNS:
+            if pat.search(question):
+                return None
 
         # 0. Skip expired markets — check both end_date AND date parsed from question
         # For negRisk events, end_date is for the whole event, but question has specific date
