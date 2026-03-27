@@ -8,7 +8,6 @@
 ## Table of Contents
 
 1. [Current State](#1-current-state)
-2. [Community Strategies](#2-community-strategies)
 3. [Remaining Improvements](#3-remaining-improvements)
 4. [Market Inefficiencies & Microstructure](#4-market-inefficiencies--microstructure)
 5. [References](#5-references)
@@ -47,28 +46,6 @@
 
 **Key insight**: v4 had best WR but still lost money due to TP/SL ratio (breakeven WR=63%).
 
----
-
-## 2. Community Strategies
-
-### Applicable but NOT yet implemented
-
-| Strategy | Source | Action |
-|---|---|---|
-| Whale conviction as evidence source | Reddit #2, Medium #2 | On-chain wallet tracking |
-| News Scalping — first 30 sec | Reddit #3 | RSS/Telegram fast-trigger |
-| Cultural Calendar — fade hype near holidays | Reddit #14 | Holiday calendar modifier |
-| Riskless Rate Discounting | Reddit #11 | Risk-free rate for long markets |
-
-### Not Applicable
-
-- Personality-driven mention trading (Reddit #4)
-- "Girlfriend Poll" (Reddit #8)
-- Partial Resolution Advocacy (Reddit #13)
-- Market Making / LP (Medium #5)
-- Fed Signal Trading (Reddit #5)
-
----
 
 ## 3. Remaining Improvements
 

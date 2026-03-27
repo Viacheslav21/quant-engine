@@ -32,10 +32,13 @@ Deployed via Railway (`Procfile: worker: python main.py`). Graceful shutdown on 
 ```
 Polymarket API → Scanner (500 markets, paginated, every 5 min)
     → Drawdown Check (halt new trades if equity drops ≥25% from peak)
+    → Short-term filter (block "Up or Down", 5-min direction bets — pure noise)
+    → Expired question date filter (parse date from question text for negRisk sub-markets)
     → Math Engine (9 evidence sources → de-duplicate correlated pairs → 6 sources → Bayesian fusion → adaptive drift cap)
     → ML Enrichment (top 5 signals: XGBoost blend 90% math + 10% ML, cap ±5%)
     → Signal Ranking (Kelly × entropy penalty)
     → Signal Cooldown (5 min per market)
+    → Escalating Loss Cooldown (per market_id: 1st SL→2h, 2nd→8h, 3rd+→24h block)
     → Optional Claude Confirmation (if enabled + EV > threshold)
     → Kelly Sizing (0.15 fraction, spread penalty, theme concentration penalty, per-theme Bayesian multiplier)
     → Execution (max per-theme limit, MAX_OPEN total, displacement)
@@ -140,6 +143,10 @@ PostgreSQL required. Schema auto-created on startup by `db.init()`. 12 tables: m
 - **Displacement**: Only when EV > 25%; losing positions protected unless new signal is 2× better. Race-safe (returns bool).
 - **Conservative Kelly**: 0.15 fraction of full Kelly. Contrarian trades halved again. Zero stake on negative bankroll.
 - **Resolution safety**: API-confirmed resolution uses binary payout; price-based (≥99¢) uses linear payout to prevent spike false positives.
+- **Duplicate position guard**: Partial unique index `positions(market_id) WHERE status='open'` — DB-level prevention. `save_position` catches `UniqueViolationError` gracefully.
+- **Escalating loss cooldown**: Per market_id, after SL: 1st→2h, 2nd→8h, 3rd+→24h block. Prevents repeated entries into losing markets (e.g., 13x entries on one market losing -$9.67). `_loss_cooldown` stores expiry timestamps, `_loss_count` tracks SL count per session.
+- **Short-term filter**: Blocks "Up or Down", "Higher or Lower", 5-min direction bets via regex in `math_engine._SHORT_TERM_PATTERNS`. These are pure coin flips (52% WR, -$13.46 total).
+- **Expired question date filter**: `math_engine._parse_question_date()` extracts dates from question text ("on March 22, 2026?"). Blocks negRisk sub-markets where the specific date already passed, even if the event's `end_date` is still in the future.
 
 ### Performance Optimizations
 

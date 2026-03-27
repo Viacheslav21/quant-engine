@@ -1043,7 +1043,8 @@ async def main():
             all_signals = {k: v for k, v in all_signals.items() if k not in _signal_cooldown}
 
             # Escalating loss cooldown — expiry time stored in _loss_cooldown
-            _loss_cooldown = {k: v for k, v in _loss_cooldown.items() if v > now}  # keep unexpired
+            for k in [k for k, v in _loss_cooldown.items() if v <= now]:
+                del _loss_cooldown[k]  # purge expired, mutate in-place (avoid rebinding)
             loss_blocked = {k for k in all_signals if k in _loss_cooldown}
             if loss_blocked:
                 log.info(f"[SCAN] Loss cooldown blocked {len(loss_blocked)} signals (counts: {', '.join(f'{k[:8]}={_loss_count.get(k,0)}' for k in loss_blocked)})")
