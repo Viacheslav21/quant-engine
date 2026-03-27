@@ -542,17 +542,24 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         pnl = round(payout - pos["stake_amt"], 2)
         close_reason = "TAKE_PROFIT"
 
-    # 2b. Trailing take profit
+    # 2b. Trailing take profit with dynamic pullback
+    # The higher the peak profit, the wider the allowed pullback (let winners run)
+    # Base pullback at 50% TP, scales up to 2× base at 100%+ TP
     elif config.get("TRAILING_TP") and pnl_pct >= tp_pct * 0.5:
         prev_high = trailing_highs.get(pos["id"], 0)
         current_high = max(prev_high, pnl_pct)
         trailing_highs[pos["id"]] = current_high
         pullback = current_high - pnl_pct
-        if pullback >= config.get("TRAILING_PULLBACK", 0.05) and current_high >= tp_pct * 0.5:
+        # Dynamic pullback: base × (1 + peak_ratio)
+        # At 50% TP peak: base × 1.5, at 100% TP peak: base × 2.0, at 150%: base × 2.5
+        base_pullback = config.get("TRAILING_PULLBACK", 0.03)
+        peak_ratio = current_high / tp_pct if tp_pct > 0 else 1.0
+        dynamic_pullback = base_pullback * (1.0 + peak_ratio * 0.5)
+        if pullback >= dynamic_pullback and current_high >= tp_pct * 0.5:
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
             pnl = round(payout - pos["stake_amt"], 2)
             close_reason = "TRAILING_TP"
-            log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}%)")
+            log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}% >= {dynamic_pullback*100:.1f}%)")
 
     # 3. Stop loss
     elif pnl_pct <= -sl_pct:
