@@ -334,11 +334,11 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         sl_pct = config["STOP_LOSS_PCT"]
 
     # Volatility-based SL: SL = max(MIN_SL, 4.0 × ATR / entry_price)
-    # Floor 15% — 8% was too tight, caused 24% WR on <1h positions (stopped on noise)
+    # Floor 20% — 8% caused 24% WR, 15% caused 34% WR on <1h. Data shows SL≥25% → 75%+ WR
     volatility = signal.get("volatility", 0)
     if volatility > 0 and signal["side_price"] > 0.10:  # skip vol SL for very cheap positions
         vol_sl = 4.0 * volatility / signal["side_price"]
-        vol_sl = max(0.15, min(sl_pct, round(vol_sl, 3)))  # floor 15%, cap at default SL
+        vol_sl = max(0.20, min(sl_pct, round(vol_sl, 3)))  # floor 20%, cap at default SL
         log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
         sl_pct = vol_sl
 
