@@ -71,6 +71,10 @@ CONFIG = {
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
+    "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
+    "MAX_EV":           float(os.getenv("MAX_EV", "0.20")),
+    "CLAUDE_CONFIRM":   os.getenv("CLAUDE_CONFIRM", "false").lower() == "true",
+    "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
 }
 
 _claude_client = None
@@ -83,60 +87,172 @@ def _get_claude_client(config: dict):
         _claude_client = AsyncAnthropic(api_key=config["ANTHROPIC_KEY"])
     return _claude_client
 
-async def claude_confirm(signal: dict, config: dict, db=None) -> dict:
+async def build_signal_context(signal: dict, config: dict, db=None, open_positions: list = None) -> dict:
+    """Build rich context for Claude confirmation. Contains everything Claude needs to make a decision."""
+    import time as _t
+    theme = signal.get("theme", "other")
+    context = {
+        "health": {
+            "bankroll": 0, "wr": 0, "breakeven_wr": 0, "wr_gap": 0,
+            "7d_pnl": 0, "trend": "unknown",
+        },
+        "signal": {
+            "question": signal.get("question", ""),
+            "side": signal["side"],
+            "side_price": signal["side_price"],
+            "ev": signal["ev"],
+            "kelly": signal["kelly"],
+            "edge": signal.get("edge", 0),
+            "p_final": signal["p_final"],
+            "p_market": signal["p_market"],
+            "theme": theme,
+            "theme_wr": 0, "theme_trend": "?",
+            "n_evidence": signal.get("n_evidence", 0),
+            "is_contrarian": signal.get("contrarian", False),
+            "sources": {},
+            "dma_weights": {},
+            "previous_sl_on_market": _loss_count.get(signal["market_id"], 0),
+            "similar_theme_open": 0, "theme_stake": 0,
+        },
+        "portfolio": {
+            "open_positions": 0, "drawdown": 0,
+            "today_pnl": 0, "largest_theme": "",
+        },
+    }
+    if db:
+        try:
+            stats = await db.get_stats()
+            total = stats["wins"] + stats["losses"]
+            wr = round(stats["wins"] / total * 100, 1) if total > 0 else 0
+            # Breakeven from actual win/loss sizes (not EV/Kelly)
+            async with db.pool.acquire() as _conn:
+                _wl = await _conn.fetchrow("""
+                    SELECT AVG(CASE WHEN pnl > 0 THEN ABS(pnl/stake_amt) END) as avg_win_pct,
+                           AVG(CASE WHEN pnl < 0 THEN ABS(pnl/stake_amt) END) as avg_loss_pct
+                    FROM positions WHERE status='closed' AND result IS NOT NULL AND stake_amt > 0
+                """)
+            avg_win_pct = float(_wl['avg_win_pct'] or 0.13)
+            avg_loss_pct = float(_wl['avg_loss_pct'] or 0.17)
+            breakeven = round(avg_loss_pct / (avg_win_pct + avg_loss_pct) * 100, 1) if (avg_win_pct + avg_loss_pct) > 0 else 50
+            context["health"]["bankroll"] = round(stats["bankroll"])
+            context["health"]["wr"] = wr
+            context["health"]["breakeven_wr"] = breakeven
+            context["health"]["wr_gap"] = round(wr - breakeven, 1)
+
+            # Theme stats from patterns
+            patterns = await db.get_patterns()
+            tp = patterns.get(theme, {})
+            context["signal"]["theme_wr"] = round(float(tp.get("trade_wr", 0)) * 100, 1)
+            context["signal"]["ev_mult"] = round(float(tp.get("ev_mult", 1)), 2)
+            context["signal"]["kelly_mult"] = round(float(tp.get("kelly_mult", 1)), 2)
+
+            # DMA weights
+            dma = await db.get_dma_weights()
+            context["signal"]["dma_weights"] = {k: round(v, 2) for k, v in dma.items()} if dma else {}
+
+            # Source probabilities from signal
+            for src_key in ["p_history", "p_momentum", "p_long_mom", "p_contrarian", "p_vol_trend", "p_arb", "p_book", "p_flb"]:
+                v = signal.get(src_key)
+                if v is not None:
+                    context["signal"]["sources"][src_key] = round(v, 3)
+
+            # Portfolio context
+            open_pos = open_positions or await db.get_open_positions()
+            context["portfolio"]["open_positions"] = len(open_pos)
+            theme_pos = [p for p in open_pos if p.get("theme") == theme]
+            context["signal"]["similar_theme_open"] = len(theme_pos)
+            context["signal"]["theme_stake"] = round(sum(p.get("stake_amt", 0) for p in theme_pos))
+
+            # Today's PnL
+            async with db.pool.acquire() as conn:
+                today_pnl = await conn.fetchval("""
+                    SELECT COALESCE(SUM(pnl), 0) FROM positions
+                    WHERE status='closed' AND closed_at::date = CURRENT_DATE
+                """)
+                context["portfolio"]["today_pnl"] = round(float(today_pnl), 2)
+
+                # 7d PnL
+                pnl_7d = await conn.fetchval("""
+                    SELECT COALESCE(SUM(pnl), 0) FROM positions
+                    WHERE status='closed' AND closed_at > NOW() - INTERVAL '7 days'
+                """)
+                context["health"]["7d_pnl"] = round(float(pnl_7d))
+                context["health"]["trend"] = "improving" if float(pnl_7d) > 0 else "declining"
+
+            # Largest theme by stake
+            from collections import Counter
+            theme_stakes = Counter()
+            for p in open_pos:
+                theme_stakes[p.get("theme", "?")] += p.get("stake_amt", 0)
+            if theme_stakes:
+                top_theme = theme_stakes.most_common(1)[0]
+                context["portfolio"]["largest_theme"] = f"{top_theme[0]}/${round(top_theme[1])}"
+        except Exception as e:
+            log.warning(f"[CLAUDE] Context build error: {e}")
+    return context
+
+async def claude_confirm(signal: dict, config: dict, db=None, open_positions: list = None) -> dict:
+    """Claude confirmation with rich context. Enable via CLAUDE_CONFIRM=true env var."""
     import re, json
     client = _get_claude_client(config)
     use_web = config.get("CLAUDE_WEB_SEARCH", False)
-    SYSTEM = f"""Prediction market analyst. Evaluate if our probability estimate is more accurate than market price{' — search web for latest news first' if use_web else ''}.
-Confirm unless you have SPECIFIC evidence the market price is correct and our estimate is wrong. Math model has already filtered for edge.
-If theme has losing record, slightly reduce p_claude but still confirm if logic is sound. Return ONLY:
+    ctx = await build_signal_context(signal, config, db, open_positions)
+
+    SYSTEM = f"""You are a prediction market analyst for a Polymarket trading bot.
+You receive a signal with full system context. Your job: confirm or reject the trade.
+{'Search the web for latest news about the market topic before deciding.' if use_web else ''}
+
+CONFIRM unless you have SPECIFIC evidence the market price is correct and our model is wrong.
+Consider: theme performance, DMA source reliability, portfolio concentration, loss history on this market.
+Be skeptical of high-EV signals (>18%) — our model tends to be overconfident.
+Be extra skeptical if the theme has WR < 40% or if we already lost on this market.
+
+Return ONLY:
 <json>{{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}}</json>"""
 
-    # Build compact track record
-    track = ""
-    if db:
-        theme = signal.get("theme", "other")
-        s = await db.get_win_loss_stats(theme)
-        if s["theme_w"] + s["theme_l"] > 0:
-            track = f"\n'{theme}': {s['theme_w']}W/{s['theme_l']}L."
-            if s["theme_l"] > s["theme_w"]:
-                track += " LOSING THEME."
-        if s["total_w"] + s["total_l"] > 0:
-            track += f" All: {s['total_w']}W/{s['total_l']}L."
-
+    # Compact context brief for Claude
+    h = ctx["health"]
+    s = ctx["signal"]
+    p = ctx["portfolio"]
     prompt = (
-        f"{signal['question']}\n"
-        f"{signal['side']} @ {signal['side_price']*100:.0f}¢ | "
-        f"Our estimate: {signal['p_final']*100:.0f}% vs market: {signal['p_market']*100:.0f}%"
-        f"{track}\nConfirm?"
+        f"SYSTEM: WR={h['wr']}% (need {h['breakeven_wr']}%) | 7d: {h['7d_pnl']:+d}$ | Bank: ${h['bankroll']} | Open: {p['open_positions']} pos\n\n"
+        f"SIGNAL: {s['side']} \"{s['question'][:100]}\" @ {s['side_price']*100:.0f}c\n"
+        f"  EV: +{s['ev']*100:.1f}% | Edge: {s['edge']*100:.1f}% | Kelly: {s['kelly']*100:.1f}%\n"
+        f"  p_true: {s['p_final']*100:.0f}% vs market: {s['p_market']*100:.0f}% | Sources: {s['n_evidence']}/8\n"
     )
+    if s["sources"]:
+        prompt += f"  Sources: {' '.join(f'{k}={v:.2f}' for k, v in s['sources'].items())}\n"
+    if s["dma_weights"]:
+        top_dma = sorted(s["dma_weights"].items(), key=lambda x: -x[1])[:4]
+        prompt += f"  DMA (best→worst): {' '.join(f'{k}={v:.2f}' for k, v in top_dma)}\n"
+    prompt += (
+        f"\nTHEME [{s['theme']}]: WR={s['theme_wr']}% | ev_mult={s.get('ev_mult', 1):.2f} | kelly_mult={s.get('kelly_mult', 1):.2f}\n"
+        f"  Open: {s['similar_theme_open']} pos, ${s['theme_stake']} staked\n"
+    )
+    if s["previous_sl_on_market"] > 0:
+        prompt += f"  WARNING: {s['previous_sl_on_market']} previous SL on this market\n"
+    if s["is_contrarian"]:
+        prompt += f"  NOTE: Contrarian signal (betting against recent move)\n"
+    prompt += f"\nPORTFOLIO: Today {p['today_pnl']:+.0f}$ | Largest: {p['largest_theme']}\n"
+    prompt += f"\nConfirm this trade?"
+
     try:
         call_args = {
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 200 if not use_web else 300,
+            "max_tokens": 200 if not use_web else 400,
             "system": SYSTEM,
             "messages": [{"role": "user", "content": prompt}],
         }
         if use_web:
-            call_args["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+            call_args["tools"] = [{"type": "web_search_20250305", "name": "web_search",
+                                    "max_uses": 1}]
         r = await client.messages.create(**call_args)
-        final = r.content
-        if use_web and r.stop_reason == "tool_use":
-            tu = next(b for b in r.content if b.type == "tool_use")
-            r2 = await client.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=300, system=SYSTEM,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                messages=[
-                    {"role": "user",      "content": prompt},
-                    {"role": "assistant", "content": r.content},
-                    {"role": "user",      "content": [{"type":"tool_result","tool_use_id":tu.id,"content":"Return your answer as JSON in <json></json> tags."}]},
-                ],
-            )
-            final = r2.content
-        txt   = "".join(b.text for b in final if hasattr(b,"text"))
+        txt = "".join(b.text for b in r.content if hasattr(b, "text"))
         match = re.search(r"<json>([\s\S]*?)</json>", txt)
         if match:
-            return json.loads(match.group(1).strip())
+            result = json.loads(match.group(1).strip())
+            log.info(f"[CLAUDE] {'CONFIRM' if result.get('confirm') else 'REJECT'} {signal['market_id'][:8]} | {result.get('reasoning', '?')}")
+            return result
     except Exception as e:
         log.warning(f"[CLAUDE] {e}")
     return {"confirm": True, "p_claude": signal["p_final"], "confidence": 0.3, "reasoning": "api_error_passthrough"}
@@ -1155,11 +1271,64 @@ async def main():
                                 sig["side_price"])
                             log.info(f"[ML] {sig['market_id'][:8]} p_ml={p_ml:.2f} p_final:{old_final:.2f}→{sig['p_final']:.2f} EV:{sig['ev']*100:+.1f}%")
 
-            # All signals that pass math filters are confirmed directly
-            confirmed = signals[:CONFIG["MAX_SIGNALS"]]
+            # Claude confirmation filter (if enabled via CLAUDE_CONFIRM=true)
+            if CONFIG.get("CLAUDE_CONFIRM") and CONFIG.get("ANTHROPIC_KEY"):
+                confirmed = []
+                from agents.math_engine import expected_value, kelly_fraction
+                for sig in signals[:CONFIG["MAX_SIGNALS"]]:
+                    result = await claude_confirm(sig, CONFIG, db, open_pos)
+                    if result.get("confirm"):
+                        # Blend Claude's probability: 60% math + 40% Claude, cap ±15% drift
+                        p_claude = result.get("p_claude", sig["p_final"])
+                        if p_claude and abs(p_claude - sig["p_final"]) < 0.15:
+                            sig["p_claude"] = p_claude
+                            old_final = sig["p_final"]
+                            sig["p_final"] = round(old_final * 0.6 + p_claude * 0.4, 4)
+                            sig["p_final"] = max(old_final - 0.15, min(old_final + 0.15, sig["p_final"]))
+
+                        # Price freshness check — re-read from WS after Claude delay
+                        ws_data = ws.get_market_data(sig["market_id"]) if ws else {}
+                        fresh_price = ws_data.get("yes_price", 0) if ws_data else 0
+                        if fresh_price > 0 and abs(fresh_price - sig["p_market"]) > 0.01:
+                            old_price = sig["side_price"]
+                            sig["p_market"] = fresh_price
+                            if sig["side"] == "YES":
+                                sig["side_price"] = ws_data.get("best_ask", fresh_price) if ws_data else fresh_price
+                            else:
+                                sig["side_price"] = round(1 - fresh_price, 4)
+                            sig["ev"] = expected_value(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                            sig["kelly"] = kelly_fraction(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                            log.info(f"[CLAUDE] Price refresh: {sig['market_id'][:8]} {old_price*100:.1f}c→{sig['side_price']*100:.1f}c EV:{sig['ev']*100:+.1f}%")
+                            # Re-check EV after price move
+                            if sig["ev"] < CONFIG["MIN_EV"]:
+                                log.info(f"[CLAUDE] Post-refresh EV too low: {sig['ev']*100:.1f}% < {CONFIG['MIN_EV']*100:.0f}%")
+                                continue
+                        else:
+                            sig["ev"] = expected_value(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                            sig["kelly"] = kelly_fraction(
+                                sig["p_final"] if sig["side"] == "YES" else 1 - sig["p_final"],
+                                sig["side_price"])
+                        confirmed.append(sig)
+                    else:
+                        log.info(f"[CLAUDE] Rejected: {sig['market_id'][:8]} {sig['side']} | {result.get('reasoning', '?')}")
+                        await db.log_event("SIGNAL_REJECTED",
+                            market_id=sig["market_id"], question=sig["question"],
+                            theme=sig.get("theme"), side=sig["side"], ev=sig["ev"],
+                            kelly=sig["kelly"], is_simulation=CONFIG["SIMULATION"],
+                            config_tag=CONFIG.get("CONFIG_TAG"),
+                            details={"reason": "claude_rejected", "reasoning": result.get("reasoning"),
+                                     "p_claude": result.get("p_claude"), "confidence": result.get("confidence")})
+            else:
+                confirmed = signals[:CONFIG["MAX_SIGNALS"]]
 
             mmap = {m["id"]: m for m in markets}
-            for sig in confirmed[:CONFIG["MAX_SIGNALS"]]:
+            for sig in confirmed:
                 sig_id = f"sig_{sig['market_id'][:8]}_{int(now)}"
                 await db.save_signal({
                     "id":          sig_id,
