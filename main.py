@@ -399,6 +399,7 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
 
 async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict,
                          scanner: PolymarketScanner = None, math_eng: MathEngine = None):
+    from agents.math_engine import expected_value, kelly_fraction
     open_pos = await db.get_open_positions()
     _rej_base = dict(market_id=signal["market_id"], question=signal["question"],
                       theme=signal.get("theme"), side=signal["side"], ev=signal["ev"],
@@ -436,6 +437,63 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     bankroll = stats.get("bankroll", config["BANKROLL"])
     if math_eng is None:
         math_eng = MathEngine(config, db)
+
+    # --- Pre-execution price recheck ---
+    # Scanner price can be stale (up to 5 min old). Fetch fresh price before entry.
+    # Prevents entering at phantom prices on fast-moving / resolving markets.
+    if scanner:
+        fresh = await scanner.get_market(signal["market_id"])
+        if fresh:
+            if fresh.get("closed"):
+                log.info(f"[RECHECK] ❌ Market closed before execution | {signal['question'][:50]}")
+                await db.log_event("SIGNAL_REJECTED", **_rej_base,
+                                   details={"reason": "market_closed_pre_exec"})
+                return False
+            # accepting_orders=false means market is in review / paused
+            if fresh.get("acceptingOrders") is False or fresh.get("accepting_orders") is False:
+                log.info(f"[RECHECK] ❌ Market not accepting orders (in review) | {signal['question'][:50]}")
+                await db.log_event("SIGNAL_REJECTED", **_rej_base,
+                                   details={"reason": "market_in_review"})
+                return False
+            raw_prices = fresh.get("outcomePrices") or []
+            if isinstance(raw_prices, str):
+                import json as _json2
+                raw_prices = _json2.loads(raw_prices)
+            if raw_prices:
+                fresh_yes = float(raw_prices[0])
+                fresh_ask = float(fresh.get("bestAsk") or fresh_yes)
+                if signal["side"] == "YES":
+                    fresh_price = fresh_ask if 0.01 < fresh_ask < 0.99 else fresh_yes
+                    fresh_p_market = fresh_yes
+                else:
+                    fresh_price = 1 - fresh_yes
+                    fresh_p_market = fresh_yes
+                p_side = signal["p_final"] if signal["side"] == "YES" else 1 - signal["p_final"]
+                fresh_ev = expected_value(p_side, fresh_price)
+                fresh_kelly = kelly_fraction(p_side, fresh_price)
+                fresh_edge = abs(signal["p_final"] - fresh_p_market)
+                price_moved = abs(fresh_price - signal["side_price"]) / signal["side_price"] if signal["side_price"] > 0 else 0
+                min_ev = config["MIN_EV"] * (signal.get("ev_mult", 1.0) or 1.0)
+                if fresh_ev < min_ev:
+                    log.info(f"[RECHECK] ❌ Stale price: {signal['side_price']*100:.1f}¢→{fresh_price*100:.1f}¢ (moved {price_moved*100:+.1f}%) | EV:{signal['ev']*100:.1f}%→{fresh_ev*100:.1f}% < {min_ev*100:.1f}% | {signal['question'][:50]}")
+                    await db.log_event("SIGNAL_REJECTED", **_rej_base, bankroll=bankroll,
+                                       details={"reason": "stale_price", "old_price": signal["side_price"],
+                                                "fresh_price": fresh_price, "old_ev": signal["ev"], "fresh_ev": fresh_ev})
+                    return False
+                if price_moved > 0.005:
+                    log.info(f"[RECHECK] Price updated: {signal['side_price']*100:.1f}¢→{fresh_price*100:.1f}¢ ({price_moved*100:+.1f}%) | EV:{signal['ev']*100:.1f}%→{fresh_ev*100:.1f}% Kelly:{signal['kelly']*100:.1f}%→{fresh_kelly*100:.1f}% | {signal['question'][:50]}")
+                else:
+                    log.info(f"[RECHECK] ✅ Price confirmed: {fresh_price*100:.1f}¢ | EV:{fresh_ev*100:.1f}% | {signal['question'][:50]}")
+                # Update signal with fresh price for accurate position record
+                signal["side_price"] = fresh_price
+                signal["ev"] = fresh_ev
+                signal["kelly"] = fresh_kelly
+                signal["edge"] = fresh_edge
+                signal["p_market"] = fresh_p_market
+            else:
+                log.warning(f"[RECHECK] No price data in fresh response | {signal['question'][:50]}")
+        else:
+            log.warning(f"[RECHECK] API failed, proceeding with scan price {signal['side_price']*100:.1f}¢ | {signal['question'][:50]}")
 
     # Contrarian trades: half Kelly, tighter TP/SL
     kelly = signal["kelly"]
