@@ -333,14 +333,13 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         tp_pct = config["TAKE_PROFIT_PCT"]
         sl_pct = config["STOP_LOSS_PCT"]
 
-    # Volatility-based SL: SL = max(MIN_SL, 4.0 × ATR / entry_price)
-    # Floor 20% — 8% caused 24% WR, 15% caused 34% WR on <1h. Data shows SL≥25% → 75%+ WR
+    # Vol SL disabled — data shows fixed SL=25% (74.6% WR, +$0.92) beats all vol-adjusted SLs
+    # History: 8% floor → 24% WR, 15% → 34% WR, 20% → 55.6% WR. Fixed 25% is the sweet spot.
+    # ATR still logged for monitoring but doesn't override SL
     volatility = signal.get("volatility", 0)
-    if volatility > 0 and signal["side_price"] > 0.10:  # skip vol SL for very cheap positions
-        vol_sl = 4.0 * volatility / signal["side_price"]
-        vol_sl = max(0.20, min(sl_pct, round(vol_sl, 3)))  # floor 20%, cap at default SL
-        log.info(f"[EXEC] Vol SL: ATR={volatility:.5f} → SL:{vol_sl*100:.1f}% (default:{sl_pct*100:.0f}%)")
-        sl_pct = vol_sl
+    if volatility > 0:
+        vol_sl_info = 4.0 * volatility / signal["side_price"] if signal["side_price"] > 0.10 else 0
+        log.info(f"[EXEC] Vol info: ATR={volatility:.5f} → would be SL:{vol_sl_info*100:.1f}% (using fixed:{sl_pct*100:.0f}%)")
 
     stake = math_eng.compute_stake(bankroll, kelly, signal.get("theme"), open_pos,
                                    signal.get("liquidity", 0),
