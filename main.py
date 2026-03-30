@@ -406,6 +406,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                       kelly=signal["kelly"], is_simulation=config["SIMULATION"],
                       config_tag=config.get("CONFIG_TAG"))
     if any(p["market_id"] == signal["market_id"] for p in open_pos):
+        log.info(f"[EXEC] Duplicate: already have position on {signal['market_id'][:8]} | {signal['question'][:50]}")
         await db.log_event("SIGNAL_REJECTED", **_rej_base, details={"reason": "duplicate_market"})
         return False
     theme = signal.get("theme", "other")
