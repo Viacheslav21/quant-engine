@@ -40,6 +40,7 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
     → Signal Cooldown (5 min per market)
     → Escalating Loss Cooldown (per market_id: 1st SL→2h, 2nd→8h, 3rd+→24h block)
     → Optional Claude Confirmation (if enabled + EV > threshold)
+    → MAX_EV cap (default 0.20 — EV>20% signals are overconfident, data shows 46% WR)
     → Kelly Sizing (0.15 fraction, spread penalty, theme concentration penalty, per-theme Bayesian multiplier)
     → Execution (max per-theme limit, MAX_OPEN total, displacement)
     → WS Subscribe (on new position) + instant _ws_positions refresh
@@ -82,7 +83,7 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
 - **Mean reversion**: 180-point long cache (~30 min). Detects >8% moves, volume filter (>2.5x = skip, 1.5-2.5x = weak, <1.5x = strong), EWMA reversion target, confidence-weighted shift.
 - **NegRisk arbitrage**: Groups markets by negRiskMarketID, normalizes prices to sum=1.0.
 - **Kelly criterion**: 0.15 fraction (conservative), spread penalty (3-10¢ → 1.0-0.3x multiplier), capped at MAX_KELLY_FRAC of bankroll. **Uncertainty scaling**: `kelly × (0.5 + 0.5 × n_sources/7)` — 1 evidence source → Kelly ×0.57, all 7 → Kelly ×1.0. Contrarian trades: Kelly × 0.5. Per-theme Bayesian Kelly multiplier (0.3–2.0×) from trade history. Portfolio correlation penalty (see below).
-- **Bayesian theme calibration**: Empirical Bayes shrinkage with k=20. Per-theme adjusted WR = `(n × raw_wr + k × global_wr) / (n + k)`. Kelly multiplier = `adj_wr / global_wr`. EV threshold multiplier combines WR ratio with ROI penalty (losing themes: `1 + |roi| × 3`, profitable: `max(0.7, 1 - roi × 2)`). Recalculated every HISTORY_INTERVAL (4h). Protects against overfitting: themes with <20 trades stay near global behavior.
+- **Nonlinear theme calibration**: Empirical Bayes shrinkage with k=20 for WR/ROI. Nonlinear penalty curves: WR<40% → steep penalty (kelly_mult 0.3-0.65, ev_mult 1.5-3.0×, effectively blocks worst themes when combined with MAX_EV cap), WR 40-55% → neutral, WR>55% → reward (kelly_mult up to 1.5, ev_mult down to 0.7). ROI double-penalty on losing themes (ev_mult × (1 + |roi| × 2)). Auto-recovery: recalculated every HISTORY_INTERVAL — as WR improves, thresholds drop automatically. Example: oil 35% WR → ev_mult=1.74 (need EV≥22.6%), crypto 59% → ev_mult=0.82 (need EV≥10.6%).
 - **Portfolio correlation**: Positions in same negRisk group (ρ=1.0) or theme (ρ=0.5) are correlated. Effective independent bets = `n / (1 + (n-1) × ρ)`. Three checks: (1) negRisk group: positions sharing negRiskMarketID count as 1 effective bet, max 5% bankroll per effective bet. (2) Theme cluster: same formula with ρ=0.5, e.g. 14 iran positions = 1.9 effective bets. (3) Worst-case: if all theme positions hit SL simultaneously, loss must stay < 15% bankroll. Penalty applied as multiplier on stake (min 0.05×). Only limits new positions, never closes existing.
 - **Order book imbalance**: 10th evidence source from WS book events. `imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)` over top-5 price levels. Threshold |imbalance| > 0.3. Shift: 0.3→±1%, 1.0→±4%. Weight 0.5 in Bayesian fusion (short-term, noisy). Flipped for NO tokens.
 - **Bid-price SL/TP**: Position monitoring uses bid price (realistic exit price) instead of mid-price. YES positions: YES best_bid. NO positions: 1 − YES best_ask (= NO bid). Prevents premature closes from spread inflation and matches real execution price.
@@ -138,8 +139,8 @@ PostgreSQL required. Schema auto-created on startup by `db.init()`. 12 tables: m
 - **Double-close protection**: `close_position` atomic with `WHERE status='open' RETURNING id`. WS + REST can't double-count.
 - **Portfolio correlation**: Three-layer protection against correlated risk. (1) NegRisk groups (ρ=1.0): positions sharing negRiskMarketID = 1 effective bet, max 5% bankroll. (2) Theme clusters (ρ=0.5): 14 iran positions = ~2 effective bets, stake limited per effective bet. (3) Worst-case: all theme positions hit SL simultaneously must be < 15% bankroll. Only restricts new entries, never closes existing.
 - **Position limits**: Max open (configurable, default 75), max 10 per theme.
-- **Volatility-based SL**: ATR-scaled stop loss (4.0 × ATR / entry_price), floor 15%, cap at default SL. (Previously floor 8% — caused 24% WR on positions closed <1h due to noise stops.)
-- **Trailing TP**: Tracks peak profit, closes on 5% pullback once peak ≥ 50% of TP target.
+- **Staged SL with grace period**: First hour: emergency SL only (1.5× default, e.g., 37.5% at SL=25%). After 1h: normal SL. Data: <1h positions had 29% WR (noise stops), 6h+ had 60%+ WR. Vol SL disabled — fixed SL from config (data showed SL=0.25-0.30 beats all vol-adjusted SLs: 8%→24% WR, 15%→34%, 20%→56%, 25%→75%+).
+- **Dynamic trailing TP**: Tracks peak profit, uses dynamic pullback that widens with peak height. `pullback = base × (1 + peak_ratio × 0.5)`. At 50% TP peak: base×1.25, at 100% TP: base×1.5, at 150%: base×1.75. Lets winners run longer while protecting small gains quickly.
 - **Displacement**: Only when EV > 25%; losing positions protected unless new signal is 2× better. Race-safe (returns bool).
 - **Conservative Kelly**: 0.15 fraction of full Kelly. Contrarian trades halved again. Zero stake on negative bankroll.
 - **Resolution safety**: API-confirmed resolution uses binary payout; price-based (≥99¢) uses linear payout to prevent spike false positives.

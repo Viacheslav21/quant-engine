@@ -400,8 +400,20 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
 
 _last_db_price_update: dict = {}  # pos_id -> timestamp of last DB write
 DB_PRICE_UPDATE_INTERVAL = 30  # update DB every 30 seconds, not every tick
-_loss_cooldown: dict = {}  # market_id -> (timestamp, sl_count), escalating cooldown
+_loss_cooldown: dict = {}  # market_id -> expiry timestamp, escalating cooldown
 _loss_count: dict = {}  # market_id -> total SL count (persistent within session)
+
+def _position_age_hours(pos: dict) -> float:
+    """Return position age in hours. Uses opened_at from DB."""
+    from datetime import datetime, timezone
+    opened = pos.get("opened_at")
+    if not opened:
+        return 999.0  # unknown age → treat as old (no grace)
+    if isinstance(opened, str):
+        opened = datetime.fromisoformat(opened)
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - opened).total_seconds() / 3600
 
 async def process_trader_commands(db: Database, telegram: TelegramBot,
                                   scanner, config: dict, trailing_highs: dict,
@@ -560,11 +572,25 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
             close_reason = "TRAILING_TP"
             log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}% >= {dynamic_pullback*100:.1f}%)")
 
-    # 3. Stop loss
+    # 3. Stop loss with staged grace period
+    # <1h positions had 29% WR (noise stops). Staged SL: wider first hour, then normal.
+    # Emergency SL (1.5×) still protects against real crashes during grace period.
     elif pnl_pct <= -sl_pct:
-        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-        pnl = round(payout - pos["stake_amt"], 2)
-        close_reason = "STOP_LOSS"
+        pos_age_h = _position_age_hours(pos)
+        if pos_age_h >= 1.0:
+            # Normal SL after 1h
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+            pnl = round(payout - pos["stake_amt"], 2)
+            close_reason = "STOP_LOSS"
+        else:
+            # Grace period (<1h): only emergency SL at 1.5× default
+            emergency_sl = sl_pct * 1.5
+            if pnl_pct <= -emergency_sl:
+                payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+                pnl = round(payout - pos["stake_amt"], 2)
+                close_reason = "STOP_LOSS"
+                log.info(f"[MONITOR] Emergency SL: age={pos_age_h:.1f}h pnl={pnl_pct*100:.1f}% (emergency:{emergency_sl*100:.0f}%)")
+            # else: within grace period + above emergency → hold
 
     if not close_reason:
         return False

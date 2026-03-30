@@ -380,7 +380,7 @@ class MathEngine:
         if ev < min_ev:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} < {min_ev:.4f} (×{ev_mult:.2f} {theme})")
             return None
-        max_ev = float(self.config.get("MAX_EV", 0.25))
+        max_ev = float(self.config.get("MAX_EV", 0.20))
         if ev > max_ev:
             log.debug(f"[MATH] Rejected {market['id'][:8]}: EV {ev:.4f} > {max_ev} (overconfident edge)")
             return None
