@@ -717,7 +717,12 @@ class Database:
 
     async def get_open_positions(self) -> list:
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM positions WHERE status='open' ORDER BY opened_at DESC")
+            rows = await conn.fetch("""
+                SELECT p.*, m.end_date as end_date
+                FROM positions p
+                LEFT JOIN markets m ON p.market_id = m.id
+                WHERE p.status='open' ORDER BY p.opened_at DESC
+            """)
             return [dict(r) for r in rows]
 
     async def get_closed_positions(self, limit: int = 100) -> list:

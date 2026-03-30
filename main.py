@@ -531,6 +531,65 @@ def _position_age_hours(pos: dict) -> float:
         opened = opened.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - opened).total_seconds() / 3600
 
+def _resolution_shield(pos: dict, yes_price: float) -> bool:
+    """Check if position should be shielded from SL for near-expiry resolution.
+    Returns True if shield is active (skip SL).
+
+    Uses EARLIER of: question date (parsed) vs market end_date.
+    This handles "Will X by March 31?" where end_date=March 31 but the
+    event outcome is decided AT the deadline (max uncertainty).
+
+    Shield window: 6-48h before expiry. <6h = too volatile near deadline.
+    Conditions: price confirms our side (>55%) AND loss < 40%.
+    """
+    from datetime import datetime, timezone
+    import re
+
+    # 1. Try question date first (more specific for negRisk sub-markets)
+    question = pos.get("question", "")
+    hours_to_expiry = None
+
+    m = re.search(r'(?:on|by|before)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:,?\s+(\d{4}))?', question, re.IGNORECASE)
+    if m:
+        month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
+        year = int(year_str) if year_str else datetime.now(timezone.utc).year
+        try:
+            qdate = datetime.strptime(f"{month_str} {day_str} {year}", "%B %d %Y").replace(tzinfo=timezone.utc)
+            hours_to_expiry = (qdate - datetime.now(timezone.utc)).total_seconds() / 3600
+        except ValueError:
+            pass
+
+    # 2. Fallback to market end_date
+    if hours_to_expiry is None:
+        end_date = pos.get("end_date")
+        if not end_date:
+            return False
+        try:
+            if isinstance(end_date, str):
+                end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            hours_to_expiry = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
+        except Exception:
+            return False
+
+    # Shield window: 6-48h. <6h = too close to deadline (volatile). >48h = too far.
+    if hours_to_expiry < 6 or hours_to_expiry > 48:
+        return False
+
+    # Check price confirms our direction
+    if pos["side"] == "YES":
+        side_price = yes_price
+    else:
+        side_price = 1 - yes_price
+    if side_price < 0.55:
+        return False
+
+    # Emergency override: if loss > 40%, don't shield
+    pnl_pct = (side_price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
+    if pnl_pct < -0.40:
+        return False
+
+    return True
+
 async def process_trader_commands(db: Database, telegram: TelegramBot,
                                   scanner, config: dict, trailing_highs: dict,
                                   ws: PolymarketWS = None):
@@ -687,6 +746,19 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
             pnl = round(payout - pos["stake_amt"], 2)
             close_reason = "TRAILING_TP"
             log.info(f"[MONITOR] Trailing TP: peak {current_high*100:.1f}% → now {pnl_pct*100:.1f}% (pullback {pullback*100:.1f}% >= {dynamic_pullback*100:.1f}%)")
+
+    # 2c. Resolution shield — if market expires within 48h and price confirms our direction,
+    # skip SL and let it resolve. RESOLVED avg=+$0.80 vs SL avg=-$1.34.
+    # Only activates if market is moving toward resolution in our favor (>60% side price).
+    elif pnl_pct <= -sl_pct and _resolution_shield(pos, yes_price):
+        # Shield active — hold for resolution, just log
+        pos_age_h = _position_age_hours(pos)
+        if not hasattr(_check_position, '_shield_logged'):
+            _check_position._shield_logged = set()
+        if pos["id"] not in _check_position._shield_logged:
+            log.info(f"[SHIELD] Holding {pos['market_id'][:8]} for resolution: pnl={pnl_pct*100:.1f}% age={pos_age_h:.0f}h | {pos['question'][:50]}")
+            _check_position._shield_logged.add(pos["id"])
+        # Don't close — pass through to end of function
 
     # 3. Stop loss with staged grace period
     # <1h positions had 29% WR (noise stops). Staged SL: wider first hour, then normal.
