@@ -187,14 +187,17 @@ class PolymarketScanner:
                     "limit": 100, "offset": offset,
                 })
                 if r.status_code == 429:
-                    log.warning(f"[SCANNER] Rate limited at offset={offset}, waiting 2s...")
-                    import asyncio
-                    await asyncio.sleep(2)
-                    r = await self.client.get(f"{GAMMA_API}/markets", params={
-                        "active": "true", "closed": "false",
-                        "order": "volume24hr", "ascending": "false",
-                        "limit": 100, "offset": offset,
-                    })
+                    for retry_delay in [2, 5, 10]:
+                        log.warning(f"[SCANNER] Rate limited at offset={offset}, waiting {retry_delay}s...")
+                        import asyncio
+                        await asyncio.sleep(retry_delay)
+                        r = await self.client.get(f"{GAMMA_API}/markets", params={
+                            "active": "true", "closed": "false",
+                            "order": "volume24hr", "ascending": "false",
+                            "limit": 100, "offset": offset,
+                        })
+                        if r.status_code != 429:
+                            break
                 if r.status_code != 200:
                     raise Exception(f"HTTP {r.status_code} at offset={offset} after retry")
                 batch = r.json() or []

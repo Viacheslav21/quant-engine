@@ -254,8 +254,8 @@ Return ONLY:
             log.info(f"[CLAUDE] {'CONFIRM' if result.get('confirm') else 'REJECT'} {signal['market_id'][:8]} | {result.get('reasoning', '?')}")
             return result
     except Exception as e:
-        log.warning(f"[CLAUDE] {e}")
-    return {"confirm": True, "p_claude": signal["p_final"], "confidence": 0.3, "reasoning": "api_error_passthrough"}
+        log.warning(f"[CLAUDE] API error, rejecting signal: {e}")
+    return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0.0, "reasoning": "api_error_reject"}
 
 async def bootstrap_history(db: Database, scanner: PolymarketScanner):
     """Load historical closed markets from Polymarket for training. Skips if already done."""
@@ -460,9 +460,16 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
             if isinstance(raw_prices, str):
                 import json as _json2
                 raw_prices = _json2.loads(raw_prices)
+            fresh_yes = None
+            fresh_ask = None
             if raw_prices:
-                fresh_yes = float(raw_prices[0])
-                fresh_ask = float(fresh.get("bestAsk") or fresh_yes)
+                try:
+                    fresh_yes = float(raw_prices[0])
+                    fresh_ask = float(fresh.get("bestAsk") or fresh_yes)
+                except (ValueError, TypeError, IndexError) as e:
+                    log.warning(f"[RECHECK] Invalid price data: {e} | {signal['question'][:50]}")
+                    fresh_yes = None
+            if fresh_yes is not None:
                 if signal["side"] == "YES":
                     fresh_price = fresh_ask if 0.01 < fresh_ask < 0.99 else fresh_yes
                     fresh_p_market = fresh_yes
@@ -751,7 +758,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
                           db: Database, telegram: TelegramBot, ws: PolymarketWS = None) -> bool:
     """Check a single position for TP/SL/resolution. Returns True if position was closed."""
     import time as _time
-    upnl = (price / pos["side_price"] - 1) * pos["stake_amt"]
+    upnl = (price / pos["side_price"] - 1) * pos["stake_amt"] if pos["side_price"] > 0 else 0
     # Throttle DB writes — update price every 30s, not every WS tick
     now = _time.time()
     last_update = _last_db_price_update.get(pos["id"], 0)
@@ -774,7 +781,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         won = outcome == pos["side"]
         if is_closed:
             # API confirmed resolution — use binary payout
-            payout = pos["stake_amt"] * (1 / pos["side_price"]) if won else 0.0
+            payout = pos["stake_amt"] * (1 / pos["side_price"]) if (won and pos["side_price"] > 0) else 0.0
         else:
             # Price-based detection (99/1) — use linear payout as safety
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
@@ -1268,7 +1275,7 @@ async def main():
             # Drawdown check: equity = free cash + value of all open positions
             stats = await db.get_stats()
             open_pos = await db.get_open_positions()
-            positions_value = sum((p.get("stake_amt", 0) + (p.get("unrealized_pnl", 0) or 0)) for p in open_pos)
+            positions_value = sum(max(0, p.get("stake_amt", 0) + (p.get("unrealized_pnl", 0) or 0)) for p in open_pos)
             equity = stats["bankroll"] + positions_value
             if equity > peak_equity:
                 peak_equity = equity

@@ -396,7 +396,7 @@ class MathEngine:
 
         # Determine if contrarian/overreaction is the dominant evidence
         is_contrarian = False
-        if p_revert_combined is not None and (contrarian_conf > 0.3 or p_overreact is not None):
+        if p_revert_combined is not None and (contrarian_conf > 0.5 or p_overreact is not None):
             # Contrarian/overreaction is dominant if its contribution exceeds other evidence
             contrarian_shift = abs(p_revert_combined - p_market)
             other_shifts = [abs(e - p_market) for e in [p_history, p_volume, p_time, p_momentum, p_crowd_combined] if e is not None]
@@ -485,7 +485,9 @@ class MathEngine:
             history.append(volume_24h)
         if len(history) > 48: history.pop(0)
         if len(history) < 3: return 1.0, "neutral"
-        avg = sum(history[:-1]) / len(history[:-1])
+        prev = history[:-1]
+        if not prev: return 1.0, "neutral"
+        avg = sum(prev) / len(prev)
         if avg <= 0: return 1.0, "neutral"
         ratio = volume_24h / avg
         if ratio > VOLUME_SPIKE_THR:
@@ -547,6 +549,9 @@ class MathEngine:
         # Positive slope = price trending up = YES more likely
         # Cap at ±5% adjustment
         momentum_shift = max(-0.05, min(0.05, slope * n * 0.5))
+        # Skip weak momentum — 50.5% WR on 97 trades = pure noise
+        if abs(momentum_shift) < 0.015:
+            return None
         p_mom = current_price + momentum_shift
         return round(max(0.02, min(0.98, p_mom)), 4)
 
@@ -562,8 +567,13 @@ class MathEngine:
         old_price = long_hist[0]
         move = current_price - old_price
 
-        # Need >5% absolute move
-        if abs(move) < 0.05:
+        # Need >8% absolute move (was 5% — too sensitive, 45% WR on contrarian signals)
+        if abs(move) < 0.08:
+            return None, 0
+
+        # Large moves (>30%) are almost always news-driven, not overreaction
+        if abs(move) > 0.30:
+            log.debug(f"[MATH] Contrarian skip {market_id[:8]}: move {move:+.3f} too large (news-driven)")
             return None, 0
 
         # Check volume ratio from _vol_history
@@ -575,21 +585,22 @@ class MathEngine:
             avg_vol = sum(vol_hist[:-1]) / len(vol_hist[:-1])
             vol_ratio = vol_hist[-1] / avg_vol if avg_vol > 0 else 1.0
 
-        # Volume filter: high volume = informed money, skip
-        if vol_ratio > 2.5:
+        # Volume filter: high volume = informed money, skip (lowered from 2.5x)
+        if vol_ratio > 2.0:
             log.debug(f"[MATH] Contrarian skip {market_id[:8]}: vol_ratio {vol_ratio:.1f}x (informed money)")
             return None, 0
 
         # Confidence: lower volume = higher confidence, bigger move = higher confidence
-        move_confidence = min(1, abs(move) / 0.20)
-        if vol_ratio >= 1.5:
-            # Moderate volume: might be informed, lower confidence
-            vol_confidence = max(0.1, 1 - (vol_ratio - 1.5) / 1.0)  # 1.5x→1.0, 2.5x→0.1
+        # Raised denominator: need bigger moves for same confidence (was 0.20)
+        move_confidence = min(1, abs(move) / 0.25)
+        if vol_ratio >= 1.3:
+            # Moderate volume: might be informed, lower confidence (was 1.5x)
+            vol_confidence = max(0.1, 1 - (vol_ratio - 1.3) / 0.7)  # 1.3x→1.0, 2.0x→0.0
             confidence = vol_confidence * move_confidence
             log.info(f"[MATH] Contrarian WEAK {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
         else:
-            # Low volume: likely noise, high confidence in reversion
-            confidence = move_confidence
+            # Low volume: likely noise, but still cap confidence at 0.7 (was uncapped at 1.0)
+            confidence = move_confidence * 0.7
             log.info(f"[MATH] Contrarian STRONG {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
 
         # Compute EWMA as reversion target
@@ -606,14 +617,14 @@ class MathEngine:
         return p_contrarian, confidence
 
     def _spread_penalty(self, market: dict) -> float:
-        """Spread > 3¢ reduces confidence. Returns multiplier 0.0–1.0."""
+        """Spread > 3¢ reduces confidence. Returns multiplier 0.3–1.0."""
         spread = market.get("spread", 0)
         if spread <= 0.03:
             return 1.0
         if spread >= 0.10:
             return 0.3
         # Linear scale: 3¢→1.0, 10¢→0.3
-        return round(1.0 - (spread - 0.03) / 0.07 * 0.7, 3)
+        return round(max(0.3, min(1.0, 1.0 - (spread - 0.03) / 0.07 * 0.7)), 3)
 
     def _long_momentum(self, market: dict) -> Optional[float]:
         """Use API-provided week/month price changes as long-term momentum signal."""
@@ -734,8 +745,11 @@ class MathEngine:
         recent = hist[-10:]
         move = recent[-1] - recent[0]
         abs_move = abs(move)
-        # Need rapid move: >8% in ~10 ticks
-        if abs_move < 0.08:
+        # Need rapid move: >12% in ~10 ticks (was 8% — too sensitive)
+        if abs_move < 0.12:
+            return None
+        # Skip very large moves — likely news, not overreaction
+        if abs_move > 0.30:
             return None
         # Speed: move per tick (higher = more likely overreaction)
         speed = abs_move / len(recent)

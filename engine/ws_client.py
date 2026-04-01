@@ -94,8 +94,8 @@ class PolymarketWS:
                 msg = {"assets_ids": tokens_to_remove, "type": "market", "action": "unsubscribe"}
                 await self.ws.send(json.dumps(msg))
                 log.info(f"[WS] Unsubscribed from {market_id[:8]} ({len(tokens_to_remove)} tokens)")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug(f"[WS] Unsubscribe send failed for {market_id[:8]}: {e}")
 
     async def connect(self):
         """Connect to WebSocket and start listening."""
@@ -107,7 +107,7 @@ class PolymarketWS:
                     log.info(f"[WS] Connected, subscribing to {len(self._subscribed_tokens)} tokens")
                     if self._on_reconnect:
                         try: await self._on_reconnect()
-                        except Exception: pass
+                        except Exception as e: log.warning(f"[WS] Reconnect callback failed: {e}")
                     await self._subscribe_all(ws)
                     heartbeat_task = asyncio.create_task(self._heartbeat(ws))
                     try:
@@ -126,14 +126,14 @@ class PolymarketWS:
                 self.ws = None
                 if self._on_disconnect:
                     try: await self._on_disconnect()
-                    except Exception: pass
+                    except Exception as e2: log.debug(f"[WS] Disconnect callback failed: {e2}")
                 await asyncio.sleep(RECONNECT_DELAY)
             except Exception as e:
                 log.error(f"[WS] Error: {e}", exc_info=True)
                 self.ws = None
                 if self._on_disconnect:
                     try: await self._on_disconnect()
-                    except Exception: pass
+                    except Exception as e2: log.debug(f"[WS] Disconnect callback failed: {e2}")
                 await asyncio.sleep(RECONNECT_DELAY)
 
     @property

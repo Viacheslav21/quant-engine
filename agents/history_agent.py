@@ -309,7 +309,7 @@ class HistoryAgent:
             mean_w = sum(all_weights) / len(all_weights)
             if mean_w > 0:
                 for data in weights.values():
-                    data["weight"] = round(max(0.3, min(2.0, data["weight"] / mean_w)), 4)
+                    data["weight"] = round(max(0.5, min(2.0, data["weight"] / mean_w)), 4)
 
         # Save to DB
         await self.db.save_dma_weights(weights)
