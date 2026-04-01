@@ -1065,6 +1065,18 @@ async def main():
     # ── Smoke test: verify critical systems before trading ──
     smoke_errors = []
     try:
+        # 0. Run offline unit tests (math, guards, thresholds)
+        import subprocess
+        result = subprocess.run([sys.executable, "tests/smoke_test.py"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            # Extract failed test names from output
+            for line in result.stdout.split("\n"):
+                if "✗" in line:
+                    smoke_errors.append(f"Unit test: {line.strip()}")
+            if not smoke_errors:
+                smoke_errors.append(f"Unit tests failed: {result.stderr[-200:]}")
+
         # 1. Hurst exponent: known trending data → H > 0.5
         math_eng._long_price_cache["_test"] = [0.50 + i * 0.005 for i in range(30)]
         h = math_eng._hurst_exponent("_test")
@@ -1082,8 +1094,6 @@ async def main():
         import re as _re
         with open("agents/math_engine.py") as _f:
             _src = _f.read()
-        # Check that book weight base is 0.8 (line like: p_book, 0.8 * dma...)
-        import re as _re
         if not _re.search(r"p_book.*0\.8", _src):
             smoke_errors.append("Book imbalance weight not 0.8")
 
