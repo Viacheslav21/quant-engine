@@ -1066,8 +1066,9 @@ async def main():
     smoke_errors = []
     try:
         # 0. Run offline unit tests (math, guards, thresholds)
-        import subprocess, sys as _sys
-        result = subprocess.run([_sys.executable, "tests/smoke_test.py"],
+        import subprocess, sys as _sys, pathlib as _pathlib
+        _smoke_path = _pathlib.Path(__file__).parent / "tests" / "smoke_test.py"
+        result = subprocess.run([_sys.executable, str(_smoke_path)],
                                 capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             # Extract failed test names from output
