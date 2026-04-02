@@ -66,7 +66,8 @@ THEME_KEYWORDS = {
                    "tesla","microsoft","meta","amazon","semiconductor","chip","quantum","robotics"],
     "space":      ["nasa","spacex","rocket","satellite","mars","moon","orbit","launch","starship",
                    "blue origin","artemis","iss"],
-    "social":     ["elon musk","musk","tweet","twitter","x.com","post","followers","tiktok",
+    "musk":       ["elon musk","musk","tweet","twitter","x.com","truth social post"],
+    "social":     ["post","followers","tiktok",
                    "instagram","youtube","subscribers","views","downloads",
                    "mrbeast","mr beast","pewdiepie","streamer","influencer","viral"],
 
