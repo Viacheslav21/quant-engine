@@ -34,6 +34,7 @@ def expected_value(p_true: float, price: float) -> float:
 def kelly_fraction(p_true: float, price: float, fraction: float = 0.15) -> float:
     if not (0 < price < 1) or not (0 < p_true < 1): return 0.0
     b = (1/price)-1
+    if b < 0.01 or b > 100: return 0.0
     k = (b*p_true-(1-p_true))/b
     return round(max(0, k*fraction), 4)
 
@@ -496,7 +497,7 @@ class MathEngine:
             if len(price_hist) >= 3:
                 direction = "up" if price_hist[-1] > price_hist[-3] else "down"
             else:
-                direction = "up"  # default to bullish if no price history
+                return ratio, "neutral"  # no price history → can't determine direction, skip
             log.info(f"[MATH] Volume spike {market_id[:8]}: {ratio:.1f}x avg → {direction}")
             return ratio, direction
         return ratio, "neutral"
@@ -545,11 +546,10 @@ class MathEngine:
         if den == 0: return None
         slope = num / den
 
-        # Slope per tick → extrapolated probability shift
-        # Positive slope = price trending up = YES more likely
+        # Slope per tick → probability shift (normalized, not scaled by n)
         # Cap at ±5% adjustment
-        momentum_shift = max(-0.05, min(0.05, slope * n * 0.5))
-        # Skip weak momentum — 50.5% WR on 97 trades = pure noise
+        momentum_shift = max(-0.05, min(0.05, slope * 10))
+        # Skip weak momentum — noise filter
         if abs(momentum_shift) < 0.015:
             return None
         p_mom = current_price + momentum_shift
@@ -590,17 +590,15 @@ class MathEngine:
             log.debug(f"[MATH] Contrarian skip {market_id[:8]}: vol_ratio {vol_ratio:.1f}x (informed money)")
             return None, 0
 
-        # Confidence: lower volume = higher confidence, bigger move = higher confidence
-        # Raised denominator: need bigger moves for same confidence (was 0.20)
+        # Confidence: lower volume = higher confidence (noise), bigger move = higher confidence
         move_confidence = min(1, abs(move) / 0.25)
+        # Smooth volume scaling: low vol → high conf, high vol → low conf
+        # vol_ratio 0.5→0.9, 1.0→0.8, 1.3→0.65, 2.0→0.2
+        vol_confidence = min(0.95, max(0.1, 1.0 - (vol_ratio - 0.5) * 0.5))
+        confidence = vol_confidence * move_confidence
         if vol_ratio >= 1.3:
-            # Moderate volume: might be informed, lower confidence (was 1.5x)
-            vol_confidence = max(0.1, 1 - (vol_ratio - 1.3) / 0.7)  # 1.3x→1.0, 2.0x→0.0
-            confidence = vol_confidence * move_confidence
             log.info(f"[MATH] Contrarian WEAK {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
         else:
-            # Low volume: likely noise, but still cap confidence at 0.7 (was uncapped at 1.0)
-            confidence = move_confidence * 0.7
             log.info(f"[MATH] Contrarian STRONG {market_id[:8]}: move={move:+.3f} vol={vol_ratio:.1f}x conf={confidence:.2f}")
 
         # Compute EWMA as reversion target
@@ -890,6 +888,16 @@ class MathEngine:
                 log.info(f"[MATH] Liquidity penalty: ${liquidity:,.0f} → stake ×{liq_mult:.2f}")
 
         stake = round(max(1.0, stake), 2)
+
+        # Bimodal sizing: $5-10 range is toxic (48.6% WR, -$57).
+        # Push down to $4 or up to $12 based on confidence.
+        if 5.0 <= stake <= 10.0:
+            if kelly >= 0.08:  # higher Kelly = more confident → go bigger
+                stake = 12.0
+            else:
+                stake = 4.0
+            log.info(f"[MATH] Bimodal sizing: kelly={kelly*100:.1f}% → ${stake:.0f} (skipped $5-10 zone)")
+
         log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")
         return stake
 

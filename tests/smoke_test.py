@@ -280,7 +280,7 @@ src_me_full = open("agents/math_engine.py").read()
 check("Contrarian: 8% min move", "abs(move) < 0.08" in src_me_full)
 check("Contrarian: 30% max block", "abs(move) > 0.30" in src_me_full)
 check("Contrarian: volume 2.0x filter", "vol_ratio > 2.0" in src_me_full)
-check("Contrarian: STRONG conf cap 0.7", "move_confidence * 0.7" in src_me_full)
+check("Contrarian: smooth vol confidence", "1.0 - (vol_ratio - 0.5) * 0.5" in src_me_full)
 check("Overreaction: 12% threshold", "abs_move < 0.12" in src_me_full)
 check("Momentum: 1.5% min shift", "abs(momentum_shift) < 0.015" in src_me_full)
 

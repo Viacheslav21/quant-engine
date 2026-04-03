@@ -209,8 +209,8 @@ class PolymarketScanner:
                     if vol < self.config["MIN_VOLUME"] or liq < 5000:
                         filtered += 1
                         continue
-                    # Skip markets not accepting orders (in review / paused)
-                    if m.get("acceptingOrders") is False:
+                    # Skip markets not accepting orders (in review / paused / missing field)
+                    if not m.get("acceptingOrders", True):
                         filtered += 1
                         continue
                     # Skip sports/esports markets

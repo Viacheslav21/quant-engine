@@ -766,7 +766,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         await db.update_position_price(pos["id"], price, upnl)
         _last_db_price_update[pos["id"]] = now
 
-    pnl_pct = (price - pos["side_price"]) / pos["side_price"]
+    pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
     close_reason = None
     outcome = None
 
@@ -788,11 +788,24 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         pnl = round(payout - pos["stake_amt"], 2)
         close_reason = "RESOLVED"
 
-    # 2. Take profit
+    # 2. Take profit (skip if near resolution — wait for $1.00 payout)
     elif pnl_pct >= tp_pct:
-        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-        pnl = round(payout - pos["stake_amt"], 2)
-        close_reason = "TAKE_PROFIT"
+        # If price >92¢ our side and market expires <48h, hold for resolution
+        if pos["side"] == "YES":
+            near_resolution = yes_price > 0.92 and _resolution_shield(pos, yes_price)
+        else:
+            near_resolution = yes_price < 0.08 and _resolution_shield(pos, yes_price)
+        if near_resolution:
+            if not hasattr(_check_position, '_tp_shield_logged'):
+                _check_position._tp_shield_logged = set()
+            if pos["id"] not in _check_position._tp_shield_logged:
+                log.info(f"[TP-SHIELD] Holding for resolution: yes={yes_price*100:.0f}¢ pnl=+{pnl_pct*100:.1f}% | {pos['question'][:50]}")
+                _check_position._tp_shield_logged.add(pos["id"])
+            # Don't close — let it resolve for $1.00
+        else:
+            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+            pnl = round(payout - pos["stake_amt"], 2)
+            close_reason = "TAKE_PROFIT"
 
     # 2b. Trailing take profit with dynamic pullback
     # The higher the peak profit, the wider the allowed pullback (let winners run)
@@ -827,17 +840,17 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         # Don't close — pass through to end of function
 
     # 3. Stop loss with staged grace period
-    # <1h positions had 29% WR (noise stops). Staged SL: wider first hour, then normal.
-    # Emergency SL (1.5×) still protects against real crashes during grace period.
+    # <1h: 32% WR, 1-3h: 49% WR, 3h+: 63% WR. Noise kills early positions.
+    # Grace period 2h: only emergency SL (1.5×) during first 2 hours.
     elif pnl_pct <= -sl_pct:
         pos_age_h = _position_age_hours(pos)
-        if pos_age_h >= 1.0:
-            # Normal SL after 1h
+        if pos_age_h >= 2.0:
+            # Normal SL after 2h
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
             pnl = round(payout - pos["stake_amt"], 2)
             close_reason = "STOP_LOSS"
         else:
-            # Grace period (<1h): only emergency SL at 1.5× default
+            # Grace period (<2h): only emergency SL at 1.5× default
             emergency_sl = sl_pct * 1.5
             if pnl_pct <= -emergency_sl:
                 payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
