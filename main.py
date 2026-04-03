@@ -442,6 +442,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
     # --- Pre-execution price recheck ---
     # Scanner price can be stale (up to 5 min old). Fetch fresh price before entry.
     # Prevents entering at phantom prices on fast-moving / resolving markets.
+    _scan_price = signal["side_price"]  # original price from scanner (for logging delta)
     if scanner:
         fresh = await scanner.get_market(signal["market_id"])
         if fresh:
@@ -565,7 +566,14 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         config_tag=config.get("CONFIG_TAG"),
         details={"volatility": signal.get("volatility"), "spread": signal.get("spread"),
                  "liquidity": signal.get("liquidity"), "original_kelly": signal["kelly"],
-                 "source": signal.get("source", "math")})
+                 "source": signal.get("source", "math"),
+                 "hurst": signal.get("hurst"), "n_evidence": signal.get("n_evidence"),
+                 "recheck_price_delta": round(signal["side_price"] - _scan_price, 4) if signal["side_price"] != _scan_price else 0,
+                 "scan_price": _scan_price,
+                 "kelly_mult": signal.get("kelly_mult"), "ev_mult": signal.get("ev_mult"),
+                 "end_date": str(signal.get("end_date", "")) if signal.get("end_date") else None,
+                 "neg_risk_market_id": signal.get("neg_risk_market_id"),
+                 })
     side_label = "✅ YES (случится)" if signal["side"] == "YES" else "❌ NO (не случится)"
     await telegram.send(
         f"🎯 <b>СИГНАЛ [{mode}]</b>{' 🔄' if is_contrarian else ''}\n\n"
@@ -909,7 +917,10 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         is_simulation=config["SIMULATION"], config_tag=pos.get("config_tag"),
         details={"outcome": outcome, "close_reason": close_reason, "current_price": price,
                  "trailing_high": _peak_pnl,
-                 "win_rate": wr, "total_closed": total})
+                 "win_rate": wr, "total_closed": total,
+                 "position_age_hours": round(_position_age_hours(pos), 1),
+                 "grace_period_survived": _position_age_hours(pos) >= 2.0,
+                 })
 
     _reason_label = {
         "RESOLVED":   "🏁 Рынок закрылся",
@@ -1534,7 +1545,13 @@ async def main():
                              "p_flb": sig.get("p_flb"), "p_certainty": sig.get("p_certainty"),
                              "p_overreact": sig.get("p_overreact"),
                              "contrarian_conf": sig.get("contrarian_conf"),
-                             "p_mispriced": sig.get("p_mispriced")})
+                             "p_mispriced": sig.get("p_mispriced"),
+                             "hurst": sig.get("hurst"),
+                             "n_evidence": sig.get("n_evidence"),
+                             "spread_mult": sig.get("spread_mult"),
+                             "end_date": str(sig.get("end_date", "")) if sig.get("end_date") else None,
+                             "dma_weights": {k: round(v, 2) for k, v in (math_eng._dma_weights or {}).items()},
+                             })
                 executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
                 if executed:
                     await db.mark_signal_executed(sig_id)

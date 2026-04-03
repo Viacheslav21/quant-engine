@@ -439,11 +439,15 @@ class MathEngine:
             "volatility": self._market_volatility(market["id"]),
             "neg_risk_market_id": market.get("neg_risk_market_id", ""),
             "n_evidence": n_evidence,
+            "hurst":      round(H, 3),
             "p_book":     p_book,
             "p_flb":      p_flb,
             "p_certainty": p_certainty,
             "p_overreact": p_overreact,
             "source":     "math",
+            "end_date":   market.get("end_date"),
+            "ev_mult":    ev_mult,
+            "kelly_mult": theme_pat.get("kelly_mult", 1.0) or 1.0,
         }
 
     def _hurst_exponent(self, market_id: str) -> float:
