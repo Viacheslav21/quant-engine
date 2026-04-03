@@ -893,14 +893,12 @@ class MathEngine:
 
         stake = round(max(1.0, stake), 2)
 
-        # Bimodal sizing: $5-10 range is toxic (48.6% WR, -$57).
-        # Push down to $4 or up to $12 based on confidence.
-        if 5.0 <= stake <= 10.0:
-            if kelly >= 0.08:  # higher Kelly = more confident → go bigger
-                stake = 12.0
-            else:
-                stake = 4.0
-            log.info(f"[MATH] Bimodal sizing: kelly={kelly*100:.1f}% → ${stake:.0f} (skipped $5-10 zone)")
+        # Bimodal sizing: $5-13 range is toxic (47-48% WR).
+        # Data: $4-5 bimodal low = 60.7% WR, $11-13 bimodal high = 48.2% WR.
+        # Only $20+ (74.4% WR) is profitable in mid-range. Push everything down to $4.
+        if 5.0 <= stake <= 15.0:
+            stake = 4.0
+            log.info(f"[MATH] Bimodal sizing: kelly={kelly*100:.1f}% → $4 (skipped $5-15 toxic zone)")
 
         log.info(f"[MATH] Stake: ${stake:.2f} (kelly={kelly*100:.1f}% bankroll=${bankroll:.2f})")
         return stake
