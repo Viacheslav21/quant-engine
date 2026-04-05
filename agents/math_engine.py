@@ -465,7 +465,8 @@ class MathEngine:
         n = len(hist)
         mean = sum(hist) / n
         deviations = [h - mean for h in hist]
-        cumulative = [sum(deviations[:i+1]) for i in range(n)]
+        import itertools
+        cumulative = list(itertools.accumulate(deviations))
         R = max(cumulative) - min(cumulative)
         S = (sum(d ** 2 for d in deviations) / n) ** 0.5
         if S == 0 or R == 0:
@@ -780,6 +781,15 @@ class MathEngine:
             return None
         log.info(f"[MATH] Overreaction {market_id[:8]}: move={move:+.3f} speed={speed:.4f}/tick → revert {reversion_pct*100:.0f}% (λ={lam:.2f})")
         return p_revert
+
+    def evict_stale_caches(self, active_market_ids: set):
+        """Remove price caches for markets no longer in the scan to prevent unbounded growth."""
+        for cache in (self._price_cache, self._long_price_cache, self._vol_history):
+            stale = [k for k in cache if k not in active_market_ids]
+            for k in stale:
+                del cache[k]
+        if stale:
+            log.debug(f"[MATH] Evicted {len(stale)} stale cache entries")
 
     def build_neg_risk_groups(self, markets: list):
         """Group neg-risk markets by their shared event ID for arbitrage detection."""

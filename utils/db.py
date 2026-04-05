@@ -12,7 +12,7 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def init(self):
-        self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10, command_timeout=30)
+        self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=15, command_timeout=30)
         await self._create_schema()
         await self._migrate_positions_tp_sl()
         await self._migrate_clv()
@@ -364,11 +364,38 @@ class Database:
                 m["volume"], m.get("volume_24h",0), m.get("liquidity",0),
                 m.get("end_date"), m.get("url",""))
 
+    async def upsert_markets_batch(self, markets: list):
+        """Batch upsert markets in a single transaction."""
+        if not markets:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO markets (id,slug,question,theme,yes_price,no_price,volume,volume_24h,liquidity,end_date,url,updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    yes_price=EXCLUDED.yes_price, no_price=EXCLUDED.no_price,
+                    volume=EXCLUDED.volume, volume_24h=EXCLUDED.volume_24h,
+                    liquidity=EXCLUDED.liquidity, updated_at=NOW()
+            """, [(m["id"], m.get("slug",""), m["question"], m.get("theme","other"),
+                   m["yes_price"], m.get("no_price", 1-m["yes_price"]),
+                   m["volume"], m.get("volume_24h",0), m.get("liquidity",0),
+                   m.get("end_date"), m.get("url","")) for m in markets])
+
     async def save_snapshot(self, market_id: str, price: float, volume: float, delta: float):
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO price_snapshots (market_id,yes_price,volume,volume_delta) VALUES ($1,$2,$3,$4)",
                 market_id, price, volume, delta
+            )
+
+    async def save_snapshots_batch(self, snapshots: list):
+        """Batch insert snapshots. snapshots = [(market_id, price, volume, delta), ...]"""
+        if not snapshots:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO price_snapshots (market_id,yes_price,volume,volume_delta) VALUES ($1,$2,$3,$4)",
+                snapshots
             )
 
     async def get_active_markets(self) -> list:
@@ -578,6 +605,23 @@ class Database:
                 UPDATE positions SET {column} = $1
                 WHERE id = $2 AND {column} IS NULL AND status = 'open'
             """, price, pos_id)
+
+    async def update_clv_batch(self, updates: list):
+        """Batch CLV updates. updates = [(pos_id, column, price), ...].
+        Groups by column and runs one query per column."""
+        if not updates:
+            return
+        by_col = {}
+        for pos_id, column, price in updates:
+            if column not in ("clv_1h", "clv_4h", "clv_24h", "clv_close"):
+                continue
+            by_col.setdefault(column, []).append((pos_id, price))
+        async with self.pool.acquire() as conn:
+            for column, pairs in by_col.items():
+                await conn.executemany(f"""
+                    UPDATE positions SET {column} = $2
+                    WHERE id = $1 AND {column} IS NULL AND status = 'open'
+                """, pairs)
 
     async def update_clv_close(self, pos_id: str, price: float):
         """Set CLV at close time (always overwrite)."""

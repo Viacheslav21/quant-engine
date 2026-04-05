@@ -398,9 +398,10 @@ async def _close_for_displacement(pos: dict, db: Database, telegram: TelegramBot
     return True
 
 async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, config: dict,
-                         scanner: PolymarketScanner = None, math_eng: MathEngine = None):
+                         scanner: PolymarketScanner = None, math_eng: MathEngine = None,
+                         open_positions: list = None, cached_stats: dict = None):
     from agents.math_engine import expected_value, kelly_fraction
-    open_pos = await db.get_open_positions()
+    open_pos = open_positions if open_positions is not None else await db.get_open_positions()
     _rej_base = dict(market_id=signal["market_id"], question=signal["question"],
                       theme=signal.get("theme"), side=signal["side"], ev=signal["ev"],
                       kelly=signal["kelly"], is_simulation=config["SIMULATION"],
@@ -434,7 +435,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
             await db.log_event("SIGNAL_REJECTED", **_rej_base, open_positions=len(open_pos),
                                details={"reason": "displacement_failed_race"})
             return False
-    stats    = await db.get_stats()
+    stats    = cached_stats if cached_stats is not None else await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
     if math_eng is None:
         math_eng = MathEngine(config, db)
@@ -1187,7 +1188,7 @@ async def main():
 
     # Subscribe WS to all currently open positions
     open_pos = await db.get_open_positions()
-    markets_initial = await scanner.fetch()
+    markets_initial = test_markets if test_markets else await scanner.fetch()
     mmap_initial = {m["id"]: m for m in markets_initial}
     ws_registered = 0
     ws_failed = 0
@@ -1363,15 +1364,21 @@ async def main():
             await process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)
 
             markets = await scanner.fetch()
+            changed_markets = []
+            snapshots = []
             for m in markets:
                 prev = _market_price_cache.get(m["id"])
                 if prev and abs(prev - m["yes_price"]) < 0.001:
                     continue
                 _market_price_cache[m["id"]] = m["yes_price"]
-                await db.upsert_market(m)
-                await db.save_snapshot(m["id"], m["yes_price"], m["volume"], m.get("volume_24h", 0))
+                changed_markets.append(m)
+                snapshots.append((m["id"], m["yes_price"], m["volume"], m.get("volume_24h", 0)))
+            if changed_markets:
+                await db.upsert_markets_batch(changed_markets)
+                await db.save_snapshots_batch(snapshots)
 
             math_eng.build_neg_risk_groups(markets)
+            math_eng.evict_stale_caches({m["id"] for m in markets})
 
             # Warmup: first scan fills price caches
             if scan_count <= 1:
@@ -1389,10 +1396,12 @@ async def main():
                     m["book_imbalance"] = ws_data["imbalance"]
 
             math_signals = []
-            for m in markets:
+            for i, m in enumerate(markets):
                 sig = math_eng.analyze(m)
                 if sig:
                     math_signals.append(sig)
+                if i % 50 == 49:
+                    await asyncio.sleep(0)  # yield to event loop for WS callbacks
 
             all_signals = {s["market_id"]: s for s in math_signals}
 
@@ -1408,8 +1417,8 @@ async def main():
                 log.info(f"[SCAN] Loss cooldown blocked {len(loss_blocked)} signals (counts: {', '.join(f'{k[:8]}={_loss_count.get(k,0)}' for k in loss_blocked)})")
             all_signals = {k: v for k, v in all_signals.items() if k not in _loss_cooldown}
 
-            # Filter out markets where we already have an open position
-            open_market_ids = {p["market_id"] for p in await db.get_open_positions()}
+            # Filter out markets where we already have an open position (use cached open_pos)
+            open_market_ids = {p["market_id"] for p in open_pos}
             new_signals = {k: v for k, v in all_signals.items() if k not in open_market_ids}
 
             signals = sorted(new_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
@@ -1558,7 +1567,8 @@ async def main():
                              "end_date": str(sig.get("end_date", "")) if sig.get("end_date") else None,
                              "dma_weights": {k: round(v, 2) for k, v in (math_eng._dma_weights or {}).items()},
                              })
-                executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng)
+                executed = await execute_signal(sig, db, telegram, CONFIG, scanner, math_eng,
+                                               open_positions=open_pos, cached_stats=stats)
                 if executed:
                     await db.mark_signal_executed(sig_id)
                     # Subscribe WS to the new position's market
@@ -1576,9 +1586,11 @@ async def main():
             await _refresh_ws_positions()
             await monitor_positions(db, telegram, scanner, CONFIG, markets, trailing_highs, ws)
 
-            # CLV tracking: record market price at 1h, 4h, 24h after entry
+            # CLV tracking: record market price at 1h, 4h, 24h after entry (batched)
             try:
                 mmap_clv = {m["id"]: m for m in markets}
+                clv_updates = []
+                now_clv = datetime.now(timezone.utc)
                 for pos in open_pos:
                     if not pos.get("opened_at"):
                         continue
@@ -1586,15 +1598,16 @@ async def main():
                     if not m:
                         continue
                     yes_price = m["yes_price"]
-                    age_hours = (datetime.now(timezone.utc) - pos["opened_at"].replace(
-                        tzinfo=timezone.utc) if pos["opened_at"].tzinfo is None
-                        else datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 3600
+                    opened = pos["opened_at"].replace(tzinfo=timezone.utc) if pos["opened_at"].tzinfo is None else pos["opened_at"]
+                    age_hours = (now_clv - opened).total_seconds() / 3600
                     if age_hours >= 1:
-                        await db.update_clv(pos["id"], "clv_1h", yes_price)
+                        clv_updates.append((pos["id"], "clv_1h", yes_price))
                     if age_hours >= 4:
-                        await db.update_clv(pos["id"], "clv_4h", yes_price)
+                        clv_updates.append((pos["id"], "clv_4h", yes_price))
                     if age_hours >= 24:
-                        await db.update_clv(pos["id"], "clv_24h", yes_price)
+                        clv_updates.append((pos["id"], "clv_24h", yes_price))
+                if clv_updates:
+                    await db.update_clv_batch(clv_updates)
             except Exception as e:
                 log.debug(f"[CLV] Update failed: {e}")
 
