@@ -280,6 +280,7 @@ class Database:
                 "trade_roi":  "REAL DEFAULT 0",
                 "kelly_mult": "REAL DEFAULT 1.0",
                 "ev_mult":    "REAL DEFAULT 1.0",
+                "blocked":    "BOOLEAN DEFAULT FALSE",
             }
             for col, typedef in new_cols.items():
                 if col not in col_names:
@@ -791,6 +792,20 @@ class Database:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM patterns")
             return {r["category"]: dict(r) for r in rows}
+
+    async def get_blocked_themes(self) -> set:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT category FROM patterns WHERE blocked = TRUE")
+            return {r["category"] for r in rows}
+
+    async def set_theme_blocked(self, theme: str, blocked: bool):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO patterns (category, base_rate, sample_size, blocked)
+                VALUES ($1, 0.5, 0, $2)
+                ON CONFLICT (category) DO UPDATE SET blocked = $2, updated_at = NOW()
+            """, theme, blocked)
+        log.info(f"[DB] Theme '{theme}' {'BLOCKED' if blocked else 'UNBLOCKED'}")
 
     async def save_calibration(self, agent: str, brier: float, bias: float, factor: float, n: int):
         async with self.pool.acquire() as conn:

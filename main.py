@@ -409,10 +409,10 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                       theme=signal.get("theme"), side=signal["side"], ev=signal["ev"],
                       kelly=signal["kelly"], is_simulation=config["SIMULATION"],
                       config_tag=config.get("CONFIG_TAG"))
-    # Blocked themes — data shows consistent losses (israel: 36% WR, -$37)
-    BLOCKED_THEMES = {"israel","musk"}
+    # Blocked themes — managed via dashboard (patterns.blocked = TRUE)
     theme = signal.get("theme", "other")
-    if theme in BLOCKED_THEMES:
+    blocked_themes = await db.get_blocked_themes()
+    if theme in blocked_themes:
         log.info(f"[EXEC] Blocked theme '{theme}' | {signal['question'][:50]}")
         await db.log_event("SIGNAL_REJECTED", **_rej_base,
                            details={"reason": "blocked_theme", "theme": theme})
