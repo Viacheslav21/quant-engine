@@ -619,31 +619,35 @@ def _resolution_shield(pos: dict, yes_price: float) -> bool:
     from datetime import datetime, timezone
     import re
 
-    # 1. Try question date first (more specific for negRisk sub-markets)
+    # Use EARLIER of: question date vs market end_date
     question = pos.get("question", "")
-    hours_to_expiry = None
+    now = datetime.now(timezone.utc)
+    candidates = []
 
     m = re.search(r'(?:on|by|before)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:,?\s+(\d{4}))?', question, re.IGNORECASE)
     if m:
         month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
-        year = int(year_str) if year_str else datetime.now(timezone.utc).year
+        year = int(year_str) if year_str else now.year
         try:
             qdate = datetime.strptime(f"{month_str} {day_str} {year}", "%B %d %Y").replace(tzinfo=timezone.utc)
-            hours_to_expiry = (qdate - datetime.now(timezone.utc)).total_seconds() / 3600
+            if not year_str and (now - qdate).days > 30:
+                qdate = qdate.replace(year=year + 1)
+            candidates.append((qdate - now).total_seconds() / 3600)
         except ValueError:
             pass
 
-    # 2. Fallback to market end_date
-    if hours_to_expiry is None:
-        end_date = pos.get("end_date")
-        if not end_date:
-            return False
+    end_date = pos.get("end_date")
+    if end_date:
         try:
             if isinstance(end_date, str):
                 end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-            hours_to_expiry = (end_date - datetime.now(timezone.utc)).total_seconds() / 3600
+            candidates.append((end_date - now).total_seconds() / 3600)
         except Exception:
-            return False
+            pass
+
+    if not candidates:
+        return False
+    hours_to_expiry = min(candidates)  # use earliest expiry
 
     # Shield window: 6-48h. <6h = too close to deadline (volatile). >48h = too far.
     if hours_to_expiry < 6 or hours_to_expiry > 48:
@@ -1053,7 +1057,8 @@ async def main():
             price = ws_data.get("best_bid", yes_price)
         else:
             # Selling NO = 1 - YES ask (NO bid = 1 - YES ask)
-            price = 1 - ws_data.get("best_ask", 1 - yes_price) if ws_data.get("best_ask") else 1 - yes_price
+            best_ask = ws_data.get("best_ask")
+            price = (1 - best_ask) if best_ask is not None and best_ask > 0 else (1 - yes_price)
         pnl_pct = (price - pos["side_price"]) / pos["side_price"] if pos["side_price"] > 0 else 0
         sl_pct = pos.get("sl_pct") or CONFIG["STOP_LOSS_PCT"]
         tp_pct = pos.get("tp_pct") or CONFIG["TAKE_PROFIT_PCT"]
@@ -1160,6 +1165,8 @@ async def main():
             f"Bot will NOT start trading."
         )
         await db.close()
+        await scanner.close()
+        await telegram.close()
         return
     else:
         log.info(f"[SMOKE] All checks passed: Hurst, Bayesian, book weight, CLV, scanner ({len(test_markets)} mkts), DB")
@@ -1174,7 +1181,6 @@ async def main():
     )
 
     await db.save_config_snapshot(CONFIG["CONFIG_TAG"], CONFIG)
-    await db._cleanup_arb_positions()
     await bootstrap_history(db, scanner)
     await history.analyze()
     await math_eng.load_patterns()

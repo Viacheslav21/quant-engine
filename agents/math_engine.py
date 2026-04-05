@@ -159,9 +159,14 @@ class MathEngine:
         if not m:
             return None
         month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
-        year = int(year_str) if year_str else _dt.now(_tz.utc).year
+        now = _dt.now(_tz.utc)
+        year = int(year_str) if year_str else now.year
         try:
-            return _dt.strptime(f"{month_str} {day_str} {year}", "%B %d %Y").replace(tzinfo=_tz.utc)
+            dt = _dt.strptime(f"{month_str} {day_str} {year}", "%B %d %Y").replace(tzinfo=_tz.utc)
+            # If no year specified and date is >30 days in the past, assume next year
+            if not year_str and (now - dt).days > 30:
+                dt = dt.replace(year=year + 1)
+            return dt
         except ValueError:
             return None
 

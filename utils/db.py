@@ -301,36 +301,6 @@ class Database:
         except Exception as e:
             log.warning(f"[DB] Backfill executed signals: {e}")
 
-    async def _cleanup_arb_positions(self):
-        """One-time: remove arb positions and recalculate stats from real positions only."""
-        try:
-            async with self.pool.acquire() as conn:
-                # Delete any remaining arb positions and signals
-                await conn.execute("DELETE FROM positions WHERE config_tag LIKE 'arb%'")
-                try:
-                    await conn.execute("DELETE FROM arb_signals WHERE TRUE")
-                except Exception:
-                    pass  # table may not exist
-                # Recalculate stats from remaining positions
-                row = await conn.fetchrow("""
-                    SELECT
-                        COUNT(*) FILTER (WHERE status='closed') as total_bets,
-                        COUNT(*) FILTER (WHERE result='WIN') as wins,
-                        COUNT(*) FILTER (WHERE result='LOSS') as losses,
-                        COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl,
-                        COALESCE(SUM(stake_amt) FILTER (WHERE status='open'), 0) as open_stakes
-                    FROM positions
-                """)
-                starting = float(os.getenv("BANKROLL", "1000"))
-                bankroll = starting + float(row["total_pnl"]) - float(row["open_stakes"])
-                await conn.execute("""
-                    UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
-                    WHERE id=1
-                """, bankroll, float(row["total_pnl"]), row["total_bets"], row["wins"], row["losses"])
-                log.info(f"[DB] Arb cleanup done. Bankroll=${bankroll:.2f}, PnL=${row['total_pnl']:.2f}, W:{row['wins']}/L:{row['losses']}")
-        except Exception as e:
-            log.warning(f"[DB] Arb cleanup: {e}")
-
     async def save_market_metrics(self, market_id: str, metrics: dict):
         """Upsert market metrics (volatility, momentum, caches)."""
         async with self.pool.acquire() as conn:
@@ -540,7 +510,7 @@ class Database:
 
     async def close_position(self, pos_id: str, outcome: str, payout: float, pnl: float) -> bool:
         """Close a position. Returns False if already closed (race protection)."""
-        result = "WIN" if pnl > 0 else "LOSS"
+        result = "WIN" if pnl >= 0 else "LOSS"
         won = result == "WIN"
         try:
             async with self.pool.acquire() as conn:
@@ -637,7 +607,7 @@ class Database:
 
             def clv_val(row, col):
                 v = row.get(col)
-                if v is None or v <= 0:
+                if v is None:
                     return None
                 entry = row["side_price"]
                 if row["side"] == "YES":
@@ -1067,9 +1037,18 @@ class Database:
                     "DELETE FROM news WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND processed = TRUE",
                     str(news_days)
                 )
-                # reclaim disk space
-                await conn.execute("VACUUM")
                 log.info(f"[DB] Cleanup: snapshots={r1}, signals={r2}, news={r3}")
+            # VACUUM must run outside a transaction block
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("VACUUM (ANALYZE) price_snapshots")
+                await conn.execute("VACUUM (ANALYZE) signals")
+                await conn.execute("VACUUM (ANALYZE) news")
+                log.info("[DB] VACUUM done")
+            except Exception as e:
+                log.warning(f"[DB] VACUUM failed: {e}")
+            finally:
+                await self.pool.release(conn)
         except Exception as e:
             log.error(f"[DB] Cleanup failed: {e}")
 
