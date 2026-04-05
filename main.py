@@ -976,6 +976,9 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         trailing_highs = {}
     mmap = {m["id"]: m for m in markets}
 
+    import time as _time
+    _ws_fresh_cutoff = _time.time() - 30  # 30s freshness threshold
+
     for pos in open_pos:
         m = mmap.get(pos["market_id"])
         is_closed = False
@@ -983,6 +986,14 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         # Try WS price first (fresher), fall back to REST
         ws_data = ws.get_market_data(pos["market_id"]) if ws else {}
         ws_price = ws_data.get("yes_price", 0) if ws_data else 0
+
+        # If WS has fresh data and scanner has market info, skip the expensive REST fallback path.
+        # WS already handles real-time SL/TP. REST fallback is only needed for:
+        # 1. Stale WS data (>30s) 2. Missing scanner data 3. Resolution detection via API is_closed flag
+        ws_fresh = ws_data and ws_data.get("last_update", 0) > _ws_fresh_cutoff
+        if ws_fresh and m and not m.get("closed"):
+            continue
+
         if ws_price > 0:
             yes_price = ws_price
             no_price = 1 - ws_price
@@ -1619,9 +1630,8 @@ async def main():
             if now - last_metrics_save >= METRICS_SAVE_INTERVAL:
                 last_metrics_save = now
                 try:
-                    for m in markets[:100]:
-                        metrics = math_eng.get_market_metrics(m["id"])
-                        await db.save_market_metrics(m["id"], metrics)
+                    metrics_batch = [(m["id"], math_eng.get_market_metrics(m["id"])) for m in markets[:100]]
+                    await db.save_market_metrics_batch(metrics_batch)
                 except Exception as e:
                     log.warning(f"[MAIN] Metrics save failed: {e}")
 

@@ -318,6 +318,25 @@ class Database:
                 metrics.get("long_prices", []), metrics.get("short_prices", []),
                 metrics.get("last_signal_at"))
 
+    async def save_market_metrics_batch(self, batch: list):
+        """Batch upsert market metrics. batch = [(market_id, metrics_dict), ...]"""
+        if not batch:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO market_metrics (market_id, volatility, momentum, vol_ratio, vol_direction,
+                    long_prices, short_prices, last_signal_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (market_id) DO UPDATE SET
+                    volatility = $2, momentum = $3, vol_ratio = $4, vol_direction = $5,
+                    long_prices = $6, short_prices = $7,
+                    last_signal_at = COALESCE($8, market_metrics.last_signal_at),
+                    updated_at = NOW()
+            """, [(mid, mt.get("volatility", 0), mt.get("momentum", 0),
+                   mt.get("vol_ratio", 1.0), mt.get("vol_direction", "neutral"),
+                   mt.get("long_prices", []), mt.get("short_prices", []),
+                   mt.get("last_signal_at")) for mid, mt in batch])
+
     async def mark_signal_cooldown(self, market_id: str):
         """Update last_signal_at for cooldown tracking."""
         async with self.pool.acquire() as conn:
