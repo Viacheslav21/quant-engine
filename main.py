@@ -1729,6 +1729,9 @@ async def main():
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
+        finally:
+            _last_scan_at = time.time()
+            _scan_count_global = scan_count
 
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
