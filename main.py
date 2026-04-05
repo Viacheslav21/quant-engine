@@ -79,6 +79,9 @@ CONFIG = {
 
 _claude_client = None
 _shutdown_flag = False
+_last_scan_at = 0.0  # timestamp of last successful scan loop iteration
+_scan_count_global = 0
+_WATCHDOG_STALE_SECONDS = 900  # 15 min — alert if scan loop hasn't run
 
 def _get_claude_client(config: dict):
     global _claude_client
@@ -1252,6 +1255,55 @@ async def main():
             log.warning(f"[CMD] LISTEN setup failed, polling only: {e}")
     cmd_task = asyncio.create_task(_listen_commands())
 
+    # Watchdog: alert if scan loop stalls for >15 min
+    async def _watchdog():
+        global _last_scan_at
+        _last_scan_at = time.time()  # init
+        while not _shutdown_flag:
+            await asyncio.sleep(60)
+            if _last_scan_at and time.time() - _last_scan_at > _WATCHDOG_STALE_SECONDS:
+                stale_min = int((time.time() - _last_scan_at) / 60)
+                log.error(f"[WATCHDOG] Scan loop stale! Last scan {stale_min}m ago")
+                await telegram.send(
+                    f"<b>WATCHDOG ALERT</b>\n"
+                    f"Scan loop stale — last run {stale_min}m ago\n"
+                    f"Scan #{_scan_count_global} | WS={'connected' if ws.connected else 'DISCONNECTED'}"
+                )
+                _last_scan_at = time.time()  # reset to avoid spam (re-alert in 15 min)
+    watchdog_task = asyncio.create_task(_watchdog())
+
+    # Health check HTTP server (for Railway / monitoring)
+    async def _health_server():
+        from aiohttp import web
+        async def _health_handler(request):
+            stale = time.time() - _last_scan_at if _last_scan_at else 9999
+            healthy = stale < _WATCHDOG_STALE_SECONDS and not _shutdown_flag
+            data = {
+                "status": "ok" if healthy else "stale",
+                "scan_count": _scan_count_global,
+                "last_scan_age_s": int(stale),
+                "ws_connected": ws.connected if ws else False,
+                "ws_active": ws.active_count() if ws else 0,
+                "shutdown": _shutdown_flag,
+            }
+            import json
+            return web.Response(text=json.dumps(data), content_type="application/json",
+                                status=200 if healthy else 503)
+        app_h = web.Application()
+        app_h.router.add_get("/health", _health_handler)
+        runner = web.AppRunner(app_h)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("HEALTH_PORT", "8081")))
+        try:
+            await site.start()
+            log.info(f"[HEALTH] Listening on :{os.getenv('HEALTH_PORT', '8081')}")
+        except OSError as e:
+            log.warning(f"[HEALTH] Could not start health server: {e}")
+    try:
+        health_task = asyncio.create_task(_health_server())
+    except Exception:
+        pass  # non-critical — bot works without health endpoint
+
     last_history = last_metrics_save = 0
     METRICS_SAVE_INTERVAL = 300
     scan_count = 0
@@ -1655,6 +1707,9 @@ async def main():
                     is_simulation=CONFIG["SIMULATION"], config_tag=CONFIG["CONFIG_TAG"],
                     details={"wins": stats["wins"], "losses": stats["losses"],
                              "total_pnl": stats["total_pnl"], "total_bets": stats["total_bets"]})
+
+            _last_scan_at = time.time()
+            _scan_count_global = scan_count
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
