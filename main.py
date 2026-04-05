@@ -409,11 +409,19 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                       theme=signal.get("theme"), side=signal["side"], ev=signal["ev"],
                       kelly=signal["kelly"], is_simulation=config["SIMULATION"],
                       config_tag=config.get("CONFIG_TAG"))
+    # Blocked themes — data shows consistent losses (israel: 36% WR, -$37)
+    BLOCKED_THEMES = {"israel"}
+    theme = signal.get("theme", "other")
+    if theme in BLOCKED_THEMES:
+        log.info(f"[EXEC] Blocked theme '{theme}' | {signal['question'][:50]}")
+        await db.log_event("SIGNAL_REJECTED", **_rej_base,
+                           details={"reason": "blocked_theme", "theme": theme})
+        return False
+
     if any(p["market_id"] == signal["market_id"] for p in open_pos):
         log.info(f"[EXEC] Duplicate: already have position on {signal['market_id'][:8]} | {signal['question'][:50]}")
         await db.log_event("SIGNAL_REJECTED", **_rej_base, details={"reason": "duplicate_market"})
         return False
-    theme = signal.get("theme", "other")
     theme_count = sum(1 for p in open_pos if p.get("theme") == theme)
     theme_limit = MAX_PER_OTHER if theme == "other" else MAX_PER_THEME
     if theme_count >= theme_limit:
@@ -508,17 +516,17 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
         else:
             log.warning(f"[RECHECK] API failed, proceeding with scan price {signal['side_price']*100:.1f}¢ | {signal['question'][:50]}")
 
-    # Contrarian trades: half Kelly, tighter TP/SL
+    # Contrarian trades disabled — data shows 45.6% WR, avg -$0.46 (prediction markets
+    # don't mean-revert like equities; sharp moves = real news, not overreaction)
     kelly = signal["kelly"]
     is_contrarian = signal.get("contrarian", False)
     if is_contrarian:
-        kelly *= 0.5
-        tp_pct = 0.10
-        sl_pct = 0.25
-        log.info(f"[EXEC] Contrarian sizing: Kelly {signal['kelly']*100:.1f}%→{kelly*100:.1f}%, TP:10%, SL:25%")
-    else:
-        tp_pct = config["TAKE_PROFIT_PCT"]
-        sl_pct = config["STOP_LOSS_PCT"]
+        log.info(f"[EXEC] Contrarian signal rejected (disabled) | {signal['question'][:50]}")
+        await db.log_event("SIGNAL_REJECTED", **_rej_base, bankroll=bankroll,
+                           details={"reason": "contrarian_disabled"})
+        return False
+    tp_pct = config["TAKE_PROFIT_PCT"]
+    sl_pct = config["STOP_LOSS_PCT"]
 
     # Vol SL disabled — data shows fixed SL=25% (74.6% WR, +$0.92) beats all vol-adjusted SLs
     # History: 8% floor → 24% WR, 15% → 34% WR, 20% → 55.6% WR. Fixed 25% is the sweet spot.
@@ -536,7 +544,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                            details={"reason": "stake_too_small", "computed_stake": stake})
         return False
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
-    log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%{' [CONTRARIAN]' if is_contrarian else ''}")
+    log.info(f"[EXEC] {mode} {signal['side']} '{signal['question'][:50]}' | ${stake} EV:{signal['ev']*100:.1f}%")
     pos = {
         "id":         f"pos_{signal['market_id'][:8]}_{int(time.time())}",
         "market_id":  signal["market_id"],
@@ -580,7 +588,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                  })
     side_label = "✅ YES (случится)" if signal["side"] == "YES" else "❌ NO (не случится)"
     await telegram.send(
-        f"🎯 <b>СИГНАЛ [{mode}]</b>{' 🔄' if is_contrarian else ''}\n\n"
+        f"🎯 <b>СИГНАЛ [{mode}]</b>\n\n"
         f"❓ {signal['question'][:150]}\n"
         f"🎲 Ставка: <b>{side_label}</b> по <b>{signal['side_price']*100:.1f}¢</b>\n\n"
         f"📊 EV:<b>+{signal['ev']*100:.1f}%</b> | Kelly:<b>{kelly*100:.1f}%</b> | Edge:<b>{signal.get('edge',0)*100:.1f}%</b>\n"
@@ -856,17 +864,18 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         # Don't close — pass through to end of function
 
     # 3. Stop loss with staged grace period
-    # <1h: 32% WR, 1-3h: 49% WR, 3h+: 63% WR. Noise kills early positions.
-    # Grace period 2h: only emergency SL (1.5×) during first 2 hours.
+    # <1h: 32% WR, 1-3h: 49% WR, 3h+: 65% WR. Noise kills early positions.
+    # Grace period 4h: only emergency SL (1.5×) during first 4 hours.
+    # Data: positions surviving past 3h have 65% WR and are profitable.
     elif pnl_pct <= -sl_pct:
         pos_age_h = _position_age_hours(pos)
-        if pos_age_h >= 2.0:
-            # Normal SL after 2h
+        if pos_age_h >= 4.0:
+            # Normal SL after 4h
             payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
             pnl = round(payout - pos["stake_amt"], 2)
             close_reason = "STOP_LOSS"
         else:
-            # Grace period (<2h): only emergency SL at 1.5× default
+            # Grace period (<4h): only emergency SL at 1.5× default
             emergency_sl = sl_pct * 1.5
             if pnl_pct <= -emergency_sl:
                 payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
@@ -927,7 +936,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
                  "trailing_high": _peak_pnl,
                  "win_rate": wr, "total_closed": total,
                  "position_age_hours": round(_position_age_hours(pos), 1),
-                 "grace_period_survived": _position_age_hours(pos) >= 2.0,
+                 "grace_period_survived": _position_age_hours(pos) >= 4.0,
                  })
 
     _reason_label = {
