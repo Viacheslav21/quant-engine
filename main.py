@@ -1436,9 +1436,8 @@ async def main():
             await process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)
 
             try:
-                async with asyncio.timeout(120):
-                    markets = await scanner.fetch()
-            except TimeoutError:
+                markets = await asyncio.wait_for(scanner.fetch(), timeout=120)
+            except asyncio.TimeoutError:
                 log.error(f"[MAIN] Scanner fetch timed out (120s)! Skipping cycle.")
                 _last_scan_at = time.time()
                 _scan_count_global = scan_count
