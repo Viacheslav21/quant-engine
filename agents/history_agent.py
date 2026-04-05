@@ -117,33 +117,38 @@ class HistoryAgent:
             roi_adj = (n * roi + SHRINKAGE_K * global_roi) / (n + SHRINKAGE_K)
 
             # Kelly multiplier: nonlinear — losing themes get steep penalty, winning themes rewarded
-            # WR < 40%: aggressive penalty (0.3-0.65), WR 40-55%: near 1.0, WR > 55%: bonus up to 1.5
+            # WR < 40%: aggressive penalty (0.3-0.65), WR 40-55%: near 1.0
+            # WR > 55% AND ROI > 0: bonus up to 1.5. WR > 55% but ROI < 0: no reward (high WR trap)
             if wr_adj < 0.40:
                 # Steep penalty: 35% WR → 0.55, 30% → 0.40, 25% → 0.30
                 kelly_mult = max(0.3, 0.3 + (wr_adj / 0.40) * 0.70)
-            elif wr_adj > 0.55:
-                # Reward: 59% WR → 1.18, 65% → 1.40
+            elif wr_adj > 0.55 and roi_adj >= 0:
+                # Reward only if actually profitable: 59% WR → 1.18, 65% → 1.40
                 kelly_mult = min(1.5, 1.0 + (wr_adj - 0.50) * 2.0)
             else:
-                # Neutral zone
+                # Neutral zone — includes high WR with negative ROI
                 kelly_mult = wr_adj / global_wr if global_wr > 0 else 1.0
+                # Extra penalty for negative ROI despite decent WR
+                if roi_adj < -0.02:
+                    kelly_mult *= max(0.5, 1.0 - abs(roi_adj) * 3)
             kelly_mult = round(max(0.3, min(2.0, kelly_mult)), 3)
 
             # EV threshold multiplier: nonlinear penalty for losing themes
             # WR < 40%: need 1.5-2.5× EV to enter (super confidence required)
-            # WR > 55%: reduced threshold (0.7-0.9×), easier to enter
-            # Recovery: automatic — as WR improves, thresholds drop each HISTORY_INTERVAL
+            # WR > 55% AND ROI > 0: reduced threshold (0.7-0.9×), easier to enter
+            # WR > 55% but ROI < 0: no reward, apply ROI penalty (high WR trap — small wins, big losses)
+            # Recovery: automatic — as ROI turns positive, thresholds drop each HISTORY_INTERVAL
             if wr_adj < 0.40:
                 # Steep: 35% → ev_mult=1.75, 30% → 2.0, 25% → 2.5
                 ev_mult = 1.5 + (0.40 - wr_adj) * 5.0
                 # ROI double penalty on top
                 if roi_adj < -0.02:
                     ev_mult *= (1.0 + abs(roi_adj) * 2)
-            elif wr_adj > 0.55:
-                # Reward: 59% → 0.82, 65% → 0.70
+            elif wr_adj > 0.55 and roi_adj >= 0:
+                # Reward only if actually profitable: 59% → 0.82, 65% → 0.70
                 ev_mult = max(0.7, 1.0 - (wr_adj - 0.50) * 2.0)
             else:
-                # Neutral: mild adjustment based on ROI
+                # Neutral: includes high WR with negative ROI
                 roi_factor = 1.0
                 if roi_adj < -0.02:
                     roi_factor = 1.0 + abs(roi_adj) * 3
