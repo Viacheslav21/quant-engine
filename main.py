@@ -588,7 +588,7 @@ async def execute_signal(signal: dict, db: Database, telegram: TelegramBot, conf
                  })
     side_label = "✅ YES (случится)" if signal["side"] == "YES" else "❌ NO (не случится)"
     await telegram.send(
-        f"🎯 <b>СИГНАЛ [{mode}]</b>\n\n"
+        f"🎯 <b>ENGINE | СИГНАЛ [{mode}]</b>\n\n"
         f"❓ {signal['question'][:150]}\n"
         f"🎲 Ставка: <b>{side_label}</b> по <b>{signal['side_price']*100:.1f}¢</b>\n\n"
         f"📊 EV:<b>+{signal['ev']*100:.1f}%</b> | Kelly:<b>{kelly*100:.1f}%</b> | Edge:<b>{signal.get('edge',0)*100:.1f}%</b>\n"
@@ -962,7 +962,7 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
         except Exception:
             pass
     await telegram.send(
-        f"{_reason_label} {'✅' if won else '❌'}\n\n"
+        f"<b>ENGINE</b> | {_reason_label} {'✅' if won else '❌'}\n\n"
         f"❓ {pos['question'][:120]}\n"
         f"🎲 Ставка: <b>{side_label}</b>\n\n"
         f"📊 Вход: {pos['side_price']*100:.1f}¢ → Выход: <b>{price*100:.1f}¢</b>\n"
@@ -1277,7 +1277,7 @@ async def main():
                 stale_min = int((time.time() - _last_scan_at) / 60)
                 log.error(f"[WATCHDOG] Scan loop stale! Last scan {stale_min}m ago")
                 await telegram.send(
-                    f"<b>WATCHDOG ALERT</b>\n"
+                    f"<b>ENGINE WATCHDOG</b>\n"
                     f"Scan loop stale — last run {stale_min}m ago\n"
                     f"Scan #{_scan_count_global} | WS={'connected' if ws.connected else 'DISCONNECTED'}"
                 )
