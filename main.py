@@ -868,21 +868,26 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
     # Grace period 4h: only emergency SL (1.5×) during first 4 hours.
     # Data: positions surviving past 3h have 65% WR and are profitable.
     elif pnl_pct <= -sl_pct:
-        pos_age_h = _position_age_hours(pos)
-        if pos_age_h >= 4.0:
-            # Normal SL after 4h
-            payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
-            pnl = round(payout - pos["stake_amt"], 2)
-            close_reason = "STOP_LOSS"
+        # Small stakes ($4-10): no SL — let them ride to resolution
+        # Data: RESOLVED avg=+$1.36, SL avg=-$1.63. Small positions not worth cutting.
+        if pos["stake_amt"] <= 10:
+            log.debug(f"[MONITOR] SL skipped (small stake ${pos['stake_amt']:.0f}): pnl={pnl_pct*100:.1f}% | {pos['question'][:40]}")
         else:
-            # Grace period (<4h): only emergency SL at 1.5× default
-            emergency_sl = sl_pct * 1.5
-            if pnl_pct <= -emergency_sl:
+            pos_age_h = _position_age_hours(pos)
+            if pos_age_h >= 4.0:
+                # Normal SL after 4h
                 payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
                 pnl = round(payout - pos["stake_amt"], 2)
                 close_reason = "STOP_LOSS"
-                log.info(f"[MONITOR] Emergency SL: age={pos_age_h:.1f}h pnl={pnl_pct*100:.1f}% (emergency:{emergency_sl*100:.0f}%)")
-            # else: within grace period + above emergency → hold
+            else:
+                # Grace period (<4h): only emergency SL at 1.5× default
+                emergency_sl = sl_pct * 1.5
+                if pnl_pct <= -emergency_sl:
+                    payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+                    pnl = round(payout - pos["stake_amt"], 2)
+                    close_reason = "STOP_LOSS"
+                    log.info(f"[MONITOR] Emergency SL: age={pos_age_h:.1f}h pnl={pnl_pct*100:.1f}% (emergency:{emergency_sl*100:.0f}%)")
+                # else: within grace period + above emergency → hold
 
     if not close_reason:
         return False
