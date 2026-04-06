@@ -1268,8 +1268,11 @@ async def main():
     async def _watchdog():
         global _last_scan_at
         _last_scan_at = time.time()  # init
+        log.info(f"[WATCHDOG] Started, _last_scan_at={_last_scan_at:.0f}")
         while not _shutdown_flag:
             await asyncio.sleep(60)
+            age = int(time.time() - _last_scan_at)
+            log.debug(f"[WATCHDOG] Check: scan #{_scan_count_global}, age={age}s")
             if _last_scan_at and time.time() - _last_scan_at > _WATCHDOG_STALE_SECONDS:
                 stale_min = int((time.time() - _last_scan_at) / 60)
                 log.error(f"[WATCHDOG] Scan loop stale! Last scan {stale_min}m ago")
@@ -1313,6 +1316,7 @@ async def main():
     except Exception:
         pass  # non-critical — bot works without health endpoint
 
+    global _last_scan_at, _scan_count_global
     last_history = last_metrics_save = 0
     METRICS_SAVE_INTERVAL = 300
     scan_count = 0
@@ -1732,6 +1736,7 @@ async def main():
         finally:
             _last_scan_at = time.time()
             _scan_count_global = scan_count
+            log.debug(f"[MAIN] Scan #{scan_count} done, watchdog reset (age=0s)")
 
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
