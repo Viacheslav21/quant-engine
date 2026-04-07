@@ -97,7 +97,7 @@ async def build_signal_context(signal: dict, config: dict, db=None, open_positio
     context = {
         "health": {
             "bankroll": 0, "wr": 0, "breakeven_wr": 0, "wr_gap": 0,
-            "7d_pnl": 0, "trend": "unknown",
+            "7d_pnl": 0, "trend": "unknown", "drawdown_pct": 0,
         },
         "signal": {
             "question": signal.get("question", ""),
@@ -108,20 +108,37 @@ async def build_signal_context(signal: dict, config: dict, db=None, open_positio
             "edge": signal.get("edge", 0),
             "p_final": signal["p_final"],
             "p_market": signal["p_market"],
+            "p_prospect": signal.get("p_prospect"),
             "theme": theme,
-            "theme_wr": 0, "theme_trend": "?",
+            "theme_wr": 0, "theme_roi": 0, "theme_trend": "?",
             "n_evidence": signal.get("n_evidence", 0),
             "is_contrarian": signal.get("contrarian", False),
             "sources": {},
             "dma_weights": {},
             "previous_sl_on_market": _loss_count.get(signal["market_id"], 0),
             "similar_theme_open": 0, "theme_stake": 0,
+            # Market data
+            "spread": signal.get("spread", 0),
+            "volume": signal.get("volume", 0),
+            "volatility": signal.get("volatility", 0),
+            "hurst": signal.get("hurst", 0),
+            "end_date": signal.get("end_date"),
+            "neg_risk": signal.get("negRisk", False),
+            # Confirmation delay info
+            "times_seen": 0,
         },
         "portfolio": {
             "open_positions": 0, "drawdown": 0,
             "today_pnl": 0, "largest_theme": "",
         },
     }
+    # How many times we've seen this signal (confirmation delay)
+    mid = signal["market_id"]
+    try:
+        if mid in _signal_first_seen:
+            context["signal"]["times_seen"] = _signal_first_seen[mid].get("count", 1)
+    except NameError:
+        pass
     if db:
         try:
             stats = await db.get_stats()
@@ -142,12 +159,33 @@ async def build_signal_context(signal: dict, config: dict, db=None, open_positio
             context["health"]["breakeven_wr"] = breakeven
             context["health"]["wr_gap"] = round(wr - breakeven, 1)
 
+            # Drawdown
+            equity = stats["bankroll"] + sum(
+                max(0, p.get("unrealized_pnl", 0)) for p in (open_positions or []))
+            peak = getattr(db, '_peak_equity', equity)
+            if peak > 0:
+                context["health"]["drawdown_pct"] = round((1 - equity / peak) * 100, 1)
+
             # Theme stats from patterns
             patterns = await db.get_patterns()
             tp = patterns.get(theme, {})
             context["signal"]["theme_wr"] = round(float(tp.get("trade_wr", 0)) * 100, 1)
+            context["signal"]["theme_roi"] = round(float(tp.get("trade_roi", 0)) * 100, 1)
             context["signal"]["ev_mult"] = round(float(tp.get("ev_mult", 1)), 2)
             context["signal"]["kelly_mult"] = round(float(tp.get("kelly_mult", 1)), 2)
+
+            # Our trade history on this specific market
+            async with db.pool.acquire() as _conn2:
+                market_history = await _conn2.fetch("""
+                    SELECT result, pnl, side FROM positions
+                    WHERE market_id = $1 AND status = 'closed'
+                    ORDER BY closed_at DESC LIMIT 5
+                """, signal["market_id"])
+            if market_history:
+                context["signal"]["market_history"] = [
+                    {"result": r["result"], "pnl": round(float(r["pnl"]), 2), "side": r["side"]}
+                    for r in market_history
+                ]
 
             # DMA weights
             dma = await db.get_dma_weights()
@@ -203,37 +241,65 @@ async def claude_confirm(signal: dict, config: dict, db=None, open_positions: li
 
     SYSTEM = f"""You are a prediction market analyst for a Polymarket trading bot.
 You receive a signal with full system context. Your job: confirm or reject the trade.
-{'Search the web for latest news about the market topic before deciding.' if use_web else ''}
+{'Search the web for the LATEST news about this specific market topic before deciding. Focus on recent events that could affect the outcome.' if use_web else ''}
 
-CONFIRM unless you have SPECIFIC evidence the market price is correct and our model is wrong.
-Consider: theme performance, DMA source reliability, portfolio concentration, loss history on this market.
-Be skeptical of high-EV signals (>18%) — our model tends to be overconfident.
-Be extra skeptical if the theme has WR < 40% or if we already lost on this market.
+DECISION RULES:
+- CONFIRM unless you have SPECIFIC evidence the market price is correct and our model is wrong
+- REJECT if: theme WR < 40%, we already lost on this market, spread > 5c, Hurst < 0.4 (mean-reverting noise)
+- REJECT if: high EV (>18%) — our model tends to be overconfident at high EV
+- REJECT if: drawdown > 15% — capital preservation mode
+- REJECT if: web search reveals news that invalidates our probability estimate
+- Be skeptical of short-expiry markets (<3 days) — prices are usually efficient near resolution
+- Consider volume: low volume (<$100k) = less reliable prices, high volume = more efficient market
+- p_claude should reflect YOUR probability estimate after considering all evidence + web search results
 
-Return ONLY:
+Return ONLY valid JSON (no other text):
 <json>{{"confirm": true/false, "p_claude": 0.00, "reasoning": "one sentence", "confidence": 0.00}}</json>"""
 
     # Compact context brief for Claude
     h = ctx["health"]
     s = ctx["signal"]
     p = ctx["portfolio"]
+    # Days until market closes
+    days_left = ""
+    if s.get("end_date"):
+        try:
+            from datetime import datetime, timezone
+            end = datetime.fromisoformat(str(s["end_date"]).replace("Z", "+00:00"))
+            dl = (end - datetime.now(timezone.utc)).days
+            days_left = f" | Expires: {dl}d"
+        except Exception:
+            pass
+
     prompt = (
-        f"SYSTEM: WR={h['wr']}% (need {h['breakeven_wr']}%) | 7d: {h['7d_pnl']:+d}$ | Bank: ${h['bankroll']} | Open: {p['open_positions']} pos\n\n"
-        f"SIGNAL: {s['side']} \"{s['question'][:100]}\" @ {s['side_price']*100:.0f}c\n"
+        f"SYSTEM: WR={h['wr']}% (need {h['breakeven_wr']}%) | 7d: {h['7d_pnl']:+d}$ | Bank: ${h['bankroll']} | Drawdown: {h['drawdown_pct']}% | Open: {p['open_positions']} pos\n\n"
+        f"SIGNAL: {s['side']} \"{s['question'][:150]}\" @ {s['side_price']*100:.0f}c\n"
         f"  EV: +{s['ev']*100:.1f}% | Edge: {s['edge']*100:.1f}% | Kelly: {s['kelly']*100:.1f}%\n"
-        f"  p_true: {s['p_final']*100:.0f}% vs market: {s['p_market']*100:.0f}% | Sources: {s['n_evidence']}/8\n"
+        f"  p_true: {s['p_final']*100:.0f}% vs market: {s['p_market']*100:.0f}%"
     )
+    if s.get("p_prospect"):
+        prompt += f" | p_prospect: {s['p_prospect']*100:.0f}%"
+    prompt += f" | Sources: {s['n_evidence']}/8\n"
+    prompt += f"  Spread: {s['spread']*100:.1f}c | Vol: ${s['volume']:,.0f} | Volatility: {s['volatility']:.3f} | Hurst: {s['hurst']:.2f}{days_left}"
+    if s.get("neg_risk"):
+        prompt += " | negRisk"
+    if s.get("times_seen", 0) > 1:
+        prompt += f" | Seen {s['times_seen']}x"
+    prompt += "\n"
     if s["sources"]:
         prompt += f"  Sources: {' '.join(f'{k}={v:.2f}' for k, v in s['sources'].items())}\n"
     if s["dma_weights"]:
         top_dma = sorted(s["dma_weights"].items(), key=lambda x: -x[1])[:4]
         prompt += f"  DMA (best→worst): {' '.join(f'{k}={v:.2f}' for k, v in top_dma)}\n"
     prompt += (
-        f"\nTHEME [{s['theme']}]: WR={s['theme_wr']}% | ev_mult={s.get('ev_mult', 1):.2f} | kelly_mult={s.get('kelly_mult', 1):.2f}\n"
+        f"\nTHEME [{s['theme']}]: WR={s['theme_wr']}% | ROI={s['theme_roi']:+.1f}% | ev_mult={s.get('ev_mult', 1):.2f} | kelly_mult={s.get('kelly_mult', 1):.2f}\n"
         f"  Open: {s['similar_theme_open']} pos, ${s['theme_stake']} staked\n"
     )
     if s["previous_sl_on_market"] > 0:
         prompt += f"  WARNING: {s['previous_sl_on_market']} previous SL on this market\n"
+    if s.get("market_history"):
+        hist = " ".join(f"{t['side']}→{t['result']}({t['pnl']:+.1f}$)" for t in s["market_history"])
+        prompt += f"  HISTORY on this market: {hist}\n"
     if s["is_contrarian"]:
         prompt += f"  NOTE: Contrarian signal (betting against recent move)\n"
     prompt += f"\nPORTFOLIO: Today {p['today_pnl']:+.0f}$ | Largest: {p['largest_theme']}\n"
@@ -241,21 +307,35 @@ Return ONLY:
 
     try:
         call_args = {
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 200 if not use_web else 400,
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 512 if not use_web else 1024,
             "system": SYSTEM,
             "messages": [{"role": "user", "content": prompt}],
         }
         if use_web:
             call_args["tools"] = [{"type": "web_search_20250305", "name": "web_search",
                                     "max_uses": 1}]
+        import time as _time
+        _t0 = _time.time()
+        log.info(f"[CLAUDE] Calling {'web+' if use_web else ''}sonnet for {signal['market_id'][:8]} {signal['side']} \"{signal['question'][:60]}\"")
         r = await client.messages.create(**call_args)
+        _elapsed = _time.time() - _t0
         txt = "".join(b.text for b in r.content if hasattr(b, "text"))
+        # Try <json> tags first, then ```json code blocks
         match = re.search(r"<json>([\s\S]*?)</json>", txt)
+        if not match:
+            match = re.search(r"```json\s*([\s\S]*?)```", txt)
+        if not match:
+            match = re.search(r'\{[^{}]*"confirm"\s*:\s*(?:true|false)[^{}]*\}', txt)
         if match:
-            result = json.loads(match.group(1).strip())
-            log.info(f"[CLAUDE] {'CONFIRM' if result.get('confirm') else 'REJECT'} {signal['market_id'][:8]} | {result.get('reasoning', '?')}")
+            raw = match.group(1).strip() if match.lastindex else match.group(0).strip()
+            result = json.loads(raw)
+            p_cl = result.get("p_claude", "?")
+            conf = result.get("confidence", "?")
+            log.info(f"[CLAUDE] {'CONFIRM' if result.get('confirm') else 'REJECT'} {signal['market_id'][:8]} | p_claude={p_cl} conf={conf} | {_elapsed:.1f}s | {result.get('reasoning', '?')}")
             return result
+        else:
+            log.warning(f"[CLAUDE] Could not parse response: {txt[:200]}")
     except Exception as e:
         log.warning(f"[CLAUDE] API error, rejecting signal: {e}")
     return {"confirm": False, "p_claude": signal["p_final"], "confidence": 0.0, "reasoning": "api_error_reject"}
@@ -1598,6 +1678,7 @@ async def main():
                             old_final = sig["p_final"]
                             sig["p_final"] = round(old_final * 0.6 + p_claude * 0.4, 4)
                             sig["p_final"] = max(old_final - 0.15, min(old_final + 0.15, sig["p_final"]))
+                            log.info(f"[CLAUDE] Blend {sig['market_id'][:8]}: p_final {old_final:.3f}→{sig['p_final']:.3f} (claude={p_claude:.3f})")
 
                         # Price freshness check — re-read from WS after Claude delay
                         ws_data = ws.get_market_data(sig["market_id"]) if ws else {}
