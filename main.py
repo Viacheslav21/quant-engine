@@ -330,7 +330,7 @@ Return ONLY valid JSON (no other text):
 
     try:
         call_args = {
-            "model": "claude-sonnet-4-6",
+            "model": "claude-haiku-4-5",
             "max_tokens": 512 if not use_web else 1024,
             "system": SYSTEM,
             "messages": [{"role": "user", "content": prompt}],
@@ -340,7 +340,7 @@ Return ONLY valid JSON (no other text):
                                     "max_uses": 1}]
         import time as _time
         _t0 = _time.time()
-        log.info(f"[CLAUDE] Calling {'web+' if use_web else ''}sonnet for {signal['market_id'][:8]} {signal['side']} \"{signal['question'][:60]}\"")
+        log.info(f"[CLAUDE] Calling {'web+' if use_web else ''}haiku for {signal['market_id'][:8]} {signal['side']} \"{signal['question'][:60]}\"")
         r = await client.messages.create(**call_args)
         _elapsed = _time.time() - _t0
         txt = "".join(b.text for b in r.content if hasattr(b, "text"))

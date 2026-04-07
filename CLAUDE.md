@@ -97,7 +97,7 @@ Polymarket API → Scanner (500 markets, paginated, every 5 min)
 - **Displacement**: When slots full, new signal (EV > 25%) can close worst position. Profitable positions displaced easily; losing positions only if new EV > 2× old EV. Returns bool, caller aborts if displacement failed (race protection).
 - **Drawdown protection**: Tracks peak equity (free cash + position values, each clamped to max(0)). Peak restored from real equity on restart (not just BANKROLL env). Halts all new trades when drawdown ≥ 25%. Continues monitoring and closing existing positions. Resume after recovery + 30 min cooldown.
 - **Double-close protection**: `close_position` uses `WHERE status='open' RETURNING id` — concurrent WS + REST close attempts are safe.
-- **Claude confirmation** (optional): Haiku with web search, max 1 call/min, 30-min cache. Blends: 0.6 × p_final + 0.4 × p_claude, then re-caps drift to ±15%. Fallback: reject (not confirm). Currently disabled — math-only mode.
+- **Claude confirmation** (optional): Sonnet 4.6 with web search tool, max 1 call/min, configurable delay (`CONFIRM_DELAY`, default 600s). Enriched context: spread, volume, volatility, Hurst exponent, days_left, negRisk flag, drawdown %, market price history, theme ROI, confirmation count. Improved JSON parsing (supports ```json fenced blocks). Blends: 0.6 × p_final + 0.4 × p_claude, then re-caps drift to ±15%. Fallback: reject (not confirm). Toggled via `CLAUDE_CONFIRM` and `CLAUDE_WEB_SEARCH` config keys.
 
 ### Trade Log (trade_log table)
 
@@ -120,7 +120,17 @@ Columns: 35 typed columns + JSONB `details` for event-specific data. Indexed by 
 
 ### Configuration
 
-All config via environment variables. Key params:
+Config loaded from environment variables at startup, then overridden at runtime by `config_live` DB table. `_seed_config_live(engine_config=CONFIG)` runs at startup to populate `config_live` with current env values (ON CONFLICT DO NOTHING — preserves DB overrides). `_reload_config()` merges DB overrides into the `CONFIG` dict (safe keys only, never credentials). Triggered instantly via `LISTEN config_reload` (same connection as `trader_commands`). 23 engine parameters exposed for live editing:
+- **Signals**: `MIN_EV`, `MAX_EV`, `MIN_KL`, `MIN_EDGE`, `USE_PROSPECT`
+- **Risk**: `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `TRAILING_TP`, `TRAILING_PULLBACK`
+- **Sizing**: `MIN_KELLY_FRAC`, `MAX_KELLY_FRAC`
+- **Capacity**: `MAX_OPEN`, `MAX_PER_THEME`, `MAX_SIGNALS`
+- **Timing**: `SCAN_INTERVAL`, `HISTORY_INTERVAL`, `CONFIRM_DELAY`
+- **Filters**: `MAX_MARKET_DAYS`, `MIN_VOLUME`, `SKIP_SPORTS`
+- **Claude**: `CLAUDE_CONFIRM`, `CLAUDE_WEB_SEARCH`
+- **General**: `CONFIG_TAG`
+
+Key env var params:
 - `SIMULATION=true` (default, no real trades)
 - `USE_PROSPECT=true` (prospect theory prior, disable for A/B testing)
 - `MIN_EV=0.12`, `MIN_KL=0.08` (signal acceptance thresholds)
@@ -137,7 +147,7 @@ All config via environment variables. Key params:
 
 ### Database
 
-PostgreSQL required. Schema auto-created on startup by `db.init()`. 13 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history, market_metrics, trade_log, trader_commands, dma_weights. Migrations run automatically for new columns (positions: tp_pct, sl_pct, config_tag; patterns: trade_n, trade_wr, trade_roi, kelly_mult, ev_mult) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. `trader_commands` table enables dashboard→engine communication: dashboard INSERTs commands + NOTIFY, engine LISTENs + polls each cycle. Cleanup runs every HISTORY_INTERVAL: snapshots (1d), unexecuted signals (7d), processed news (5d). Positions, markets, and trade_log kept forever. VACUUM after cleanup. DB writes throttled: price updates every 30s per position, market upserts skip unchanged prices.
+PostgreSQL required. Schema auto-created on startup by `db.init()`. 15 tables: markets, price_snapshots, news, signals, positions, patterns, calibration, stats, config_history, market_metrics, trade_log, trader_commands, dma_weights, config_live, config_live_history. Migrations run automatically for new columns (positions: tp_pct, sl_pct, config_tag; patterns: trade_n, trade_wr, trade_roi, kelly_mult, ev_mult) and backfill (executed signals from positions table). Signals marked `executed=TRUE` after trade for backtest analytics. `trader_commands` table enables dashboard→engine communication: dashboard INSERTs commands + NOTIFY, engine LISTENs + polls each cycle. `config_live` table enables live config: dashboard writes + `NOTIFY config_reload`, engine LISTENs on same connection as `trader_commands`. `config_live_history` stores change audit trail. Cleanup runs every HISTORY_INTERVAL: snapshots (1d), unexecuted signals (7d), processed news (5d). Positions, markets, and trade_log kept forever. VACUUM after cleanup. DB writes throttled: price updates every 30s per position, market upserts skip unchanged prices.
 
 ### Risk Management
 
