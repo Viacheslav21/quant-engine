@@ -72,7 +72,7 @@ CONFIG = {
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
     "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
-    "MAX_EV":           float(os.getenv("MAX_EV", "0.20")),
+    "MAX_EV":           float(os.getenv("MAX_EV", "0.18")),  # was 0.20 — EV 20-30% has 46.7% WR (overconfident)
     "CLAUDE_CONFIRM":   os.getenv("CLAUDE_CONFIRM", "false").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
 }
@@ -889,6 +889,27 @@ async def _check_position(pos: dict, price: float, is_closed: bool, yes_price: f
                     log.info(f"[MONITOR] Emergency SL: age={pos_age_h:.1f}h pnl={pnl_pct*100:.1f}% (emergency:{emergency_sl*100:.0f}%)")
                 # else: within grace period + above emergency → hold
 
+    # Shadow-mode: probability-based SL (log only, does not affect trading)
+    # Recalculate EV with current price — would we still enter this trade?
+    if close_reason == "STOP_LOSS" or (pnl_pct <= -sl_pct and not close_reason):
+        try:
+            from agents.math_engine import expected_value
+            p_side = pos.get("p_final", 0.5)
+            if pos["side"] == "NO":
+                p_side = 1 - p_side
+            current_ev = expected_value(p_side, price)
+            shadow_decision = "HOLD" if current_ev > 0 else "EXIT"
+            actual_decision = "EXIT" if close_reason == "STOP_LOSS" else "HOLD"
+            if shadow_decision != actual_decision:
+                log.info(
+                    f"[SHADOW-SL] {pos['market_id'][:8]} {pos['side']} | "
+                    f"Price SL={actual_decision} vs Prob SL={shadow_decision} | "
+                    f"pnl={pnl_pct*100:+.1f}% EV={current_ev*100:+.1f}% p_final={p_side*100:.1f}% price={price*100:.1f}¢ | "
+                    f"${pos['stake_amt']:.0f} | {pos['question'][:40]}"
+                )
+        except Exception:
+            pass
+
     if not close_reason:
         return False
 
@@ -1327,6 +1348,7 @@ async def main():
     scan_count = 0
     _market_price_cache = {}
     _signal_cooldown = {}
+    _signal_first_seen = {}  # market_id -> timestamp when signal first appeared (confirmation delay)
     try:
         saved_metrics = await db.get_all_market_metrics()
         for m in saved_metrics:
@@ -1509,7 +1531,22 @@ async def main():
             open_market_ids = {p["market_id"] for p in open_pos}
             new_signals = {k: v for k, v in all_signals.items() if k not in open_market_ids}
 
-            signals = sorted(new_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
+            # Confirmation delay: signal must persist for 2+ scans (~10 min)
+            # Data: <1h positions have 31.7% WR — many entries are on temporary price spikes
+            CONFIRM_DELAY = 600  # 10 min (2 scan cycles)
+            _signal_first_seen = {k: v for k, v in _signal_first_seen.items() if now - v < 3600}  # cleanup
+            confirmed_signals = {}
+            for k, v in new_signals.items():
+                if k not in _signal_first_seen:
+                    _signal_first_seen[k] = now
+                    log.debug(f"[CONFIRM] First seen: {k[:8]} EV:{v['ev']*100:.1f}% — waiting for confirmation")
+                elif now - _signal_first_seen[k] >= CONFIRM_DELAY:
+                    confirmed_signals[k] = v
+                # else: seen but not yet confirmed, skip
+            if new_signals and len(confirmed_signals) < len(new_signals):
+                log.info(f"[CONFIRM] {len(new_signals) - len(confirmed_signals)} signals awaiting confirmation (need {CONFIRM_DELAY}s)")
+
+            signals = sorted(confirmed_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
 
             if signals:
                 log.info(f"[SCAN #{scan_count}] {len(markets)} рынков | {len(all_signals)} сигналов | {len(signals)} новых")
