@@ -6,6 +6,18 @@ from typing import Optional
 
 log = logging.getLogger("db")
 
+
+def _cast_config_value(value: str, value_type: str):
+    """Cast config string value to its proper Python type."""
+    if value_type == "float":
+        return float(value)
+    elif value_type == "int":
+        return int(float(value))
+    elif value_type == "bool":
+        return value.lower() in ("true", "1", "yes")
+    return value
+
+
 class Database:
     def __init__(self):
         self.url  = os.getenv("DATABASE_URL")
@@ -19,6 +31,7 @@ class Database:
         await self._migrate_patterns_theme_perf()
         await self._backfill_executed_signals()
         await self._init_stats()
+        # config_live seeded separately after CONFIG is available
         log.info("[DB] PostgreSQL подключён")
 
     async def _create_schema(self):
@@ -168,6 +181,30 @@ class Database:
                     avg_likelihood REAL DEFAULT 0.5,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS config_live (
+                    id BIGSERIAL PRIMARY KEY,
+                    service TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    value_type TEXT NOT NULL DEFAULT 'str',
+                    description TEXT DEFAULT '',
+                    min_val REAL,
+                    max_val REAL,
+                    section TEXT DEFAULT 'general',
+                    version INTEGER DEFAULT 1,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(service, key)
+                );
+                CREATE TABLE IF NOT EXISTS config_live_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    service TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    changed_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_config_live_service ON config_live(service);
             """)
             log.info("[DB] Schema created")
         except Exception as e:
@@ -231,6 +268,99 @@ class Database:
                 "INSERT INTO stats (id, bankroll) VALUES (1, $1) ON CONFLICT (id) DO NOTHING",
                 bankroll
             )
+
+    async def _seed_config_live(self, engine_config: dict = None, micro_config: dict = None):
+        """Populate config_live with current env values. ON CONFLICT DO NOTHING — existing DB values untouched."""
+        ec = engine_config or {}
+        mc = micro_config or {}
+
+        def _v(cfg, key, fallback):
+            """Get value from config dict, convert to string."""
+            val = cfg.get(key)
+            if val is None:
+                return str(fallback)
+            if isinstance(val, bool):
+                return "true" if val else "false"
+            return str(val)
+
+        # (service, key, fallback, value_type, description, min, max, section)
+        SCHEMA = [
+            # Engine — signals
+            ("engine", "MIN_EV",           0.12,  "float", "Minimum expected value",              0.01, 0.50, "signals"),
+            ("engine", "MAX_EV",           0.18,  "float", "Max EV (reject overconfident)",       0.10, 0.50, "signals"),
+            ("engine", "MIN_KL",           0.08,  "float", "Minimum KL divergence",               0.01, 0.50, "signals"),
+            ("engine", "MIN_EDGE",         0.10,  "float", "Minimum edge |p_final - p_market|",   0.01, 0.50, "signals"),
+            ("engine", "USE_PROSPECT",     True,  "bool",  "Enable prospect theory prior",        None, None, "signals"),
+            # Engine — risk
+            ("engine", "STOP_LOSS_PCT",    0.25,  "float", "Stop loss percentage",                0.05, 0.50, "risk"),
+            ("engine", "TAKE_PROFIT_PCT",  0.15,  "float", "Take profit percentage",              0.05, 0.50, "risk"),
+            ("engine", "TRAILING_TP",      True,  "bool",  "Enable trailing take profit",         None, None, "risk"),
+            ("engine", "TRAILING_PULLBACK",0.05,  "float", "Trailing TP pullback",               0.01, 0.20, "risk"),
+            # Engine — sizing
+            ("engine", "MIN_KELLY_FRAC",   0.03,  "float", "Minimum Kelly fraction",              0.01, 0.50, "sizing"),
+            ("engine", "MAX_KELLY_FRAC",   0.20,  "float", "Maximum Kelly fraction cap",          0.05, 1.00, "sizing"),
+            # Engine — capacity
+            ("engine", "MAX_OPEN",         50,    "int",   "Maximum open positions",              1,    200,  "capacity"),
+            ("engine", "MAX_PER_THEME",    10,    "int",   "Max positions per theme",             1,    50,   "capacity"),
+            ("engine", "MAX_SIGNALS",      5,     "int",   "Max signals per scan",                1,    20,   "capacity"),
+            # Engine — timing
+            ("engine", "SCAN_INTERVAL",    300,   "int",   "Seconds between scans",               60,   3600, "timing"),
+            ("engine", "HISTORY_INTERVAL", 14400, "int",   "Seconds between recalibration",       3600, 86400,"timing"),
+            # Engine — filters
+            ("engine", "MAX_MARKET_DAYS",  30,    "int",   "Max days to market expiry",           1,    365,  "filters"),
+            ("engine", "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
+            ("engine", "SKIP_SPORTS",      True,  "bool",  "Skip sports markets",                 None, None, "filters"),
+            # Engine — claude
+            ("engine", "CLAUDE_CONFIRM",   False, "bool",  "Enable Claude confirmation",          None, None, "claude"),
+            ("engine", "CLAUDE_WEB_SEARCH",False, "bool",  "Claude web search",                   None, None, "claude"),
+            # Engine — general
+            ("engine", "CONFIG_TAG",       "v7",  "str",   "A/B testing tag",                     None, None, "general"),
+            ("engine", "CONFIRM_DELAY",    600,   "int",   "Signal confirmation delay (sec)",     0,    3600, "general"),
+
+            # Micro — signals
+            ("micro",  "ENTRY_MIN_PRICE",  0.94,  "float", "Direct entry price threshold",        0.80, 0.99, "signals"),
+            ("micro",  "WATCHLIST_MIN_PRICE",0.90, "float","Watchlist min price",                 0.80, 0.99, "signals"),
+            ("micro",  "MIN_ROI",          0.02,  "float", "Minimum ROI at resolution",           0.005,0.10, "signals"),
+            ("micro",  "MIN_QUALITY_SCORE",40,    "float", "Min quality score to enter",          0,    100,  "signals"),
+            # Micro — risk
+            ("micro",  "SL_PCT",           0.05,  "float", "Default stop loss percentage",        0.01, 0.20, "risk"),
+            ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Rapid drop exit threshold",           0.02, 0.15, "risk"),
+            ("micro",  "MAX_LOSS_PER_POS", 3.0,   "float", "Hard cap loss per position ($)",      0.5,  20.0, "risk"),
+            # Micro — sizing
+            ("micro",  "MAX_STAKE",        20.0,  "float", "Maximum stake per position",          1.0,  100.0,"sizing"),
+            ("micro",  "MIN_STAKE",        5.0,   "float", "Minimum stake per position",          1.0,  50.0, "sizing"),
+            # Micro — capacity
+            ("micro",  "MAX_OPEN",         50,    "int",   "Maximum open positions",              1,    200,  "capacity"),
+            ("micro",  "MAX_PER_THEME",    5,     "int",   "Max positions per theme",             1,    50,   "capacity"),
+            # Micro — filters
+            ("micro",  "MAX_DAYS_LEFT",    7,     "float", "Max days to market expiry",           1,    30,   "filters"),
+            ("micro",  "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
+            # Micro — timing
+            ("micro",  "SCAN_INTERVAL",    120,   "int",   "Seconds between scans",               30,   600,  "timing"),
+            # Micro — general
+            ("micro",  "CONFIG_TAG",       "micro-v4","str","Config version tag",                  None, None, "general"),
+        ]
+        async with self.pool.acquire() as conn:
+            for svc, key, fallback, vtype, desc, mn, mx, sec in SCHEMA:
+                cfg = ec if svc == "engine" else mc
+                val = _v(cfg, key, fallback)
+                await conn.execute("""
+                    INSERT INTO config_live (service, key, value, value_type, description, min_val, max_val, section)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (service, key) DO NOTHING
+                """, svc, key, val, vtype, desc, mn, mx, sec)
+            log.info(f"[DB] config_live seeded ({len(SCHEMA)} params, using env values)")
+
+    async def get_config_overrides(self, service: str) -> dict:
+        """Fetch live config overrides for a service."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT key, value, value_type FROM config_live WHERE service = $1", service
+            )
+        result = {}
+        for r in rows:
+            result[r["key"]] = _cast_config_value(r["value"], r["value_type"])
+        return result
 
     async def _migrate_positions_tp_sl(self):
         """Add tp_pct/sl_pct columns to positions if missing (existing DBs)."""

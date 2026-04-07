@@ -75,10 +75,18 @@ CONFIG = {
     "MAX_EV":           float(os.getenv("MAX_EV", "0.18")),  # was 0.20 — EV 20-30% has 46.7% WR (overconfident)
     "CLAUDE_CONFIRM":   os.getenv("CLAUDE_CONFIRM", "false").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
+    "CONFIRM_DELAY":    int(os.getenv("CONFIRM_DELAY", "600")),
 }
 
 _claude_client = None
 _shutdown_flag = False
+_SAFE_CONFIG_KEYS = {
+    "MIN_EV", "MAX_EV", "MIN_KL", "MIN_EDGE", "MIN_KELLY_FRAC", "MAX_KELLY_FRAC",
+    "STOP_LOSS_PCT", "TAKE_PROFIT_PCT", "TRAILING_TP", "TRAILING_PULLBACK",
+    "MAX_OPEN", "MAX_PER_THEME", "MAX_SIGNALS", "SCAN_INTERVAL", "HISTORY_INTERVAL",
+    "MAX_MARKET_DAYS", "MIN_VOLUME", "SKIP_SPORTS", "USE_PROSPECT", "MAX_EV",
+    "CLAUDE_CONFIRM", "CLAUDE_WEB_SEARCH", "CONFIG_TAG", "CONFIRM_DELAY",
+}
 _last_scan_at = 0.0  # timestamp of last successful scan loop iteration
 _scan_count_global = 0
 _WATCHDOG_STALE_SECONDS = 900  # 15 min — alert if scan loop hasn't run
@@ -89,6 +97,21 @@ def _get_claude_client(config: dict):
         from anthropic import AsyncAnthropic
         _claude_client = AsyncAnthropic(api_key=config["ANTHROPIC_KEY"])
     return _claude_client
+
+
+async def _reload_config(db):
+    """Fetch live config overrides from DB and merge into CONFIG."""
+    try:
+        overrides = await db.get_config_overrides("engine")
+        changed = []
+        for key, val in overrides.items():
+            if key in _SAFE_CONFIG_KEYS and key in CONFIG and CONFIG[key] != val:
+                changed.append(f"{key}: {CONFIG[key]}→{val}")
+                CONFIG[key] = val
+        if changed:
+            log.info(f"[CONFIG] Live reload: {', '.join(changed)}")
+    except Exception as e:
+        log.warning(f"[CONFIG] Failed to reload: {e}")
 
 async def build_signal_context(signal: dict, config: dict, db=None, open_positions: list = None) -> dict:
     """Build rich context for Claude confirmation. Contains everything Claude needs to make a decision."""
@@ -1155,6 +1178,8 @@ async def main():
 
     db         = Database()
     await db.init()
+    await db._seed_config_live(engine_config=CONFIG)
+    await _reload_config(db)  # apply any DB overrides immediately
     telegram   = TelegramBot(CONFIG["TELEGRAM_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
     scanner    = PolymarketScanner(CONFIG)
     calibrator = Calibrator(db)
@@ -1354,15 +1379,19 @@ async def main():
     # Start WS in background
     ws_task = asyncio.create_task(ws.connect())
 
-    # LISTEN for trader_commands NOTIFY — instant reaction to dashboard commands
+    # LISTEN for trader_commands + config_reload NOTIFY
     async def _listen_commands():
         try:
             listen_conn = await asyncpg.connect(db.url)
             await listen_conn.add_listener("trader_commands",
                 lambda conn, pid, channel, payload:
                     asyncio.create_task(process_trader_commands(db, telegram, scanner, CONFIG, trailing_highs, ws)))
+            await listen_conn.add_listener("config_reload",
+                lambda conn, pid, channel, payload:
+                    asyncio.create_task(_reload_config(db)))
             await db.setup_listen(listen_conn)
-            log.info("[CMD] LISTEN trader_commands active")
+            await listen_conn.execute("LISTEN config_reload")
+            log.info("[CMD] LISTEN trader_commands + config_reload active")
             while not _shutdown_flag:
                 await asyncio.sleep(60)
             await listen_conn.close()
@@ -1613,18 +1642,18 @@ async def main():
 
             # Confirmation delay: signal must persist for 2+ scans (~10 min)
             # Data: <1h positions have 31.7% WR — many entries are on temporary price spikes
-            CONFIRM_DELAY = 600  # 10 min (2 scan cycles)
+            _confirm_delay = CONFIG.get("CONFIRM_DELAY", 600)
             _signal_first_seen = {k: v for k, v in _signal_first_seen.items() if now - v < 3600}  # cleanup
             confirmed_signals = {}
             for k, v in new_signals.items():
                 if k not in _signal_first_seen:
                     _signal_first_seen[k] = now
                     log.debug(f"[CONFIRM] First seen: {k[:8]} EV:{v['ev']*100:.1f}% — waiting for confirmation")
-                elif now - _signal_first_seen[k] >= CONFIRM_DELAY:
+                elif now - _signal_first_seen[k] >= _confirm_delay:
                     confirmed_signals[k] = v
                 # else: seen but not yet confirmed, skip
             if new_signals and len(confirmed_signals) < len(new_signals):
-                log.info(f"[CONFIRM] {len(new_signals) - len(confirmed_signals)} signals awaiting confirmation (need {CONFIRM_DELAY}s)")
+                log.info(f"[CONFIRM] {len(new_signals) - len(confirmed_signals)} signals awaiting confirmation (need {_confirm_delay}s)")
 
             signals = sorted(confirmed_signals.values(), key=lambda s: s["kelly"] * (1 - s.get("entropy", 0.5) * 0.3), reverse=True)
 
