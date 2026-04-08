@@ -321,6 +321,9 @@ class Database:
             ("micro",  "WATCHLIST_MIN_PRICE",0.90, "float","Watchlist min price",                 0.80, 0.99, "signals"),
             ("micro",  "MIN_ROI",          0.02,  "float", "Minimum ROI at resolution",           0.005,0.10, "signals"),
             ("micro",  "MIN_QUALITY_SCORE",40,    "float", "Min quality score to enter",          0,    100,  "signals"),
+            ("micro",  "ENTRY_PRICE_1D",   0.90,  "float", "Entry price for ≤1 day markets",      0.80, 0.99, "signals"),
+            ("micro",  "ENTRY_PRICE_2D",   0.92,  "float", "Entry price for ≤2 day markets",      0.80, 0.99, "signals"),
+            ("micro",  "ENTRY_PRICE_3D",   0.93,  "float", "Entry price for ≤3 day markets",      0.80, 0.99, "signals"),
             # Micro — risk
             ("micro",  "SL_PCT",           0.05,  "float", "Default stop loss percentage",        0.01, 0.20, "risk"),
             ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Rapid drop exit threshold",           0.02, 0.15, "risk"),
