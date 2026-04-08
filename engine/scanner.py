@@ -97,61 +97,6 @@ THEME_KEYWORDS = {
     "transport":  ["boeing","airbus","airline","aviation","faa","shipping","port","suez"],
 }
 
-SPORTS_KEYWORDS = [
-    # Match patterns
-    "vs.", "vs ", "spread:", "o/u ", "over/under", "moneyline",
-    "win on 2026", "win on 2025", "win the 2026", "win the 2025",
-    "points scored", "map handicap", "map winner", "game winner",
-    "total goals", "total points", "total runs", "total sets",
-    # Leagues & sports
-    "nba", "nfl", "mlb", "nhl", "ncaa", "mls", "pga", "atp", "wta", "lpga",
-    "premier league", "la liga", "serie a", "bundesliga", "ligue 1", "eredivisie",
-    "champions league", "europa league", "conference league",
-    "ufc", "mma", "boxing", "tennis", "golf", "cricket", "rugby", "f1 ",
-    "formula 1", "nascar", "indycar", "tour de france", "grand prix",
-    "f1 drivers", "fifa world cup", "world cup 2026",
-    "win on 2026-", "win on 2025-",  # "Will X FC win on 2026-03-22?"
-    "masters tournament", "the open", "pga championship", "ryder cup",
-    "miami open", "french open", "wimbledon", "us open", "australian open",
-    "roland garros", "indian wells",
-    "round of 16", "round of 32", "round of 64", "semifinal", "quarterfinal",
-    "sweet 16", "elite eight", "final four",
-    "world series", "super bowl", "stanley cup", "nba finals",
-    # Esports
-    "counter-strike", "dota", "league of legends", "valorant", "blast open",
-    "esl ", "iem ", "major ", "bo1", "bo3", "bo5",
-    "faze", "navi", "g2 esports", "team liquid", "fnatic", "vitality",
-    "t1 ", "gen.g", "cloud9",
-    # Football (soccer) teams
-    "feyenoord", "manchester city", "manchester united", "real madrid",
-    "barcelona", "atletico", "bayern", "psg", "juventus", "inter milan",
-    "ac milan", "napoli", "liverpool", "arsenal", "chelsea", "tottenham",
-    "borussia", "roma", "lazio", "benfica", "porto", "ajax",
-    "olympique", "nottingham", "midtjylland", "san diego fc",
-    # US college / pro teams
-    "panthers", "razorbacks", "hawkeyes", "gators", "wildcats", "wolverines",
-    "bulldogs", "tigers", "eagles", "bears", "lakers", "celtics",
-    "warriors", "nets", "yankees", "dodgers", "chiefs", "49ers",
-    "timberwolves", "raptors", "blue jackets", "islanders", "bruins",
-    "canadiens", "penguins", "capitals", "rangers", "red wings",
-    "packers", "cowboys", "patriots", "steelers", "ravens",
-    "red sox", "mets", "cubs", "astros", "braves",
-    "duke", "gonzaga", "kentucky", "villanova", "baylor",
-    "michigan", "arizona", "houston", "marquette", "purdue",
-    "st. john", "northern iowa", "high point",
-    # Athletes
-    "scheffler", "berrettini", "djokovic", "nadal", "sinner", "alcaraz",
-    "swiatek", "gauff", "medvedev", "zverev", "rublev", "tsitsipas",
-    "lebron", "curry", "durant", "giannis", "jokic", "luka",
-    "mahomes", "allen", "lamar", "ohtani", "judge",
-    "verstappen", "hamilton", "leclerc", "norris",
-    "mcilroy", "koepka", "rahm", "hovland", "morikawa",
-]
-
-
-def is_sports(question: str) -> bool:
-    lower = question.lower()
-    return any(kw in lower for kw in SPORTS_KEYWORDS)
 
 
 def _parse_end_date(raw) -> Optional[datetime]:
@@ -211,10 +156,6 @@ class PolymarketScanner:
                         continue
                     # Skip markets not accepting orders (in review / paused / missing field)
                     if not m.get("acceptingOrders", True):
-                        filtered += 1
-                        continue
-                    # Skip sports/esports markets
-                    if self.config.get("SKIP_SPORTS", True) and is_sports(m.get("question", "")):
                         filtered += 1
                         continue
                     raw_prices = m.get("outcomePrices") or ["0.5","0.5"]

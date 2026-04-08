@@ -309,7 +309,6 @@ class Database:
             # Engine — filters
             ("engine", "MAX_MARKET_DAYS",  30,    "int",   "Max days to market expiry",           1,    365,  "filters"),
             ("engine", "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
-            ("engine", "SKIP_SPORTS",      True,  "bool",  "Skip sports markets",                 None, None, "filters"),
             # Engine — claude
             ("engine", "CLAUDE_CONFIRM",   False, "bool",  "Enable Claude confirmation",          None, None, "claude"),
             ("engine", "CLAUDE_WEB_SEARCH",False, "bool",  "Claude web search",                   None, None, "claude"),
@@ -416,6 +415,12 @@ class Database:
                 if col not in col_names:
                     await conn.execute(f"ALTER TABLE patterns ADD COLUMN {col} {typedef}")
                     log.info(f"[DB] Added {col} column to patterns")
+            # Seed default blocked themes
+            for theme in ["sports", "esports"]:
+                await conn.execute("""
+                    INSERT INTO patterns (category, blocked) VALUES ($1, true)
+                    ON CONFLICT (category) DO NOTHING
+                """, theme)
 
     async def _backfill_executed_signals(self):
         """One-time: mark signals as executed if they have a matching position."""

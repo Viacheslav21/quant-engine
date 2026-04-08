@@ -71,7 +71,6 @@ CONFIG = {
     "MIN_VOLUME":       float(os.getenv("MIN_VOLUME", "50000")),
     "MAX_MARKET_DAYS":  int(os.getenv("MAX_MARKET_DAYS", "30")),
     "USE_PROSPECT":     os.getenv("USE_PROSPECT", "true").lower() == "true",
-    "SKIP_SPORTS":      os.getenv("SKIP_SPORTS", "true").lower() == "true",
     "MAX_EV":           float(os.getenv("MAX_EV", "0.18")),  # was 0.20 — EV 20-30% has 46.7% WR (overconfident)
     "CLAUDE_CONFIRM":   os.getenv("CLAUDE_CONFIRM", "false").lower() == "true",
     "CLAUDE_WEB_SEARCH": os.getenv("CLAUDE_WEB_SEARCH", "false").lower() == "true",
@@ -84,7 +83,7 @@ _SAFE_CONFIG_KEYS = {
     "MIN_EV", "MAX_EV", "MIN_KL", "MIN_EDGE", "MIN_KELLY_FRAC", "MAX_KELLY_FRAC",
     "STOP_LOSS_PCT", "TAKE_PROFIT_PCT", "TRAILING_TP", "TRAILING_PULLBACK",
     "MAX_OPEN", "MAX_PER_THEME", "MAX_SIGNALS", "SCAN_INTERVAL", "HISTORY_INTERVAL",
-    "MAX_MARKET_DAYS", "MIN_VOLUME", "SKIP_SPORTS", "USE_PROSPECT", "MAX_EV",
+    "MAX_MARKET_DAYS", "MIN_VOLUME", "USE_PROSPECT", "MAX_EV",
     "CLAUDE_CONFIRM", "CLAUDE_WEB_SEARCH", "CONFIG_TAG", "CONFIRM_DELAY",
 }
 _last_scan_at = 0.0  # timestamp of last successful scan loop iteration
