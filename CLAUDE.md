@@ -126,7 +126,7 @@ Config loaded from environment variables at startup, then overridden at runtime 
 - **Sizing**: `MIN_KELLY_FRAC`, `MAX_KELLY_FRAC`
 - **Capacity**: `MAX_OPEN`, `MAX_PER_THEME`, `MAX_SIGNALS`
 - **Timing**: `SCAN_INTERVAL`, `HISTORY_INTERVAL`, `CONFIRM_DELAY`
-- **Filters**: `MAX_MARKET_DAYS`, `MIN_VOLUME`, `SKIP_SPORTS`
+- **Filters**: `MAX_MARKET_DAYS`, `MIN_VOLUME`
 - **Claude**: `CLAUDE_CONFIRM`, `CLAUDE_WEB_SEARCH`
 - **General**: `CONFIG_TAG`
 
