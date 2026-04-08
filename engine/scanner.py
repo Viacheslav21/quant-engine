@@ -19,6 +19,74 @@ def _parse_token_ids(m: dict) -> tuple:
     return yes_token, no_token
 
 THEME_KEYWORDS = {
+    # Sports & esports FIRST — must match before generic keywords
+    "sports":     [
+                   # Leagues
+                   "nba","nfl","mlb","nhl","mls","ufc","mma","wwe","pga","lpga",
+                   "atp","wta","ncaa","premier league","la liga","serie a",
+                   "bundesliga","ligue 1","eredivisie","champions league",
+                   "europa league","conference league","nations league",
+                   "fifa","uefa","concacaf","conmebol","afc","caf",
+                   # Sports
+                   "football","basketball","baseball","hockey","soccer",
+                   "tennis","golf","boxing","cricket","rugby","wrestling",
+                   "formula 1","f1 ","nascar","indycar","motogp",
+                   "cycling","tour de france","swimming","athletics","track and field",
+                   # Events
+                   "world series","super bowl","stanley cup","nba finals",
+                   "world cup","olympics","grand prix","grand slam",
+                   "masters","ryder cup","wimbledon","french open",
+                   "us open","australian open","roland garros","indian wells",
+                   "miami open","monte carlo","rome open",
+                   "playoff","semifinal","quarterfinal","final four",
+                   "round of 16","round of 32","sweet 16","elite eight",
+                   # Match patterns
+                   " vs. "," vs ",
+                   "spread:","o/u ","over/under","moneyline",
+                   "total goals","total points","total runs","total sets",
+                   "points scored","score ","goals ",
+                   "win on 2025","win on 2026","win the 2025","win the 2026",
+                   " beat "," defeat ",
+                   # Teams (MLB)
+                   "yankees","dodgers","red sox","cubs","astros","braves",
+                   "mets","padres","phillies","reds vs","marlins","tigers",
+                   "twins","rays","orioles","guardians","royals","giants",
+                   "angels","rangers","mariners","athletics","white sox",
+                   "blue jays","diamondbacks","rockies","pirates","cardinals","nationals",
+                   # Teams (NBA)
+                   "lakers","celtics","warriors","nets","76ers","bucks",
+                   "nuggets","heat","knicks","suns","clippers","mavericks",
+                   "timberwolves","cavaliers","thunder","grizzlies","pelicans",
+                   # Teams (NFL)
+                   "chiefs","49ers","eagles","cowboys","packers","ravens",
+                   "bills","bengals","lions","dolphins","jets","steelers",
+                   "patriots","broncos","chargers","rams","seahawks","commanders",
+                   # Teams (NHL)
+                   "bruins","rangers","maple leafs","oilers","panthers",
+                   "hurricanes","avalanche","stars","lightning","penguins",
+                   "capitals","canadiens","red wings","islanders","blue jackets",
+                   # Teams (Soccer)
+                   "real madrid","barcelona","manchester city","manchester united",
+                   "liverpool","arsenal","chelsea","tottenham","bayern",
+                   "psg","juventus","inter milan","ac milan","napoli",
+                   "borussia","benfica","porto","ajax","feyenoord",
+                   # Athletes
+                   "scheffler","djokovic","nadal","sinner","alcaraz","swiatek",
+                   "medvedev","zverev","gauff","rublev","tsitsipas",
+                   "lebron","curry","durant","giannis","jokic","luka",
+                   "mahomes","allen","lamar","ohtani","judge",
+                   "verstappen","hamilton","leclerc","norris",
+                   "mcilroy","koepka","rahm","hovland","morikawa",
+                   ],
+    "esports":    ["esports","counter-strike","dota","league of legends","valorant",
+                   "overwatch","call of duty","fortnite","apex legends","rocket league",
+                   "fnatic","navi","faze","g2 esports","team liquid","vitality",
+                   "cloud9","t1 ","gen.g","sentinels","100 thieves",
+                   "blast open","pgl ","esl ","iem ","major ",
+                   "parivision","fut esports","astralis","bc.game",
+                   "(bo1)","(bo3)","(bo5)","bo1","bo3","bo5",
+                   "map winner","map 1","map 2","map 3","map handicap"],
+
     # Geopolitics & conflicts
     "iran":       ["iran","iranian","tehran","nuclear iran","iaea","persian gulf","strait of hormuz"],
     "israel":     ["israel","hamas","gaza","hezbollah","netanyahu","idf","west bank","golan"],
@@ -90,7 +158,6 @@ THEME_KEYWORDS = {
     "mideast":    ["saudi","mbs","qatar","uae","emirates","bahrain","oman","iraq","baghdad","kurdish"],
 
     # Other categories
-    "sports_off": ["world cup","olympics","fifa","ioc"],  # non-betting sports events
     "culture":    ["pope","vatican","royal family","king charles","queen","celebrity","scandal",
                    "eurovision","music","album","concert","grammy"],
     "education":  ["university","college","student","tuition","scholarship"],
