@@ -337,6 +337,7 @@ class Database:
             # Micro — timing
             ("micro",  "SCAN_INTERVAL",    120,   "int",   "Seconds between scans",               30,   600,  "timing"),
             # Micro — general
+            ("micro",  "BANKROLL",         500,   "float", "Starting bankroll ($)",                100,  10000, "general"),
             ("micro",  "CONFIG_TAG",       "micro-v4","str","Config version tag",                  None, None, "general"),
         ]
         async with self.pool.acquire() as conn:
