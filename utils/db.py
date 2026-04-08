@@ -350,6 +350,17 @@ class Database:
                 """, svc, key, val, vtype, desc, mn, mx, sec)
             log.info(f"[DB] config_live seeded ({len(SCHEMA)} params, using env values)")
 
+    async def _cleanup_stale_config(self, keys: list[str]):
+        """Remove deprecated config keys from config_live."""
+        if not keys:
+            return
+        async with self.pool.acquire() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM config_live WHERE key = ANY($1::text[])", keys
+            )
+            if deleted and deleted != "DELETE 0":
+                log.info(f"[DB] Removed stale config keys: {keys}")
+
     async def get_config_overrides(self, service: str) -> dict:
         """Fetch live config overrides for a service."""
         async with self.pool.acquire() as conn:
