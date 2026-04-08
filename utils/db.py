@@ -334,6 +334,7 @@ class Database:
             # Micro — capacity
             ("micro",  "MAX_OPEN",         50,    "int",   "Maximum open positions",              1,    200,  "capacity"),
             ("micro",  "MAX_PER_THEME",    5,     "int",   "Max positions per theme",             1,    50,   "capacity"),
+            ("micro",  "MAX_PER_NEG_RISK", 3,     "int",   "Max positions per negRisk event",     1,    10,   "capacity"),
             # Micro — filters
             ("micro",  "MAX_DAYS_LEFT",    7,     "float", "Max days to market expiry",           1,    30,   "filters"),
             ("micro",  "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
