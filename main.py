@@ -26,10 +26,6 @@ from ml.calibrator        import Calibrator
 logging.basicConfig(
     level    = logging.INFO,
     format   = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers = [
-        logging.FileHandler("quant.log"),
-        logging.StreamHandler(),
-    ]
 )
 log = logging.getLogger("main")
 
@@ -1419,37 +1415,38 @@ async def main():
                 _last_scan_at = time.time()  # reset to avoid spam (re-alert in 15 min)
     watchdog_task = asyncio.create_task(_watchdog())
 
-    # Health check HTTP server (for Railway / monitoring)
-    async def _health_server():
-        from aiohttp import web
-        async def _health_handler(request):
+    # Health check HTTP server (lightweight asyncio, no aiohttp)
+    async def _health_handler(reader, writer):
+        try:
+            await reader.read(4096)
             stale = time.time() - _last_scan_at if _last_scan_at else 9999
             healthy = stale < _WATCHDOG_STALE_SECONDS and not _shutdown_flag
-            data = {
+            import json as _json_h
+            body = _json_h.dumps({
                 "status": "ok" if healthy else "stale",
                 "scan_count": _scan_count_global,
                 "last_scan_age_s": int(stale),
                 "ws_connected": ws.connected if ws else False,
                 "ws_active": ws.active_count() if ws else 0,
                 "shutdown": _shutdown_flag,
-            }
-            import json
-            return web.Response(text=json.dumps(data), content_type="application/json",
-                                status=200 if healthy else 503)
-        app_h = web.Application()
-        app_h.router.add_get("/health", _health_handler)
-        runner = web.AppRunner(app_h)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("HEALTH_PORT", "8081")))
-        try:
-            await site.start()
-            log.info(f"[HEALTH] Listening on :{os.getenv('HEALTH_PORT', '8081')}")
-        except OSError as e:
-            log.warning(f"[HEALTH] Could not start health server: {e}")
+            })
+            status = "200 OK" if healthy else "503 Service Unavailable"
+            writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
     try:
-        health_task = asyncio.create_task(_health_server())
-    except Exception:
-        pass  # non-critical — bot works without health endpoint
+        health_port = int(os.getenv("HEALTH_PORT", "8081"))
+        await asyncio.start_server(_health_handler, "0.0.0.0", health_port)
+        log.info(f"[HEALTH] Listening on :{health_port}")
+    except OSError as e:
+        log.warning(f"[HEALTH] Could not start health server: {e}")
 
     global _last_scan_at, _scan_count_global
     last_history = last_metrics_save = 0

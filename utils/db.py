@@ -24,7 +24,7 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def init(self):
-        self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=15, command_timeout=30)
+        self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=10, command_timeout=30)
         await self._create_schema()
         await self._migrate_positions_tp_sl()
         await self._migrate_clv()
