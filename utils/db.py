@@ -285,64 +285,67 @@ class Database:
 
         # (service, key, fallback, value_type, description, min, max, section)
         SCHEMA = [
-            # Engine — signals
-            ("engine", "MIN_EV",           0.12,  "float", "Minimum expected value",              0.01, 0.50, "signals"),
-            ("engine", "MAX_EV",           0.18,  "float", "Max EV (reject overconfident)",       0.10, 0.50, "signals"),
-            ("engine", "MIN_KL",           0.08,  "float", "Minimum KL divergence",               0.01, 0.50, "signals"),
-            ("engine", "MIN_EDGE",         0.10,  "float", "Minimum edge |p_final - p_market|",   0.01, 0.50, "signals"),
-            ("engine", "USE_PROSPECT",     True,  "bool",  "Enable prospect theory prior",        None, None, "signals"),
+            # Engine — signals (Bayesian fusion gates)
+            ("engine", "MIN_EV",           0.12,  "float", "Min expected value to enter (0.12 = 12% edge over market price)", 0.01, 0.50, "signals"),
+            ("engine", "MAX_EV",           0.18,  "float", "Reject signals above this EV — overconfident (EV>18% → 46% WR in data)", 0.10, 0.50, "signals"),
+            ("engine", "MIN_KL",           0.08,  "float", "Min KL divergence between our p and market p — filters weak signals", 0.01, 0.50, "signals"),
+            ("engine", "MIN_EDGE",         0.10,  "float", "Min |p_final − p_market| — reject if our prob too close to market", 0.01, 0.50, "signals"),
+            ("engine", "USE_PROSPECT",     True,  "bool",  "Apply prospect theory (γ=0.65) to prior — undoes crowd overweighting of longshots", None, None, "signals"),
             # Engine — risk
-            ("engine", "STOP_LOSS_PCT",    0.25,  "float", "Stop loss percentage",                0.05, 0.50, "risk"),
-            ("engine", "TAKE_PROFIT_PCT",  0.15,  "float", "Take profit percentage",              0.05, 0.50, "risk"),
-            ("engine", "TRAILING_TP",      True,  "bool",  "Enable trailing take profit",         None, None, "risk"),
-            ("engine", "TRAILING_PULLBACK",0.05,  "float", "Trailing TP pullback",               0.01, 0.20, "risk"),
+            ("engine", "STOP_LOSS_PCT",    0.25,  "float", "SL as fraction of stake (0.25 = exit at −25%). Small stakes ≤$10 have no SL", 0.05, 0.50, "risk"),
+            ("engine", "TAKE_PROFIT_PCT",  0.15,  "float", "TP as fraction of stake (0.15 = exit at +15%)", 0.05, 0.50, "risk"),
+            ("engine", "TRAILING_TP",      True,  "bool",  "Arm trailing TP once profit ≥ TP target — lets winners run past fixed TP", None, None, "risk"),
+            ("engine", "TRAILING_PULLBACK",0.05,  "float", "Trailing TP base pullback from peak (widens dynamically with peak height)", 0.01, 0.20, "risk"),
             # Engine — sizing
-            ("engine", "MIN_KELLY_FRAC",   0.03,  "float", "Minimum Kelly fraction",              0.01, 0.50, "sizing"),
-            ("engine", "MAX_KELLY_FRAC",   0.20,  "float", "Maximum Kelly fraction cap",          0.05, 1.00, "sizing"),
+            ("engine", "MIN_KELLY_FRAC",   0.03,  "float", "Reject if Kelly-sized stake < this fraction of bankroll", 0.01, 0.50, "sizing"),
+            ("engine", "MAX_KELLY_FRAC",   0.20,  "float", "Cap Kelly stake at this fraction of bankroll (conservative ~0.15–0.20)", 0.05, 1.00, "sizing"),
             # Engine — capacity
-            ("engine", "MAX_OPEN",         50,    "int",   "Maximum open positions",              1,    200,  "capacity"),
-            ("engine", "MAX_PER_THEME",    10,    "int",   "Max positions per theme",             1,    50,   "capacity"),
-            ("engine", "MAX_SIGNALS",      5,     "int",   "Max signals per scan",                1,    20,   "capacity"),
+            ("engine", "MAX_OPEN",         50,    "int",   "Total open engine positions allowed", 1,    200,  "capacity"),
+            ("engine", "MAX_PER_THEME",    10,    "int",   "Positions per theme (crypto/oil/iran…) for diversification", 1,    50,   "capacity"),
+            ("engine", "MAX_SIGNALS",      5,     "int",   "Top-N signals to execute per scan (ranked by Kelly × entropy penalty)", 1,    20,   "capacity"),
             # Engine — timing
-            ("engine", "SCAN_INTERVAL",    300,   "int",   "Seconds between scans",               60,   3600, "timing"),
-            ("engine", "HISTORY_INTERVAL", 14400, "int",   "Seconds between recalibration",       3600, 86400,"timing"),
+            ("engine", "SCAN_INTERVAL",    300,   "int",   "REST scan interval in seconds. Positions still monitored live via WS", 60,   3600, "timing"),
+            ("engine", "HISTORY_INTERVAL", 14400, "int",   "Recalibrate theme stats + DMA weights every N seconds (default 4h)", 3600, 86400,"timing"),
             # Engine — filters
-            ("engine", "MAX_MARKET_DAYS",  30,    "int",   "Max days to market expiry",           1,    365,  "filters"),
-            ("engine", "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
+            ("engine", "MAX_MARKET_DAYS",  30,    "int",   "Skip markets expiring > N days out (long-tail noise)", 1,    365,  "filters"),
+            ("engine", "MIN_VOLUME",       50000, "float", "Skip markets with total volume below $N", 1000, 1e7,  "filters"),
             # Engine — claude
-            ("engine", "CLAUDE_CONFIRM",   False, "bool",  "Enable Claude confirmation",          None, None, "claude"),
-            ("engine", "CLAUDE_WEB_SEARCH",False, "bool",  "Claude web search",                   None, None, "claude"),
+            ("engine", "CLAUDE_CONFIRM",   False, "bool",  "Route top-EV signals through Claude Sonnet for a 2nd opinion (0.6·p_final + 0.4·p_claude)", None, None, "claude"),
+            ("engine", "CLAUDE_WEB_SEARCH",False, "bool",  "Let Claude confirmation use the web_search tool (slower, costs more)", None, None, "claude"),
             # Engine — general
-            ("engine", "CONFIG_TAG",       "v7",  "str",   "A/B testing tag",                     None, None, "general"),
-            ("engine", "CONFIRM_DELAY",    600,   "int",   "Signal confirmation delay (sec)",     0,    3600, "general"),
+            ("engine", "CONFIG_TAG",       "v7",  "str",   "Label saved with every signal/position for A/B comparison", None, None, "general"),
+            ("engine", "CONFIRM_DELAY",    600,   "int",   "Min seconds between Claude confirmation calls (rate limit)", 0,    3600, "general"),
 
-            # Micro — signals
-            ("micro",  "ENTRY_MIN_PRICE",  0.94,  "float", "Direct entry price threshold",        0.80, 0.99, "signals"),
-            ("micro",  "WATCHLIST_MIN_PRICE",0.90, "float","Watchlist min price",                 0.80, 0.99, "signals"),
-            ("micro",  "MIN_ROI",          0.02,  "float", "Minimum ROI at resolution",           0.005,0.10, "signals"),
-            ("micro",  "MIN_QUALITY_SCORE",40,    "float", "Min quality score to enter",          0,    100,  "signals"),
-            ("micro",  "ENTRY_PRICE_1D",   0.90,  "float", "Entry price for ≤1 day markets",      0.80, 0.99, "signals"),
-            ("micro",  "ENTRY_PRICE_2D",   0.92,  "float", "Entry price for ≤2 day markets",      0.80, 0.99, "signals"),
-            ("micro",  "ENTRY_PRICE_3D",   0.93,  "float", "Entry price for ≤3 day markets",      0.80, 0.99, "signals"),
+            # Micro — signals (resolution harvester entry gates)
+            ("micro",  "ENTRY_MIN_PRICE",  0.94,  "float", "Base direct-buy threshold — above this → enter immediately (lowered for near-expiry)", 0.80, 0.99, "signals"),
+            ("micro",  "WATCHLIST_MIN_PRICE",0.90, "float","Floor to subscribe via WS and wait for price to reach entry (4¢ below ENTRY_MIN_PRICE)", 0.80, 0.99, "signals"),
+            ("micro",  "MIN_ROI",          0.02,  "float", "Min ROI at $1 payout = (1−price)/price (0.02 = 2%, floor after slippage/fees)", 0.005,0.10, "signals"),
+            ("micro",  "MIN_QUALITY_SCORE",40,    "float", "Base quality gate 0–100 — stepped up by days_left (1–3d→55, 3–5d→70, >5d→80)", 0,    100,  "signals"),
+            ("micro",  "ENTRY_PRICE_1D",   0.90,  "float", "Entry threshold for markets expiring ≤1 day — cheaper = higher ROI at same cert.", 0.80, 0.99, "signals"),
+            ("micro",  "ENTRY_PRICE_2D",   0.92,  "float", "Entry threshold for markets expiring ≤2 days", 0.80, 0.99, "signals"),
+            ("micro",  "ENTRY_PRICE_3D",   0.93,  "float", "Entry threshold for markets expiring ≤3 days (>3d uses ENTRY_MIN_PRICE)", 0.80, 0.99, "signals"),
             # Micro — risk
-            ("micro",  "SL_PCT",           0.05,  "float", "Default stop loss percentage",        0.01, 0.20, "risk"),
-            ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Rapid drop exit threshold",           0.02, 0.15, "risk"),
-            ("micro",  "MAX_LOSS_PER_POS", 3.0,   "float", "Hard cap loss per position ($)",      0.5,  20.0, "risk"),
+            ("micro",  "SL_PCT",           0.05,  "float", "Legacy % SL — DISABLED for micro (uses MAX_LOSS + RAPID_DROP instead)", 0.01, 0.20, "risk"),
+            ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Exit if bid drops this many ¢ from entry, absolute (0.07 = 7¢). REST+vol verified", 0.02, 0.15, "risk"),
+            ("micro",  "MAX_LOSS_PER_POS", 3.0,   "float", "Hard $ cap per position — always enforced, REST-verified with retry", 0.5,  20.0, "risk"),
             # Micro — sizing
-            ("micro",  "MAX_STAKE",        20.0,  "float", "Maximum stake per position",          1.0,  100.0,"sizing"),
-            ("micro",  "MIN_STAKE",        5.0,   "float", "Minimum stake per position",          1.0,  50.0, "sizing"),
+            ("micro",  "MAX_STAKE",        20.0,  "float", "Max $ per position (stake = 5% bankroll, capped here)", 1.0,  100.0,"sizing"),
+            ("micro",  "MIN_STAKE",        5.0,   "float", "Min $ per position — skip entry if bankroll too low to meet this", 1.0,  50.0, "sizing"),
             # Micro — capacity
-            ("micro",  "MAX_OPEN",         50,    "int",   "Maximum open positions",              1,    200,  "capacity"),
-            ("micro",  "MAX_PER_THEME",    5,     "int",   "Max positions per theme",             1,    50,   "capacity"),
-            ("micro",  "MAX_PER_NEG_RISK", 3,     "int",   "Max positions per negRisk event",     1,    10,   "capacity"),
+            ("micro",  "MAX_OPEN",         50,    "int",   "Total open micro positions allowed", 1,    200,  "capacity"),
+            ("micro",  "MAX_PER_THEME",    5,     "int",   "Positions per theme — bypassed for negRisk (uses MAX_PER_NEG_RISK)", 1,    50,   "capacity"),
+            ("micro",  "MAX_PER_NEG_RISK", 3,     "int",   "Max positions per negRisk event group (correlated, ρ=1.0)", 1,    10,   "capacity"),
             # Micro — filters
-            ("micro",  "MAX_DAYS_LEFT",    7,     "float", "Max days to market expiry",           1,    30,   "filters"),
-            ("micro",  "MIN_VOLUME",       50000, "float", "Minimum market volume",               1000, 1e7,  "filters"),
+            ("micro",  "MAX_DAYS_LEFT",    7,     "float", "Skip markets expiring > N days out (resolution harvesting horizon)", 1,    30,   "filters"),
+            ("micro",  "MIN_VOLUME",       50000, "float", "Skip markets with total volume below $N (illiquid = noisy)", 1000, 1e7,  "filters"),
             # Micro — timing
-            ("micro",  "SCAN_INTERVAL",    120,   "int",   "Seconds between scans",               30,   600,  "timing"),
+            ("micro",  "SCAN_INTERVAL",    120,   "int",   "Scanner loop in seconds. Positions monitored live via WS between scans", 30,   600,  "timing"),
+            # Micro — sim costs (early-exit only; resolution payouts have no fee)
+            ("micro",  "SLIPPAGE",         0.005, "float", "Sim entry slippage per side (0.005 = 0.5¢ added to fill price)", 0.0,  0.02, "sim"),
+            ("micro",  "FEE_PCT",          0.02,  "float", "Sim round-trip fee on early exits as fraction of stake (0.02 = 2%)", 0.0,  0.10, "sim"),
             # Micro — general
-            ("micro",  "BANKROLL",         500,   "float", "Starting bankroll ($)",                100,  10000, "general"),
-            ("micro",  "CONFIG_TAG",       "micro-v4","str","Config version tag",                  None, None, "general"),
+            ("micro",  "BANKROLL",         500,   "float", "Starting bankroll $ — actual bankroll computed live from position PnL", 100,  10000, "general"),
+            ("micro",  "CONFIG_TAG",       "micro-v4","str","Label saved on every position for A/B comparison", None, None, "general"),
         ]
         async with self.pool.acquire() as conn:
             for svc, key, fallback, vtype, desc, mn, mx, sec in SCHEMA:

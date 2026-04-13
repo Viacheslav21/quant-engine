@@ -120,7 +120,7 @@ Columns: 35 typed columns + JSONB `details` for event-specific data. Indexed by 
 
 ### Configuration
 
-Config loaded from environment variables at startup, then overridden at runtime by `config_live` DB table. `_seed_config_live(engine_config=CONFIG)` runs at startup to populate `config_live` with current env values (ON CONFLICT DO NOTHING — preserves DB overrides). `_reload_config()` merges DB overrides into the `CONFIG` dict (safe keys only, never credentials). Triggered instantly via `LISTEN config_reload` (same connection as `trader_commands`). 23 engine parameters exposed for live editing:
+Config loaded from environment variables at startup, then overridden at runtime by `config_live` DB table. `_seed_config_live(engine_config=CONFIG)` runs at startup to populate `config_live` with current env values (ON CONFLICT DO NOTHING — preserves DB overrides). `_reload_config()` merges DB overrides into the `CONFIG` dict (safe keys only, never credentials). Triggered instantly via `LISTEN config_reload` (same connection as `trader_commands`). 22 engine parameters exposed for live editing:
 - **Signals**: `MIN_EV`, `MAX_EV`, `MIN_KL`, `MIN_EDGE`, `USE_PROSPECT`
 - **Risk**: `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `TRAILING_TP`, `TRAILING_PULLBACK`
 - **Sizing**: `MIN_KELLY_FRAC`, `MAX_KELLY_FRAC`
