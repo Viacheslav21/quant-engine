@@ -1174,7 +1174,7 @@ async def main():
     db         = Database()
     await db.init()
     await db._seed_config_live(engine_config=CONFIG)
-    await db._cleanup_stale_config(["SKIP_SPORTS"])
+    await db._cleanup_stale_config(["SKIP_SPORTS", "SL_PCT"])
     await _reload_config(db)  # apply any DB overrides immediately
     telegram   = TelegramBot(CONFIG["TELEGRAM_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
     scanner    = PolymarketScanner(CONFIG)

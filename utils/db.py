@@ -325,7 +325,6 @@ class Database:
             ("micro",  "ENTRY_PRICE_2D",   0.92,  "float", "Entry threshold for markets expiring ≤2 days", 0.80, 0.99, "signals"),
             ("micro",  "ENTRY_PRICE_3D",   0.93,  "float", "Entry threshold for markets expiring ≤3 days (>3d uses ENTRY_MIN_PRICE)", 0.80, 0.99, "signals"),
             # Micro — risk
-            ("micro",  "SL_PCT",           0.05,  "float", "Legacy % SL — DISABLED for micro (uses MAX_LOSS + RAPID_DROP instead)", 0.01, 0.20, "risk"),
             ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Exit if bid drops this many ¢ from entry, absolute (0.07 = 7¢). REST+vol verified", 0.02, 0.15, "risk"),
             ("micro",  "MAX_LOSS_PER_POS", 3.0,   "float", "Hard $ cap per position — always enforced, REST-verified with retry", 0.5,  20.0, "risk"),
             # Micro — sizing
