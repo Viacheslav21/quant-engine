@@ -331,6 +331,8 @@ class Database:
             # Micro — sizing
             ("micro",  "MAX_STAKE",        20.0,  "float", "Max $ per position (stake = 5% bankroll, capped here)", 1.0,  100.0,"sizing"),
             ("micro",  "MIN_STAKE",        5.0,   "float", "Min $ per position — skip entry if bankroll too low to meet this", 1.0,  50.0, "sizing"),
+            ("micro",  "MAX_STAKE_Q80_6H", 75.0,  "float", "Cap $ for Q≥80 + ≤6h trades — 100% WR bucket, gets the highest Kelly stake", 5.0,  300.0,"sizing"),
+            ("micro",  "PCT_STAKE_Q80",    0.075, "float", "Kelly fraction for Q≥80 + ≤6h (vs 0.05 default) — bumped because WR is near 100%", 0.02, 0.20, "sizing"),
             # Micro — capacity
             ("micro",  "MAX_OPEN",         50,    "int",   "Total open micro positions allowed", 1,    200,  "capacity"),
             ("micro",  "MAX_PER_THEME",    5,     "int",   "Positions per theme — bypassed for negRisk (uses MAX_PER_NEG_RISK)", 1,    50,   "capacity"),
