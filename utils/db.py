@@ -327,6 +327,7 @@ class Database:
             # Micro — risk
             ("micro",  "RAPID_DROP_PCT",   0.07,  "float", "Exit if bid drops this many ¢ from entry, absolute (0.07 = 7¢). REST+vol verified", 0.02, 0.15, "risk"),
             ("micro",  "MAX_LOSS_PER_POS", 3.0,   "float", "Hard $ cap per position — always enforced, REST-verified with retry", 0.5,  20.0, "risk"),
+            ("micro",  "MAX_LOSS_BYPASS_BLOCKS", 2, "int", "After N consecutive REST blocks of MAX_LOSS, trust WS bid directly. Lower = faster cap enforcement, higher = more false-close protection", 1, 10, "risk"),
             # Micro — sizing
             ("micro",  "MAX_STAKE",        20.0,  "float", "Max $ per position (stake = 5% bankroll, capped here)", 1.0,  100.0,"sizing"),
             ("micro",  "MIN_STAKE",        5.0,   "float", "Min $ per position — skip entry if bankroll too low to meet this", 1.0,  50.0, "sizing"),
